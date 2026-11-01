@@ -51,7 +51,7 @@
 **方式二：本地链接（开发）**
 
 ```bash
-git clone https://github.com/forgotfish/cx-learn.git
+git clone https://github.com/forgotfish/dsh-cx-learn.git
 cd cx-learn
 dsh plugin --profile web add link:$PWD
 ```

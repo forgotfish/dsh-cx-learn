@@ -9,7 +9,7 @@
 - 不需要安装任何 npm 依赖（引擎只用 Node 内置模块）
 
 ```bash
-git clone https://github.com/forgotfish/cx-learn.git
+git clone https://github.com/forgotfish/dsh-cx-learn.git
 cd cx-learn
 node engine/chaoxing-autolearn.js --self-test
 ```
