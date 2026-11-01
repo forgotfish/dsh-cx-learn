@@ -15,7 +15,7 @@
  * 本脚本不改登录代码，只输出事实，用于决定重写方向。
  *
  * 用法（远端）：
- *   sudo -u <run-user> node login-diagnose.cjs
+ *   sudo -u fn-deepseek-harness node login-diagnose.cjs
  * ==========================================================================*/
 'use strict';
 

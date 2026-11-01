@@ -91,7 +91,6 @@ const BROWSER_ROOT_CANDIDATES = [
   process.env.CX_BROWSER_ROOT,
   join(DSH_HOME, 'cx-learn', 'browsers'),
   '/opt/dsh-shared/browsers',
-  '/opt/dsh-shared/browsers',
   join(PLUGIN_DIR, '.browser'),
 ].filter(Boolean)
 

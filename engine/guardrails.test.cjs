@@ -220,6 +220,16 @@ function state(over) {
     ok((await m2.waitLoad()) === true, 'knowledgeid 对得上 → 正常就绪');
   }
 
+  /* 【20】2026-11-01：课程正文/字幕提到「人脸识别」不等于验证弹窗，必须带验证语境才停机 */
+  {
+    const kw = E.CONFIG.safety.fatalKeywords;
+    ok(!kw.includes('人脸'), '★ 不再用裸「人脸」当停机关键词');
+    ok(!kw.includes('活体'), '★ 不再用裸「活体」当停机关键词');
+    const sel = require('./src/learn/selectors.js');
+    ok(/var strong/.test(sel.PAGE_PROBE_SRC), '★ 探针里有验证语境判定（strong）');
+    ok(!sel.PAGE_PROBE_SRC.includes('[^。；' + String.fromCharCode(92) + 'n]'), '★ 正则里没有会被模板吃掉的换行转义');
+  }
+
   console.log('');
   if (fails.length) {
     console.log('== 失败 ' + fails.length + ' 项 / 通过 ' + pass + ' 项 ==');

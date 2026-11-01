@@ -776,9 +776,25 @@ const PAGE_PROBE_SRC = `(function () {
 
   /* ---- 人工验证特征（安全停止信号，绝不绕过）---- */
   function humanScan() {
-    var text = norm(document.body ? document.body.innerText : '').slice(0, 4000);
+    var text = norm(document.body ? document.body.innerText : '');
+    /* ★ 2026-11-01 误报：伦理/人工智能课程的字幕与课件本身就会说“人脸识别”“验证码”，
+       以前把整页文本都拿去匹配，导致一讲到这些词就停。这里先剔除视频字幕、课件、随堂题文本。 */
+    try {
+      var ex = document.querySelectorAll('video, .vjs-text-track-display, .vjs-subtitles, .vjs-captions, [class*="subtitle"], [class*="caption"], .ans-videoquiz');
+      for (var ei = 0; ei < ex.length; ei++) {
+        var st2 = norm(ex[ei].innerText || '');
+        if (st2) text = text.split(st2).join(' ');
+      }
+    } catch (e0) { /* ignore */ }
+    text = text.slice(0, 4000);
     var hit = matchAny(text, KWS);
-    return hit ? { detected: true, evidence: hit } : { detected: false, evidence: null };
+    if (!hit) return { detected: false, evidence: null };
+    /* ★ 2026-11-01：仅仅出现「人脸识别 / 验证码」不够——课程内容、章节标题、课件都会出现。
+       必须同时是**验证语境**（请/开始/拍摄/对准/核验…），否则只当作正文，不停机。 */
+    var strong = /(请|需要|开始|进行)[^。；]{0,10}(人脸识别|人脸验证|活体检测)|(人脸识别|人脸验证|活体检测)[^。；]{0,10}(验证|核验|识别中|拍摄|对准|开始)|滑块验证|真人验证|安全验证|请输入验证码|刮开/;
+    if (!strong.test(text)) return { detected: false, evidence: null, weak: hit };
+    var at = text.indexOf(hit);
+    return { detected: true, evidence: hit, snippet: text.slice(Math.max(0, at - 20), at + 40) };
   }
 
   /* ---- 登录态特征（前置检查用；脚本绝不自动登录）---- */

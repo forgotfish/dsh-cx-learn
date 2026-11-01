@@ -94,7 +94,7 @@ function makeBus(initial) {
 
   const bus = makeBus({
     layer: 'browser',
-    executablePath: '/opt/browsers/chrome-linux64/chrome',
+    executablePath: '/vol1/browsers/chrome-linux64/chrome',
     profileDir: '/tmp/prof',
     headless: true,
     ready: true,
@@ -124,7 +124,7 @@ function makeBus(initial) {
   eq(written.lastErrorKind, '', '探测成功时 lastErrorKind 为空');
 
   /* ← 关键：旧字段必须原样保留，否则设置页会显示内核路径为空 */
-  eq(written.executablePath, '/opt/browsers/chrome-linux64/chrome', '★ 旧字段 executablePath 保留');
+  eq(written.executablePath, '/vol1/browsers/chrome-linux64/chrome', '★ 旧字段 executablePath 保留');
   eq(written.profileDir, '/tmp/prof', '★ 旧字段 profileDir 保留');
   eq(written.headless, true, '★ 旧字段 headless 保留');
   eq(written.ready, true, '★ ready 不被心跳覆盖（语义是「启动成功过」）');

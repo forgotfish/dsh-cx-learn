@@ -103,7 +103,7 @@ const CONFIG = {
        stopOnSnapshot=true 则第一次就停，用于取证；默认 false，仍允许重试。 */
     snapshotOnProblem: true,
     stopOnSnapshot: false,
-    fatalKeywords: ['人脸识别', '人脸', '活体', '活体检测', '验证码', '安全验证', '滑块验证', '真人验证', '请完成验证', '刮开'],
+    fatalKeywords: ['人脸识别', '活体检测', '验证码', '安全验证', '滑块验证', '真人验证', '请完成验证', '刮开'],
     loginHostPattern: 'passport|login\\.|auth\\.'
   },
 
