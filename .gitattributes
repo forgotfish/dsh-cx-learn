@@ -1,0 +1,9 @@
+# 默认按文本处理，仓库内统一 LF（部署目标是 Linux/DSH 运行时）
+* text=auto eol=lf
+
+# 二进制资源不参与换行转换
+*.png binary
+*.jpg binary
+*.zip binary
+*.gz binary
+*.ico binary

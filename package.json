@@ -1,0 +1,57 @@
+{
+  "name": "dsh-cx-learn",
+  "version": "0.2.0",
+  "description": "DSH 插件：超星学习通自动看课 —— CDP 驱动真实 Chromium，支持扫码登录、断点续播、跳过已看完、随堂题盲试，章节测验只识别不触碰",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "chaoxing",
+    "autolearn",
+    "cdp",
+    "browser-automation",
+    "elearning"
+  ],
+  "license": "MIT",
+  "author": "forgotfish <https://github.com/forgotfish>",
+  "homepage": "https://github.com/forgotfish/cx-learn#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/forgotfish/cx-learn.git"
+  },
+  "bugs": {
+    "url": "https://github.com/forgotfish/cx-learn/issues"
+  },
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "engine",
+    "LICENSE",
+    "README.md"
+  ],
+  "engines": {
+    "dsh": ">=0.2.0-rc.1",
+    "node": ">=22"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-settings-plugins"
+      ]
+    }
+  }
+}

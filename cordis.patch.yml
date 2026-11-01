@@ -1,0 +1,14 @@
+# ============================================================================
+# dsh-cx-learn —— DSH bundle patch（插件自带的挂载声明）
+# ============================================================================
+# 装上之后，profile 只要在 dsh.profile.bundles 里列出 dsh-cx-learn 即生效：
+#   dsh plugin --profile web add dsh-cx-learn
+#   本地开发（指向本地目录）：
+#   dsh plugin --profile web add link:/绝对路径/dsh-cx-learn
+# ============================================================================
+
+- insert:
+    - id: cx-learn
+      name: dsh-cx-learn
+      config:
+        enabled: true

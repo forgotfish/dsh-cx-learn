@@ -1,0 +1,7 @@
+{
+  "name": "dsh-cx-learn-engine",
+  "version": "0.1.0",
+  "private": true,
+  "description": "学习通自动看课引擎（CommonJS）。父目录声明了 type=module，引擎用 require，故在此单独声明。",
+  "type": "commonjs"
+}

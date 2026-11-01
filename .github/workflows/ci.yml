@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 语法检查
+        run: |
+          node --check index.js
+          node --check client.js
+          node --check engine/chaoxing-autolearn.js
+
+      - name: JSON 校验
+        run: |
+          node -e "JSON.parse(require('fs').readFileSync('package.json','utf8')); console.log('package.json ok')"
+          node -e "JSON.parse(require('fs').readFileSync('engine/package.json','utf8')); console.log('engine/package.json ok')"
+
+      - name: 引擎自检
+        run: node engine/chaoxing-autolearn.js --self-test
+
+      - name: 确认没有提交运行期数据
+        run: |
+          if git ls-files | grep -E '(latest\.png|browser-profile/|dump\.html|\.login/)'; then
+            echo "运行期数据被提交了，检查 .gitignore"
+            exit 1
+          fi
+          echo "干净"
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 扫描疑似密钥
+        run: |
+          if git grep -nEI '(sk-[A-Za-z0-9]{20,}|api[_-]?key["'"'"']?\s*[:=]\s*["'"'"'][A-Za-z0-9]{16,})' -- . ':!*.md'; then
+            echo "疑似密钥被提交"
+            exit 1
+          fi
+          echo "干净"

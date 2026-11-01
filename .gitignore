@@ -1,0 +1,49 @@
+# 依赖与构建产物
+node_modules/
+*.tgz
+
+# 运行期数据（绝不能进版本库：登录态 / Cookie / 浏览器 profile）
+cx-learn/
+*.log
+.login/
+browser-profile/
+latest.png
+dump.html
+chrome.log
+config.json
+state.json
+
+# 内核二进制（体积大，各机器自行放置）
+.browser/
+browsers/
+chrome-linux64/
+chrome-headless-shell-linux64/
+
+# 本地记忆归档（含明文口令 / 内网 IP / 服务器地址，绝不能进公开仓库）
+docs/memory/
+
+# 编辑器与系统
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# 本机测试产物
+.local-login/
+.local-profile/
+
+# 本机开发脚本与日志
+start-login.cmd
+run-scan5.cmd
+run_login.cmd
+run_scan.cmd
+dev.cmd
+*.log
+QR*.png
+
+# 分层中间状态（运行期产物，不入库）
+engine/.state/
+
+# 拆分迁移源（拆分前的 8133 行单文件副本，仅本地用来重跑 scripts/split-engine.cjs）
+scripts/.migration/
