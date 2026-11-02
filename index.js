@@ -539,6 +539,28 @@ function spawnEngine(args) {
        所以真机上看不到 stopReason（只有 null）。这里退出时合并一次。 */
     mergeLearnIntoState()
 
+    /* ★ 2026-11-02：引擎退出时给 browser.json 收尾。
+       事故：引擎以 143（SIGTERM）退出、顺手杀了 12 个残留 chrome，
+       但没有任何一方把 alive 改成 false —— 心跳停在 29 小时前，
+       /health 却还报 alive:true，与 session.json 的 kernel_dead 互相矛盾。
+       这里按「内核 pid 是否还活着」决定：死了就写墓碑，活着（keep-alive）就不动。 */
+    try {
+      const b = readBrowserState()
+      if (b && b.alive === true) {
+        const pidAlive = Number(b.pid) > 0 && isPidAlive(Number(b.pid))
+        if (!pidAlive) {
+          const p = join(PLUGIN_DIR, 'engine', '.state', 'browser.json')
+          writeFileSync(p, JSON.stringify(Object.assign({}, b, {
+            alive: false,
+            pid: null,
+            port: null,
+            heartbeatAt: new Date().toISOString(),
+            lastErrorKind: 'ENGINE_EXIT',
+          }), null, 2))
+        }
+      }
+    } catch { /* 状态收尾失败不影响主流程 */ }
+
     /* ★★★ 2026-10-31（B-精简）：看课任务结束**不再**销毁登录态 ★★★
        原实现是 `if (isWatchRun(args)) purgeEphemeralProfile()`，
        于是跑完一门课就删 profile + 关内核，想接着刷第二门必须重扫。
@@ -1125,7 +1147,7 @@ async function status() {
     home: STATE,
     /* ★ 2026-10-30：浏览器层写进 .state/browser.json 的现状（内核 pid/端口/心跳）。
        读不到就是 null，前端显示「—」，绝不因此让 status() 失败。 */
-    browser: readBrowserState(),
+    browser: reconcileBrowser(readBrowserState()),
     /* ★ B-精简：会话状态。前端据此决定显示「会话进行中 / 已结束」，
        以及「结束会话」按钮是否可点。读不到会话就是 null。 */
     session: (() => {
@@ -1166,6 +1188,48 @@ function readBrowserState() {
   } catch {
     return null
   }
+}
+
+/* ★ 2026-11-02：browser.json 是「最后一次写入」的快照，不是实时状态。
+   实测事故：心跳停在 29 小时前、pid 早已不存在、端口也不监听，
+   但 /health 仍原样转述 alive:true —— 只有内核 owner 进程才写 alive:false，
+   清理路径（kill 残留 chrome）只杀进程/删文件，没把状态改成 false。
+   解法：读出来先对账——心跳过期 / 没有端口 / pid 已死 一律降级为 alive:false。 */
+const BROWSER_STALE_MS = 90 * 1000
+
+function isPidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (e) {
+    return !!(e && e.code === 'EPERM')
+  }
+}
+
+export function reconcileBrowser(b) {
+  if (!b || typeof b !== 'object') return null
+  const out = Object.assign({}, b)
+  const hb = Date.parse(b.heartbeatAt || b.updatedAt || '')
+  out.heartbeatAgeMs = Number.isFinite(hb) ? Math.max(0, Date.now() - hb) : null
+  out.staleReason = ''
+
+  if (b.alive === true) {
+    if (out.heartbeatAgeMs != null && out.heartbeatAgeMs > BROWSER_STALE_MS) {
+      out.alive = false
+      out.staleReason = 'heartbeat_stale'
+    } else if (!(Number(b.port) > 0)) {
+      out.alive = false
+      out.staleReason = 'no_port'
+    } else if (Number(b.pid) > 0 && !isPidAlive(Number(b.pid))) {
+      out.alive = false
+      out.staleReason = 'pid_dead'
+    }
+  }
+  if (out.alive === false && !out.staleReason) {
+    out.staleReason = b.alive === true ? 'reconciled' : String(b.lastErrorKind || '')
+  }
+  return out
 }
 
 /**
@@ -1217,7 +1281,7 @@ function mergeLearnIntoState() {
 function collectHealth() {
   const at = new Date().toISOString()
   const cp = chromiumPath()
-  const browser = readBrowserState()
+  const browser = reconcileBrowser(readBrowserState())
 
   /* ★ 内核版本从这里拿，但**不能调 listBrowsers()** ——
      它会对每个候选内核 spawn 一次 `--version`（200~800ms/个，本机 3 个就是 1~2 秒），
@@ -1241,6 +1305,7 @@ function collectHealth() {
     chromium: { path: cp, ready: cp !== 'chromium' && existsSync(cp), version: chromiumVersion },
     browser: browser ? {
       alive: browser.alive === true,
+      staleReason: browser.staleReason || '',
       port: browser.port ?? null,
       heartbeatAt: browser.heartbeatAt ?? null,
       ageMs,
@@ -1408,7 +1473,20 @@ export function apply(ctx, config) {
           let cleared = false
           try {
             const p = join(PLUGIN_DIR, 'engine', '.state', 'browser.json')
-            if (existsSync(p)) { rmSync(p, { force: true }); cleared = true }
+            /* ★ 2026-11-02：以前只 rm 文件；rm 失败就什么都不留，文件里继续躺着 alive:true。
+               现在写「墓碑」：明确 alive:false + 原因（KILLED/STOPPED）。 */
+            const prev = readBrowserState() || {}
+            writeFileSync(p, JSON.stringify({
+              alive: false,
+              port: null,
+              pid: null,
+              heartbeatAt: new Date().toISOString(),
+              restarts: Number.isFinite(prev.restarts) ? prev.restarts : 0,
+              lastErrorKind: killed ? 'KILLED' : 'STOPPED',
+              browserVersion: prev.browserVersion || '',
+              executablePath: prev.executablePath || '',
+            }, null, 2))
+            cleared = true
           } catch { cleared = false }
           nowLog('browser/restart: killed=' + killed + ' clearedState=' + cleared)
           return sendJson(res, 200, { ok: true, killed, clearedState: cleared })
