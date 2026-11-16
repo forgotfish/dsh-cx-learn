@@ -74,6 +74,20 @@ async function callRoute(handler, method, url, body) {
   return { code: res._out.code, json, raw: res._out.body, headers: res._out.headers, isBuffer: res._out.isBuffer };
 }
 
+/** 与 callRoute 同，但可自定义请求头（用于 /llm-ask 的 x-cx-token 校验）。 */
+async function callRouteH(handler, method, url, body, headers) {
+  const res = fakeRes();
+  const text = body === undefined ? '' : JSON.stringify(body);
+  const req = {
+    method, url, headers: headers || {},
+    async *[Symbol.asyncIterator]() { if (text) yield Buffer.from(text) },
+  };
+  await handler(req, res);
+  let json = null;
+  try { json = JSON.parse(res._out.body) } catch (_) { json = null }
+  return { code: res._out.code, json, raw: res._out.body };
+}
+
 async function main() {
   const indexUrl = 'file:///' + path.resolve(__dirname, '..', 'index.js').replace(/\\/g, '/');
   let mod;
@@ -172,6 +186,38 @@ async function main() {
     ok(s3.code === 200 && s3.json && s3.json.running === false, '  ↳ 清掉 state.json 后 running 回到 false');
   }
 
+  /* ---- 3d. ★ D-023：引擎自终止时 clearStatePid() 清掉死 pid ----
+   * 根因：start() 写 pid、只有 stop() 删 pid，自终止的运行留下死 pid；
+   * 被系统复用后 running() 误判在跑 → 「开始」假绿灯。exit 处理器现调 clearStatePid()。 */
+  console.log('== 3d. D-023 引擎自终止清 pid ==');
+  {
+    const stPath = path.join(TMP_HOME, 'cx-learn', 'state.json');
+    fs.mkdirSync(path.dirname(stPath), { recursive: true });
+    ok(typeof mod.clearStatePid === 'function', '导出 clearStatePid()');
+    fs.writeFileSync(stPath, JSON.stringify({ phase: 'stopped', pid: 999999, startedAt: Date.now() }));
+    mod.clearStatePid();
+    const after = JSON.parse(fs.readFileSync(stPath, 'utf8'));
+    ok(after.pid === undefined, '★ 清前有 pid → 清后无 pid（实际 ' + JSON.stringify(after) + '）');
+    ok(after.phase === 'stopped', '  ↳ 不误伤其它字段（phase 保留）');
+    // 幂等：没有 pid 时再调一次不报错、不改内容
+    let threw = false
+    try { mod.clearStatePid() } catch { threw = true }
+    ok(!threw, '  ↳ 幂等：无 pid 时再调不抛');
+    fs.unlinkSync(stPath);
+  }
+
+  /* ---- 3e. ★ D-024：「开始」假绿灯真根因 —— 只有看课任务才算 running ---- */
+  console.log('== 3e. D-024 只有看课任务才登记为在跑 ==');
+  {
+    ok(typeof mod.isWatchRun === 'function', '导出 isWatchRun()');
+    ok(mod.isWatchRun(['--login']) === false, '★ --login 不算看课任务（登录时 running() 应为 false）');
+    ok(mod.isWatchRun(['--check-login']) === false, '  ↳ --check-login（预检）不算');
+    ok(mod.isWatchRun(['--list-courses']) === false, '  ↳ --list-courses（读课程）不算');
+    ok(mod.isWatchRun(['--self-test']) === false, '  ↳ --self-test 不算');
+    ok(mod.isWatchRun(['--mode=continue_chapters', '--max-sections=5', '--course-url=x']) === true,
+      '★ 正常看课参数算看课任务（登录时才是 false）');
+  }
+
   const cfg = await callRoute(H, 'GET', '/api/cx-learn/config');
   ok(cfg.code === 200 && cfg.json && cfg.json.config, '/config GET 返回 config');
   ok(cfg.json.config.courseUrl !== undefined, 'config 有 courseUrl');
@@ -264,6 +310,119 @@ async function main() {
   ok(askOk.json && !('answer' in askOk.json), '★ /ask 不返回 answer（现在不答题）');
   const askBad = await callRoute(H, 'POST', '/api/cx-learn/ask', {});
   ok(askBad.code === 400, '★ /ask 缺 question 与 image 时 400（契约已校验，实际 ' + askBad.code + '）');
+
+  /* ---- 8. ★ AI 答题实现：/llm-ask 令牌校验 + spawn env 注入 ----
+   * /llm-ask 只服务引擎子进程，凭每轮 spawn 新生成的 x-cx-token 校验；
+   * 未 spawn 过（_askToken 为空）或令牌不符，一律 401，绝不进模型调用。
+   * spawn env：enabled=false 时**一条 CX_LLM_* 都不许有**（引擎靠
+   * `CX_LLM_ASK_URL || CX_LLM_MODEL` 判 useAi，多设一条引擎就会以为自己能答题）。 */
+  console.log('== 8. /llm-ask 令牌 + spawn env 注入 ==');
+  const noTok = await callRoute(H, 'POST', '/api/cx-learn/llm-ask', { prompt: '1+1=?' });
+  ok(noTok.code === 401, '★ /llm-ask 无 token → 401（实际 ' + noTok.code + '）');
+  const wrongTok = await callRouteH(H, 'POST', '/api/cx-learn/llm-ask', { prompt: '1+1=?' }, { 'x-cx-token': 'deadbeef' });
+  ok(wrongTok.code === 401, '★ /llm-ask 错 token → 401（实际 ' + wrongTok.code + '）');
+
+  ok(typeof mod.buildSpawnEnv === 'function', '★ 导出 buildSpawnEnv()（spawn env 可单测）');
+
+  const cfgPath = path.join(TMP_HOME, 'cx-learn', 'config.json');
+  fs.mkdirSync(path.dirname(cfgPath), { recursive: true });
+  // (a) enabled=false：不含任何 CX_LLM_ / CX_AI_
+  fs.writeFileSync(cfgPath, JSON.stringify({ ai: { enabled: false } }));
+  {
+    const envOff = mod.buildSpawnEnv(['--mode=continue_chapters', '--course-url=http://example.com']);
+    const llmKeys = Object.keys(envOff).filter((k) => /^CX_LLM_/.test(k));
+    const aiKeys = Object.keys(envOff).filter((k) => /^CX_AI_/.test(k));
+    ok(llmKeys.length === 0, '★ ai.enabled=false 时 spawn env 不含任何 CX_LLM_（实际 ' + JSON.stringify(llmKeys) + '）');
+    ok(aiKeys.length === 0, '★ ai.enabled=false 时 spawn env 不含任何 CX_AI_（实际 ' + JSON.stringify(aiKeys) + '）');
+    ok(!('CX_LLM_ASK_URL' in envOff) && !('CX_LLM_MODEL' in envOff),
+      '★ 引擎 useAi 判据（CX_LLM_ASK_URL || CX_LLM_MODEL）均未设置');
+  }
+  // (b) enabled=true：六条变量齐全且取值正确
+  fs.writeFileSync(cfgPath, JSON.stringify({
+    ai: { enabled: true, provider: 'xlapi', model: 'deepseek-v4.1-flash', dryRun: true, vision: false, timeoutMs: 15000 },
+  }));
+  process.env.CX_PLUGIN_PORT = '12345';
+  {
+    const envOn = mod.buildSpawnEnv(['--mode=continue_chapters']);
+    ok(envOn.CX_LLM_ASK_URL === 'http://127.0.0.1:12345/api/cx-learn/llm-ask',
+      '★ 启用后 CX_LLM_ASK_URL = http://127.0.0.1:<port>/api/cx-learn/llm-ask（实际 ' + envOn.CX_LLM_ASK_URL + '）');
+    ok(/^[0-9a-f]{32}$/.test(String(envOn.CX_LLM_ASK_TOKEN || '')),
+      '★ CX_LLM_ASK_TOKEN 是 32 位 hex（实际 ' + envOn.CX_LLM_ASK_TOKEN + '）');
+    ok(envOn.CX_LLM_PROVIDER === 'xlapi', '★ CX_LLM_PROVIDER = 配置 provider（实际 ' + envOn.CX_LLM_PROVIDER + '）');
+    ok(envOn.CX_LLM_MODEL === 'deepseek-v4.1-flash', '★ CX_LLM_MODEL = 配置 model（实际 ' + envOn.CX_LLM_MODEL + '）');
+    ok(envOn.CX_AI_DRYRUN === '1', '★ CX_AI_DRYRUN = 1（dryRun:true）');
+    ok(envOn.CX_AI_VISION === '0', '★ CX_AI_VISION = 0（vision:false）');
+  }
+  delete process.env.CX_PLUGIN_PORT;
+
+  // == 9. LLM 流解析与路由解析（不用真模型，用文档记载的 chunk 形状）==
+  console.log('== 9. LLM 流解析与路由解析 ==');
+  {
+    const { collectStream, resolveRoute } = mod;
+
+    // 9.1 纯 text-delta 累加
+    async function* genA() {
+      yield { type: 'text-delta', index: 0, text: '答案：' };
+      yield { type: 'text-delta', index: 0, text: 'B' };
+      yield { type: 'block-end', index: 0, block: { type: 'text', text: '答案：B' } };
+      yield { type: 'finish', reason: { kind: 'stop' } };
+    }
+    const rA = await collectStream(genA());
+    ok(rA.text === '答案：B', '★ text-delta 逐块累加得到「答案：B」（实际 ' + JSON.stringify(rA.text) + '）');
+    ok(rA.finish && rA.finish.kind === 'stop', '★ finish.reason.kind 被读到（stop）');
+
+    // 9.2 没有 delta 时用 block-end 的完整文本兜底
+    async function* genB() {
+      yield { type: 'block-end', index: 0, block: { type: 'text', text: 'C' } };
+      yield { type: 'finish', reason: { kind: 'stop' } };
+    }
+    const rB = await collectStream(genB());
+    ok(rB.text === 'C', '★ 无 text-delta 时用 block-end 文本兜底（实际 ' + JSON.stringify(rB.text) + '）');
+
+    // 9.3 空流不抛错、返回空串
+    async function* genC() { /* 什么都不 yield */ }
+    const rC = await collectStream(genC());
+    ok(rC.text === '' && rC.finish === null, '★ 空流返回空串且 finish=null（不抛错）');
+
+    // 9.4 finish.kind=error → 抛带 code 的错误（DSH 自己不 throw，必须我们抛）
+    async function* genD() {
+      yield { type: 'finish', reason: { kind: 'error', failure: { code: 'MISSING_CREDENTIAL', message: '没有 key' } } };
+    }
+    let errD = null;
+    try { await collectStream(genD()); } catch (e) { errD = e; }
+    ok(!!errD && errD.code === 'MISSING_CREDENTIAL', '★ finish=error 时抛出 code=MISSING_CREDENTIAL（实际 ' + (errD && errD.code) + '）');
+
+    // 9.5 finish.kind=aborted 也要抛（否则会当成正常空回答）
+    async function* genE() { yield { type: 'finish', reason: { kind: 'aborted', failure: { code: 'TIMEOUT' } } }; }
+    let errE = null;
+    try { await collectStream(genE()); } catch (e) { errE = e; }
+    ok(!!errE, '★ finish=aborted 也抛错（不冒充正常空回答）');
+
+    // 9.6 resolveRoute：provider 空 → 取宿主第一个 provider
+    const fakeLlm = {
+      async listProviders() { return [{ id: 'xlapi' }, { id: 'dsh3' }]; },
+      async listModels(p) { return p === 'xlapi' ? [{ id: 'deepseek-v4.1-flash' }] : []; },
+    };
+    const route1 = await resolveRoute(fakeLlm, '', '');
+    ok(route1.provider === 'xlapi' && route1.model === 'deepseek-v4.1-flash',
+      '★ 留空 provider/model → 自动取宿主首个 provider 与模型（实际 ' + route1.provider + '/' + route1.model + '）');
+
+    // 9.7 占位 'host' 与留空等价（UI 默认值就是 host）
+    const route2 = await resolveRoute(fakeLlm, 'host', '');
+    ok(route2.provider === 'xlapi', '★ provider 填占位 host 时也能解析出真实 provider（实际 ' + route2.provider + '）');
+
+    // 9.8 显式给了就不覆盖
+    const route3 = await resolveRoute(fakeLlm, 'dsh3', 'my-model');
+    ok(route3.provider === 'dsh3' && route3.model === 'my-model', '★ 显式 provider/model 不被自动探测覆盖');
+
+    // 9.9 探测失败返回空串（由 doStream 报 LLM_UNAVAILABLE），不抛错
+    const deadLlm = { async listProviders() { throw new Error('boom'); }, async listModels() { throw new Error('boom'); } };
+    let errF = null;
+    let route4 = null;
+    try { route4 = await resolveRoute(deadLlm, '', ''); } catch (e) { errF = e; }
+    ok(!errF && route4 && route4.provider === '' && route4.model === '',
+      '★ provider 探测抛错时返回空串而不抛错（交给 doStream 报 LLM_UNAVAILABLE）');
+  }
 
   return finish();
 }

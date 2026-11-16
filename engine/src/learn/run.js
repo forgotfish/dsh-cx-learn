@@ -146,19 +146,47 @@ async function run(overrides, options) {
       const prefix = String((cfg.course && cfg.course.sectionPrefix) || '');
       const chOk = await openChapterAndWait(adapter, cfg, { maxRound: 2 });
       if (!chOk || !chOk.ok) {
-        throw new FatalStop('ENTRY_CHAPTER_FAILED',
-          '进入课程后点「章节」失败。请在浏览器里手动点进目标小节，把带 chapterId & enc 的完整 URL 填进「课程地址」。');
+        /* ★ 2026-11-16（D-027 现场）：有的课程点进去直接落在 studentstudy 学习页，
+           章节树是**内联在主页里**的（没有 mooc2-ans 跨域 iframe，也就没有可点的
+           「章节」tab）。这时点 tab 必然 not-found，但学习页本身完全可用。
+           判据不靠名字，靠「章节树到底读不读得到」——读得到就继续。 */
+        const stTry = await machine.gatherState().catch(() => null);
+        const tocOk = !!(stTry && stTry.toc && stTry.toc.found && (stTry.toc.items || []).length);
+        if (tocOk) {
+          logger.info('PRECHECK', '点「章节」失败但章节树已在当前页内联，直接使用', {
+            reason: (chOk && chOk.reason) || 'unknown',
+            items: (stTry.toc.items || []).length,
+            url: String(await adapter.getCurrentUrl().catch(() => '')).slice(0, 120),
+          });
+        } else {
+          throw new FatalStop('ENTRY_CHAPTER_FAILED',
+            '进入课程后点「章节」失败，且当前页读不到章节树。请在浏览器里手动点进目标小节，把带 chapterId & enc 的完整 URL 填进「课程地址」。');
+        }
+      } else {
+        logger.info('PRECHECK', '自动点进去：章节树已就绪');
       }
-      logger.info('PRECHECK', '自动点进去：章节树已就绪');
 
       /* 3) 点第一个（或指定）小节，落地到真正的学习页 */
-      const sec = await openSectionByClick(adapter, prefix);
-      if (!sec.ok) {
-        throw new FatalStop('ENTRY_SECTION_FAILED',
-          '章节树已就绪但点小节失败（' + (sec.reason || '未知') + '）。');
+      const landedNow = await adapter.getCurrentUrl().catch(() => '');
+      const alreadyStudyPage = /[?&]chapterId=\d+/i.test(landedNow);
+      if (alreadyStudyPage) {
+        /* ★ 2026-11-16（D-027 现场）：点课程卡片后超星直接把上次学习的
+           studentstudy 页打开了（URL 已带 chapterId&enc），章节树内联、内容已加载。
+           这时**不需要**再点小节：openSectionByClick 依赖 mooc2-ans 跨域 iframe，
+           在这种页面上必然失败；而页面上已经有可用的学习内容，起跑点由后面的
+           pickStart() 决定（未完成的节就在这儿，或它会切到第一个未完成节）。 */
+        logger.info('PRECHECK', '已在学习页（URL 带 chapterId），跳过点小节', {
+          url: String(landedNow).slice(0, 140),
+        });
+      } else {
+        const sec = await openSectionByClick(adapter, prefix);
+        if (!sec.ok) {
+          throw new FatalStop('ENTRY_SECTION_FAILED',
+            '章节树已就绪但点小节失败（' + (sec.reason || '未知') + '）。');
+        }
+        logger.info('PRECHECK', '自动点进去：已打开小节', { section: String(sec.text || '').slice(0, 60) });
+        await sleep(8000);
       }
-      logger.info('PRECHECK', '自动点进去：已打开小节', { section: String(sec.text || '').slice(0, 60) });
-      await sleep(8000);
 
       const landedUrl = await adapter.getCurrentUrl().catch(() => '');
       logger.info('PRECHECK', '自动点进去：落地页', { url: String(landedUrl).slice(0, 140) });
@@ -258,6 +286,14 @@ async function run(overrides, options) {
         machine.failures = 0;
         consecutiveNonProgress = 0;
       } else {
+        /* ★ 2026-11-17（D-028）：「等待加载 / 任务点等待」是有意的等待，不是「页面无法识别」。
+           真机 16.2 就是纯等被算成无进展，9 轮后误判 UNRECOGNIZED_PAGE 停掉。
+           这里只重置「无进展」计数，**不动** failures（真失败仍会按 failures 触发防呆）。 */
+        if (step.outcome === 'WAIT_LOAD' || step.outcome === 'TASKPOINT_WAIT') {
+          consecutiveNonProgress = 0;
+          await humanize.pollDelay();
+          continue;
+        }
         consecutiveNonProgress += 1;
         if (machine.failures >= cfg.safety.maxConsecutiveFailures) {
           machine.fatalStop('UNRECOGNIZED_PAGE', '连续 ' + machine.failures + ' 次关键操作失败/页面无法识别，停止并输出诊断');

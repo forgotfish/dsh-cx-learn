@@ -96,6 +96,61 @@ function isVideoTaskDone(input) {
 }
 
 /**
+ * 列出「本节还有哪几个视频/音频任务点没播完」。
+ *
+ * 【为什么需要它】
+ *   isVideoTaskDone() 只答「整节视频是否全完成」，无法回答「还剩哪几个」。
+ *   任务点多的节（如 12 个任务点 / 10 个视频）里，目录的 pending（整节任务点
+ *   总和）永远降不到 0/1，执行层因此无法「播下一个」，只能播完第 1 个就切节。
+ *   这里给出 pending 清单（含 objectid / frameUrl），执行层才能逐个推进。
+ *
+ * 【口径】
+ *   - 作用域复用 scopeTasksToSection（不重写归属逻辑）。
+ *   - 只取 kind === 'video' || 'audio'。
+ *   - finished !== true 一律算未完成（缺失/undefined 也按未完成）。
+ *   - objectid 允许缺失或 ''（探针后续补），原样容忍，不抛错。
+ *   - stale === true（任务点都来自别的 knowledgeid）⇒ ok:false，**不给出任何
+ *     「还剩几个」的结论**（total/finished/pending 归零），避免用不可信数据判断。
+ *
+ * @param {Array<{kind?:string, finished?:boolean, frameUrl?:string, objectid?:string}>} tasks
+ * @param {string} currentChapterId 当前节 chapterId
+ * @returns {{ok:boolean, stale:boolean, pending:Array, total:number, finished:number}}
+ */
+function pendingSectionVideos(tasks, currentChapterId) {
+  const { scoped, stale } = scopeTasksToSection(tasks, currentChapterId);
+
+  /* 不可信数据（来自别的 knowledgeid）⇒ 不给结论 */
+  if (stale) return { ok: false, stale: true, pending: [], total: 0, finished: 0 };
+
+  const media = scoped.filter((t) => t && (t.kind === 'video' || t.kind === 'audio'));
+  const pending = media
+    .filter((t) => t.finished !== true)
+    .map((t) => Object.assign({}, t, {
+      /* 保留两个关键字段；探针可能还没补 objectid，缺失按 '' 处理但字段一定在 */
+      objectid: t.objectid == null ? '' : t.objectid,
+      frameUrl: t.frameUrl == null ? '' : t.frameUrl,
+    }));
+
+  const total = media.length;
+  const finished = total - pending.length;
+  return { ok: true, stale: false, pending, total, finished };
+}
+
+/**
+ * 「本节媒体任务点是否全部完成」——等于 pendingSectionVideos() 全绿**且至少一个**。
+ * stale 数据、空清单都不算完成。
+ *
+ * @param {Array} tasks
+ * @param {string} chapterId
+ * @returns {boolean}
+ */
+function sectionVideosDone(tasks, chapterId) {
+  const r = pendingSectionVideos(tasks, chapterId);
+  if (!r.ok) return false;
+  return r.total > 0 && r.finished === r.total;
+}
+
+/**
  * 判定「整节是否已完成」（含章节测验也做完了）。
  * 只有当目录项 done 且没有未完成任务点时成立。
  */
@@ -201,6 +256,8 @@ module.exports = {
   knowledgeIdOf,
   scopeTasksToSection,
   isVideoTaskDone,
+  pendingSectionVideos,
+  sectionVideosDone,
   isSectionDone,
   pendingOf,
   pickNextSection,

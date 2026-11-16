@@ -62,10 +62,24 @@ window.__ModuleLoader__.load({
 [data-cx-msg]{font-size:12.5px;padding:8px 10px;border-radius:8px;}
 [data-cx-msg][data-ok]{background:#ecfdf5;color:#065f46;}
 [data-cx-msg][data-err]{background:#fef2f2;color:#991b1b;}
-[data-cx-group]{display:flex;align-items:center;gap:10px;padding:2px 2px 0;margin-top:2px;}
-[data-cx-group]::after{content:'';flex:1;height:1px;background:var(--dsw-alias-border-secondary,#e5e7eb);}
-[data-cx-group-title]{font-size:12px;font-weight:600;letter-spacing:.02em;color:var(--dsw-alias-label-secondary,#4b5563);white-space:nowrap;}
+[data-cx-tabs]{display:flex;align-items:center;gap:4px;padding:4px;border:1px solid var(--dsw-alias-border-secondary,#e5e7eb);border-radius:999px;align-self:flex-start;max-width:100%;overflow-x:auto;}
+[data-cx-tabbtn]{display:inline-flex;align-items:center;gap:6px;padding:7px 18px;border:0;border-radius:999px;background:transparent;color:var(--dsw-alias-label-secondary,#4b5563);font-size:13px;font-family:inherit;cursor:pointer;white-space:nowrap;}
+[data-cx-tabbtn]:hover{background:var(--dsw-alias-bg-secondary,#f3f4f6);color:var(--dsw-alias-label-primary,#111827);}
+[data-cx-tabbtn][data-on]{background:var(--dsw-alias-bg-primary,#fff);color:var(--dsw-alias-label-primary,#111827);font-weight:600;box-shadow:0 1px 3px rgba(0,0,0,.12);}
+[data-cx-tabdot]{width:7px;height:7px;border-radius:50%;flex:0 0 auto;}
+[data-cx-tabpanel]{display:flex;flex-direction:column;gap:16px;min-height:120px;}
+[data-cx-foot]{display:flex;align-items:center;gap:10px;}
+/* 标签页过滤：卡片按 data-cx-tab-of 归属，只有当前标签的卡片显示。 */
+[data-cx-page][data-cx-tab="内核"] [data-cx-tab-of]:not([data-cx-tab-of="内核"]),
+[data-cx-page][data-cx-tab="登录"] [data-cx-tab-of]:not([data-cx-tab-of="登录"]),
+[data-cx-page][data-cx-tab="选课"] [data-cx-tab-of]:not([data-cx-tab-of="选课"]),
+[data-cx-page][data-cx-tab="答题"] [data-cx-tab-of]:not([data-cx-tab-of="答题"]),
+[data-cx-page][data-cx-tab="开始"] [data-cx-tab-of]:not([data-cx-tab-of="开始"]){display:none;}
 [data-cx-bad]{color:#dc2626;}
+[data-cx-radio]{display:inline-flex;align-items:center;gap:7px;font-size:13px;line-height:1.2;color:var(--dsw-alias-label-primary,#111827);cursor:pointer;padding:6px 12px;border:1px solid var(--dsw-alias-border-secondary,#e5e7eb);border-radius:8px;user-select:none;}
+[data-cx-radio] input{margin:0;cursor:inherit;}
+[data-cx-radio][data-on]{border-color:var(--dsw-alias-accent,#2563eb);background:rgba(37,99,235,.07);}
+[data-cx-radio]:has(input:disabled){cursor:not-allowed;opacity:.55;}
 `
 
     function Panel() {
@@ -90,18 +104,46 @@ window.__ModuleLoader__.load({
       const [loadingCourses, setLoadingCourses] = React.useState(false)
       const [dirty, setDirty] = React.useState(false)
       const [questionsOpen, setQuestionsOpen] = React.useState(false)
+      // AI 答题：字段与 config.ai 一一对应。默认关，先只观察不点选。
+      const [aiEnabled, setAiEnabled] = React.useState(false)
+      const [aiDryRun, setAiDryRun] = React.useState(false)
+      const [aiModel, setAiModel] = React.useState('')
+      const [aiVision, setAiVision] = React.useState(true)
+      // aiOpen = 「高级」是否展开（默认收起，避免设置页堆一堆技术项）
+      const [aiOpen, setAiOpen] = React.useState(false)
+      // 章节测验策略：save（默认，只存草稿）/ none（只填不点）/ submit（真交卷）/ skip（不碰）
+      const [chapterQuiz, setChapterQuiz] = React.useState('save')
+      // v2 答题通道（追加在末尾，索引 25/26/27，别改顺序）：
+      // channel: session=可见会话窗口（默认）/ direct=隐藏直连；batchSize=每次投多少题；
+      // sessionId=上次 /llm-ask 回显的会话（由 /status.ai 提供，可能不存在）。
+      const [aiChannel, setAiChannel] = React.useState('session')  // 25
+      const [aiBatch, setAiBatch] = React.useState(10)             // 26
+      const [aiSessionId, setAiSessionId] = React.useState('')     // 27
+      // 界面按草图改成 5 个标签页：内核 / 登录 / 选课 / 答题 / 开始（索引 28/29，别改顺序）
+      const [tab, setTab] = React.useState('登录')                 // 28
+      const [logOpen, setLogOpen] = React.useState(false)          // 29
 
       const refresh = React.useCallback(async () => {
         try {
           const s = await jget('/status')
           setSt(s)
           setQuestions(Array.isArray(s?.questions) ? s.questions : [])
+          // 会话回显属状态读取，与 dirty 无关；/status.ai 可能还不存在（task-10 才加），做空值保护。
+          setAiSessionId(String((s && s.ai && s.ai.sessionId) || ''))
           if (!dirty && s?.config) {
             setUrl(s.config.courseUrl || '')
             setMode(s.config.mode || 'continue_chapters')
             setMaxSections(Number(s.config.maxSections) || 5)
             setBrowserId(s.config.browserId || '')
             setChromiumPath(s.config.chromiumPath || '')
+            const ai = (s.config && s.config.ai) || {}
+            setAiEnabled(ai.enabled === true)
+            setAiDryRun(ai.dryRun === true)
+            setAiModel(typeof ai.model === 'string' ? ai.model : '')
+            setAiVision(ai.vision !== false)
+            setChapterQuiz(typeof s.config.chapterQuiz === 'string' ? s.config.chapterQuiz : 'save')
+            setAiChannel(ai.channel === 'direct' ? 'direct' : 'session')
+            setAiBatch(Number(ai.batchSize) || 10)
           }
         } catch (e) {
           setMsg({ kind: 'err', text: '读状态失败：' + e.message })
@@ -114,13 +156,28 @@ window.__ModuleLoader__.load({
         return () => clearInterval(t)
       }, [refresh])
 
+      /* 保存通路只有一条 /config；ai 段整块写入，其余字段沿用宿主已有值。
+       * 章节测验策略由「答题」卡片一处决定：关掉 AI → skip（完全不碰）；
+       * 开着 → 保留=save（只存草稿）/ 提交=submit（真交卷）。 */
+      const cfgBody = () => ({
+        courseUrl: url.trim(), mode, maxSections: Number(maxSections) || 5,
+        browserId, chromiumPath: chromiumPath.trim(),
+        chapterQuiz: aiEnabled ? (chapterQuiz === 'submit' ? 'submit' : 'save') : 'skip',
+        ai: {
+          ...((st && st.config && st.config.ai) || {}),
+          enabled: aiEnabled,
+          dryRun: aiDryRun,
+          model: aiModel.trim(),
+          vision: aiVision,
+          channel: aiChannel,
+          batchSize: Number(aiBatch) || 10,
+        },
+      })
+
       const save = async () => {
         setBusy('save')
         try {
-          await jpost('/config', {
-            courseUrl: url.trim(), mode, maxSections: Number(maxSections) || 5,
-            browserId, chromiumPath: chromiumPath.trim(),
-          })
+          await jpost('/config', cfgBody())
           setDirty(false)
           setMsg({ kind: 'ok', text: '配置已保存' })
           await refresh()
@@ -132,10 +189,7 @@ window.__ModuleLoader__.load({
       const doStart = async () => {
         setBusy('start')
         try {
-          await jpost('/config', {
-            courseUrl: url.trim(), mode, maxSections: Number(maxSections) || 5,
-            browserId, chromiumPath: chromiumPath.trim(),
-          })
+          await jpost('/config', cfgBody())
           setDirty(false)
           // 每次开跑前先校验登录态：失效就明确提示扫码，避免跑到一半才 LOGIN_REQUIRED
           setMsg({ kind: 'ok', text: '正在校验登录态…' })
@@ -198,6 +252,26 @@ window.__ModuleLoader__.load({
           setMsg(ok ? { kind: 'ok', text: '草稿已复制到剪贴板。' } : { kind: 'err', text: '复制失败，请手动选中文本框内容复制。' })
         } catch (e) {
           setMsg({ kind: 'err', text: '复制失败：' + e.message })
+        }
+      }
+
+      /* 导出日志：取 /log（尾巴 80 行）存成 txt。纯前端，不碰任何账号数据。 */
+      const doExportLog = async () => {
+        try {
+          const r = await jget('/log')
+          const text = (r && r.ok && r.log) ? String(r.log) : String((st && st.logTail) || '')
+          const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
+          const blob = new Blob([text], { type: 'text/plain;charset=utf-8' })
+          const a = document.createElement('a')
+          a.href = URL.createObjectURL(blob)
+          a.download = 'cx-learn-log-' + stamp + '.txt'
+          document.body.appendChild(a)
+          a.click()
+          a.remove()
+          setTimeout(() => URL.revokeObjectURL(a.href), 4000)
+          setMsg({ kind: 'ok', text: '日志已导出（' + text.split('\n').length + ' 行）' })
+        } catch (e) {
+          setMsg({ kind: 'err', text: '导出日志失败：' + e.message })
         }
       }
 
@@ -364,6 +438,9 @@ window.__ModuleLoader__.load({
          缺一个就显示「—」，绝不拼出 "undefined" 或整行消失。 */
       const br = st?.browser || null
       const browserBad = !!br && br.alive === false
+      /* 真正的「内核坏了」= 明确报过错（lastErrorKind）。仅 alive:false（上一轮正常结束、
+         还没启动）不算坏——这正是主人反馈的「内核一直红，点登录才绿」。 */
+      const browserErr = browserBad && !!br.lastErrorKind
       const kernelLine = (() => {
         if (!br) return '内核：—'
         const parts = ['内核：' + (br.alive === true ? '就绪' : br.alive === false ? '已停止' : '—')]
@@ -377,15 +454,41 @@ window.__ModuleLoader__.load({
         return parts.join(' · ')
       })()
 
-      return h('div', { 'data-cx-page': '' },
+      /* 五个标签页：内核 → 登录 → 选课 → 答题 → 开始，按使用顺序排。
+         标签上有小圆点/勾，不点进去也能看出哪一步有问题。 */
+      const TABS = ['内核', '登录', '选课', '答题', '开始']
+      const tabDot = (t) => {
+        /* 内核 = 浏览器内核是否在跑：文件缺失→红；实测在跑→绿；未启动→灰。
+           不能把「没开」当「坏了」（browserBad 只表示 alive:false）。 */
+        if (t === '内核') return !envOk ? '#ef4444' : ((br && br.alive === true) ? '#16a34a' : '#9ca3af')
+        if (t === '登录') return loginState === 'logged_in' ? '#16a34a'
+          : (loginState === 'waiting' ? '#f59e0b' : (needLogin ? '#ef4444' : '#9ca3af'))
+        if (t === '选课') return url.trim() ? '#16a34a' : '#9ca3af'
+        if (t === '答题') return aiEnabled ? '#16a34a' : '#9ca3af'
+        return runningFlag ? '#16a34a' : '#9ca3af'
+      }
 
-        /* ══ 浏览器环境 ══
-           内核、健康、会话都在这一屏：出问题时先看这里，不用往下翻。
-           课程相关的东西一律放在「课程业务」，两块不混。 */
-        h('div', { 'data-cx-group': '' }, h('span', { 'data-cx-group-title': '' }, '浏览器环境')),
+      return h('div', { 'data-cx-page': '', 'data-cx-tab': tab },
+
+        h('div', { 'data-cx-tabs': '' },
+          TABS.map((t) => h('button', {
+            key: t, 'data-cx-tabbtn': '', 'data-cx-tab-id': t,
+            'data-on': tab === t ? '' : undefined,
+            onClick: () => setTab(t),
+          },
+            h('span', { 'data-cx-tabdot': '', style: { background: tabDot(t) } }),
+            t))),
+
+        /* 配置存盘只在「有未保存改动」时出现：平时不占地方，改了立刻蹦出来提醒。 */
+        dirty
+          ? h('div', { 'data-cx-foot': '' },
+              h('span', { 'data-cx-hint': '', 'data-cx-grow': '' }, '有未保存的改动'),
+              h('button', { 'data-cx-btn': '', onClick: () => { setDirty(false); refresh() } }, '撤销改动'),
+              h('button', { 'data-cx-btn': '', 'data-primary': '', onClick: save, disabled: busy !== '' }, '保存配置'))
+          : null,
 
         // 状态卡
-        h('div', { 'data-cx-card': '' },
+        h('div', { 'data-cx-card': '', 'data-cx-tab-of': '内核' },
           h('div', { 'data-cx-row': '' },
             h('span', {
               'data-cx-dot': '',
@@ -400,7 +503,7 @@ window.__ModuleLoader__.load({
             ' · 数据目录：' + (st?.home || '')),
           /* ★ 2026-10-30：内核健康行。数据来自 engine/.state/browser.json（浏览器层写），
              字段可能还没有（引擎版本比插件旧）→ 一律显示「—」，不报错、不留空白。 */
-          h('div', { 'data-cx-hint': '', 'data-cx-bad': browserBad ? '' : undefined },
+          h('div', { 'data-cx-hint': '', 'data-cx-bad': browserErr ? '' : undefined },
             kernelLine),
           h('div', { 'data-cx-hint': '' },
             '题目处理：安全识别后暂停，不自动答题或提交' +
@@ -413,7 +516,7 @@ window.__ModuleLoader__.load({
             : null),
 
         // 内核选择卡
-        h('div', { 'data-cx-card': '' },
+        h('div', { 'data-cx-card': '', 'data-cx-tab-of': '内核' },
           h('div', { 'data-cx-h': '' }, '浏览器内核'),
           h('div', { 'data-cx-row': '' },
             h('span', { 'data-cx-label': '', style: { width: 72 } }, '使用内核'),
@@ -458,7 +561,7 @@ window.__ModuleLoader__.load({
           )),
 
         // 会话卡：登录会话属于浏览器层，和内核放一起
-        h('div', { 'data-cx-card': '' },
+        h('div', { 'data-cx-card': '', 'data-cx-tab-of': '内核' },
           h('div', { 'data-cx-h': '' }, '登录会话'),
           /* 会话状态：告诉用户「现在这个登录还能用多久、内核在哪」 */
           sessionActive
@@ -482,11 +585,9 @@ window.__ModuleLoader__.load({
           h('div', { 'data-cx-hint': '' },
             '会话内可以「读课程 → 看课 → 换一门课 → 再看课」，不用重复扫码。')),
 
-        /* ══ 课程业务 ══ */
-        h('div', { 'data-cx-group': '' }, h('span', { 'data-cx-group-title': '' }, '课程业务')),
-
+        /* ══ 登录 ══ */
         // 扫码登录
-        h('div', { 'data-cx-card': '' },
+        h('div', { 'data-cx-card': '', 'data-cx-tab-of': '登录' },
           h('div', { 'data-cx-h': '' }, '扫码登录'),
           needLogin
             ? h('div', { 'data-cx-msg': '', 'data-err': '', style: { marginBottom: '8px' } },
@@ -528,7 +629,7 @@ window.__ModuleLoader__.load({
             : null),
 
         // 课程设置
-        h('div', { 'data-cx-card': '' },
+        h('div', { 'data-cx-card': '', 'data-cx-tab-of': '选课' },
           h('div', { 'data-cx-h': '' }, '课程设置'),
           h('div', { 'data-cx-hint': '' },
             '课程地址在学习通「课程 → 学习 → 任务点」页面地址栏里。'),
@@ -577,19 +678,10 @@ window.__ModuleLoader__.load({
               onChange: (e) => { setMaxSections(e.target.value); setDirty(true) },
               style: { width: 72 },
             }),
-            h('span', { 'data-cx-hint': '' }, '节')),
-          h('div', { 'data-cx-hint': '' },
-            '视频内随堂题：按选项顺序盲试，答错换下一个，直到答对（不计入课程成绩）。'),
-          h('div', { 'data-cx-hint': '' },
-            '章节测验/作业：只识别、记录，绝不作答或提交；视频看完后直接跳到下一节继续看。'),
-          h('div', { 'data-cx-hint': '' },
-            '答错且被要求回看、或剩余次数用尽时，会立即停止盲试，不会硬试。'),
-          h('div', { 'data-cx-row': '' },
-            h('button', { 'data-cx-btn': '', 'data-primary': '', onClick: save, disabled: busy !== '' || !dirty }, '保存配置'),
-            h('button', { 'data-cx-btn': '', onClick: () => { setDirty(false); refresh() }, disabled: !dirty }, '撤销改动'))),
+            h('span', { 'data-cx-hint': '' }, '节'))),
 
         // 运行控制
-        h('div', { 'data-cx-card': '' },
+        h('div', { 'data-cx-card': '', 'data-cx-tab-of': '开始' },
           h('div', { 'data-cx-h': '' }, '运行控制'),
           h('div', { 'data-cx-row': '' },
             h('button', {
@@ -600,9 +692,105 @@ window.__ModuleLoader__.load({
           h('div', { 'data-cx-hint': '' },
             '运行日志写在 ' + (st?.home || '...') + '/run.log，插件会保留最近一次的输出。')),
 
+        // 答题：一个问题「要不要用 AI 答」+ 一个问题「答完保留还是提交」，技术项收进「高级」。
+        h('div', { 'data-cx-card': '', 'data-cx-ai': '', 'data-cx-tab-of': '答题' },
+          h('div', { 'data-cx-row': '' },
+            h('div', { 'data-cx-h': '', 'data-cx-grow': '' }, '答题'),
+            h('span', { 'data-cx-ai-status': '', 'data-cx-hint': '' },
+              aiEnabled ? (aiDryRun ? '仅判定' : '已开启') : '未开启')),
+
+          h('label', { 'data-cx-row': '', style: { cursor: 'pointer' } },
+            h('input', {
+              type: 'checkbox', 'data-cx-ai-enabled': '',
+              checked: aiEnabled,
+              onChange: (e) => { setAiEnabled(!!e.target.checked); setDirty(true) },
+            }),
+            h('span', { 'data-cx-label': '' }, '用 AI 做章节测验'),
+            h('span', { 'data-cx-hint': '', 'data-cx-grow': '' },
+              aiEnabled
+                ? '章节测验交给 AI 判断作答'
+                : '关闭时：章节测验完全不碰；视频随堂题始终按顺序盲试')),
+
+          h('div', { 'data-cx-row': '', style: { opacity: aiEnabled ? 1 : 0.5 } },
+            h('span', { 'data-cx-label': '', style: { width: 64 } }, '答完之后'),
+            h('label', { 'data-cx-radio': '', 'data-on': chapterQuiz !== 'submit' ? '' : undefined },
+              h('input', {
+                type: 'radio', name: 'cx-quiz-after', 'data-cx-quiz-after': 'save',
+                checked: chapterQuiz !== 'submit',
+                disabled: !aiEnabled,
+                onChange: () => { setChapterQuiz('save'); setDirty(true) },
+              }),
+              h('span', {}, '保留（存草稿）')),
+            h('label', { 'data-cx-radio': '', 'data-on': chapterQuiz === 'submit' ? '' : undefined },
+              h('input', {
+                type: 'radio', name: 'cx-quiz-after', 'data-cx-quiz-after': 'submit',
+                checked: chapterQuiz === 'submit',
+                disabled: !aiEnabled,
+                onChange: () => { setChapterQuiz('submit'); setDirty(true) },
+              }),
+              h('span', {}, '提交（交卷）'))),
+
+          h('div', { 'data-cx-hint': '' },
+            !aiEnabled
+              ? '章节测验不会读取也不作答；视频随堂题不影响成绩，始终按 A→B→C 顺序盲试直到答对。'
+              : chapterQuiz === 'submit'
+                ? '⚠ 章节测验会真的交卷并产生成绩，提交后不可撤回。'
+                : '章节测验逐题交给 AI 作答，之后只点「保存」存草稿，不交卷；你自己复核后再决定是否交。'),
+
+          h('div', { 'data-cx-row': '' },
+            h('button', { 'data-cx-btn': '', onClick: () => setAiOpen(!aiOpen) }, aiOpen ? '收起高级' : '高级'),
+            h('span', { 'data-cx-hint': '' }, '模型 / 答题通道 / 每次题量')),
+
+          aiOpen
+            ? h('div', {
+                style: {
+                  display: 'flex', flexDirection: 'column', gap: 10,
+                  paddingTop: 10, borderTop: '1px solid var(--dsw-alias-border-secondary,#e5e7eb)',
+                },
+              },
+                h('div', { 'data-cx-row': '' },
+                  h('span', { 'data-cx-label': '', style: { width: 64 } }, '模型'),
+                  h('input', {
+                    'data-cx-in': '', 'data-cx-grow': '',
+                    placeholder: '留空 = 用宿主默认模型',
+                    value: aiModel,
+                    onChange: (e) => { setAiModel(e.target.value); setDirty(true) },
+                  })),
+                h('div', { 'data-cx-row': '' },
+                  h('span', { 'data-cx-label': '', style: { width: 64 } }, '答题通道'),
+                  h('select', {
+                    'data-cx-in': '', 'data-cx-grow': '',
+                    value: aiChannel,
+                    onChange: (e) => { setAiChannel(e.target.value); setDirty(true) },
+                  },
+                    h('option', { value: 'session' }, '工作区窗口（答题过程可见）'),
+                    h('option', { value: 'direct' }, '隐藏直连（不弹窗口）'))),
+                h('div', { 'data-cx-row': '' },
+                  h('span', { 'data-cx-label': '', style: { width: 64 } }, '每次题量'),
+                  h('select', {
+                    'data-cx-in': '', 'data-cx-grow': '',
+                    value: String(aiBatch),
+                    onChange: (e) => { setAiBatch(Number(e.target.value)); setDirty(true) },
+                  },
+                    h('option', { value: '1' }, '1 题（逐题）'),
+                    h('option', { value: '5' }, '5 题'),
+                    h('option', { value: '10' }, '10 题'),
+                    h('option', { value: '16' }, '16 题'))),
+                h('label', { 'data-cx-row': '', style: { cursor: 'pointer' } },
+                  h('input', {
+                    type: 'checkbox', 'data-cx-ai-dryrun': '',
+                    checked: aiDryRun,
+                    onChange: (e) => { setAiDryRun(!!e.target.checked); setDirty(true) },
+                  }),
+                  h('span', { 'data-cx-label': '' }, '只判定不点选（调试）')),
+                aiSessionId
+                  ? h('div', { 'data-cx-hint': '', 'data-cx-ai-session': '' }, '答题窗口会话：' + aiSessionId)
+                  : null)
+            : null),
+
         // 待处理题目：识别后停在队列里，由用户逐条投递到对话框草稿。题目多于 3 条时默认折叠。
         questions.length
-          ? h('div', { 'data-cx-card': '' },
+          ? h('div', { 'data-cx-card': '', 'data-cx-tab-of': '答题' },
               h('div', { 'data-cx-row': '' },
                 h('div', { 'data-cx-h': '', 'data-cx-grow': '' }, '待处理题目（' + questions.length + '）'),
                 questions.length > 3
@@ -644,11 +832,22 @@ window.__ModuleLoader__.load({
 
         msg ? h('div', { 'data-cx-msg': '', 'data-ok': msg.kind === 'ok' ? '' : undefined, 'data-err': msg.kind === 'err' ? '' : undefined }, msg.text) : null,
 
-        st?.logTail
-          ? h('div', { 'data-cx-card': '' },
-              h('div', { 'data-cx-h': '' }, '最近日志'),
-              h('pre', { 'data-cx-pre': '' }, st.logTail))
-          : null,
+        /* 日志：常驻在页面最下面（草图的位置）。默认只给 6 行，点「展开」看全部，
+           「导出」把 /log 返回的完整尾巴存成 .txt，方便贴给别人看。 */
+        h('div', { 'data-cx-card': '' },
+          h('div', { 'data-cx-row': '' },
+            h('div', { 'data-cx-h': '', 'data-cx-grow': '' }, '日志'),
+            h('button', {
+              'data-cx-btn': '', 'data-cx-log-toggle': '',
+              onClick: () => setLogOpen(!logOpen),
+            }, logOpen ? '收起' : '展开'),
+            h('button', { 'data-cx-btn': '', 'data-cx-log-export': '', onClick: doExportLog }, '导出')),
+          h('pre', {
+            'data-cx-pre': '',
+            style: logOpen
+              ? { maxHeight: 420 }
+              : { maxHeight: 96, overflow: 'hidden' },
+          }, st?.logTail || '（还没有日志）')),
       )
     }
 

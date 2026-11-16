@@ -162,11 +162,16 @@ async function openChapterTab(adapter) {
       const s = getComputedStyle(el);
       return s.display !== 'none' && s.visibility !== 'hidden';
     };
+    /* ★ 2026-11-16（D-027 现场）：有的课程点进去直接落在 studentstudy 学习页，
+       那里的页签叫「目录」且**已经激活**（章节树内联在主页里，不是 mooc2-ans 的
+       跨域 iframe）。只认「章节」会 tab-not-found → ENTRY_CHAPTER_FAILED。
+       两个名字都接受；点已激活的「目录」是无副作用的空操作。 */
+    const isTab = (s) => s === '章节' || s === '目录';
     let best = null;
     document.querySelectorAll('a, li, span, div').forEach((el) => {
       if (!vis(el)) return;
-      if (txt(el) !== '章节') return;
-      const inner = [...el.querySelectorAll('a, li, span, div')].some((c) => vis(c) && txt(c) === '章节');
+      if (!isTab(txt(el))) return;
+      const inner = [...el.querySelectorAll('a, li, span, div')].some((c) => vis(c) && isTab(txt(c)));
       if (inner) return;
       if (!best) best = el;
     });
@@ -219,12 +224,13 @@ async function openChapterTab(adapter) {
       const s = getComputedStyle(el);
       return s.display !== 'none' && s.visibility !== 'hidden';
     };
-    // 找最内层的「章节」文字元素
+    // 找最内层的「章节」/「目录」文字元素（D-027：两种叫法都接受）
+    const isTab = (s) => s === '章节' || s === '目录';
     let best = null;
     document.querySelectorAll('a, li, span, div').forEach((el) => {
-      if (txt(el) !== '章节') return;
+      if (!isTab(txt(el))) return;
       if (!vis(el)) return;
-      const inner = [...el.querySelectorAll('a, li, span, div')].some((c) => vis(c) && txt(c) === '章节');
+      const inner = [...el.querySelectorAll('a, li, span, div')].some((c) => vis(c) && isTab(txt(c)));
       if (inner) return;
       if (!best) best = el;
     });

@@ -206,11 +206,26 @@ try {
   process.exit(1);
 }
 
-const sections = groupSections(page);
-const groupNames = Object.keys(sections);
-console.log('  分组：' + groupNames.join(' / '));
-ok(JSON.stringify(groupNames) === JSON.stringify(['浏览器环境', '课程业务']),
-  '★ 只分两块，且顺序是「浏览器环境 → 课程业务」（实际 ' + groupNames.join(' / ') + '）');
+/* 2026-11-15：界面按主人的草图改成 5 个标签页（内核/登录/选课/答题/开始），
+   不再有「浏览器环境 / 课程业务」两块分组，因此这里改成按 data-cx-tab-of 断言。 */
+const TAB_NAMES = ['内核', '登录', '选课', '答题', '开始'];
+let tabsBar = null;
+walk(page, (el) => { if (!tabsBar && el.props && el.props['data-cx-tabs'] !== undefined) tabsBar = el; });
+const tabIds = tabsBar
+  ? tabsBar.children.map((b) => (b && b.props ? b.props['data-cx-tab-id'] : null)).filter(Boolean)
+  : [];
+console.log('  标签页：' + tabIds.join(' / '));
+ok(JSON.stringify(tabIds) === JSON.stringify(TAB_NAMES),
+  '★ 五个标签页且顺序是 内核 → 登录 → 选课 → 答题 → 开始（实际 ' + tabIds.join('/') + '）');
+ok(page.props['data-cx-tab'] === '登录', '★ 页面根节点带 data-cx-tab，默认停在「登录」');
+
+const tabCards = {};
+for (const kid of page.children) {
+  const k = kid && typeof kid === 'object' && kid.props && kid.props['data-cx-tab-of'];
+  if (k) (tabCards[k] = tabCards[k] || []).push(kid);
+}
+ok(JSON.stringify(Object.keys(tabCards).sort()) === JSON.stringify(TAB_NAMES.slice().sort()),
+  '★ 每张卡片都归属某个标签页（实际 ' + Object.keys(tabCards).join('/') + '）');
 
 const allButtons = buttonsIn([page]);
 console.log('  按钮：' + allButtons.map((b) => textOf(b).trim()).join(' / '));
@@ -218,23 +233,47 @@ console.log('  按钮：' + allButtons.map((b) => textOf(b).trim()).join(' / '))
 ok(allButtons.length > 0, '面板上有按钮');
 ok(allButtons.every((b) => typeof b.props.onClick === 'function'), '★ 每个按钮都绑定了 onClick（无「定义了但没绑定」）');
 
-const groups = Object.fromEntries(Object.entries(sections).map(([k, v]) => [k, buttonsIn(v).map((b) => textOf(b).trim())]));
-const browserBtns = groups['浏览器环境'] || [];
-const courseBtns = groups['课程业务'] || [];
+const btnsOf = (n) => buttonsIn(tabCards[n] || []).map((b) => textOf(b).trim());
+const kernelBtns = btnsOf('内核');
+const loginBtns = btnsOf('登录');
+const courseBtns = btnsOf('选课');
+const answerBtns = btnsOf('答题');
+const runBtns = btnsOf('开始');
 
-ok(['刷新', '重启内核', '结束会话'].every((t) => browserBtns.includes(t)),
-  '★ 浏览器环境含：刷新 / 重启内核 / 结束会话（实际 ' + browserBtns.join(',') + '）');
-ok(['开始登录', '刷新二维码', '读取我的课程', '保存配置', '撤销改动', '开始看课', '停止'].every((t) => courseBtns.includes(t)),
-  '★ 课程业务含：登录 / 课程 / 启停（实际 ' + courseBtns.join(',') + '）');
+ok(['刷新', '重启内核', '结束会话'].every((t) => kernelBtns.includes(t)),
+  '★「内核」含：刷新 / 重启内核 / 结束会话（实际 ' + kernelBtns.join(',') + '）');
+ok(['开始登录', '刷新二维码'].every((t) => loginBtns.includes(t)),
+  '★「登录」含：开始登录 / 刷新二维码（实际 ' + loginBtns.join(',') + '）');
+ok(courseBtns.includes('读取我的课程'), '★「选课」含：读取我的课程（实际 ' + courseBtns.join(',') + '）');
+ok(answerBtns.includes('高级'), '★「答题」含：高级（答题通道/每次题量收在里面）');
+ok(['开始看课', '停止'].every((t) => runBtns.includes(t)),
+  '★「开始」含：开始看课 / 停止（实际 ' + runBtns.join(',') + '）');
 
-ok(!browserBtns.includes('开始看课'), '★「开始看课」不在浏览器环境组');
-ok(!courseBtns.includes('重启内核') && !courseBtns.includes('结束会话'),
-  '★「重启内核 / 结束会话」不在课程业务组（属于浏览器层）');
+const pageBtns = allButtons.map((b) => textOf(b).trim());
+/* 存盘行只在「有未保存改动」时出现（dirty 是第 18 个 useState，索引 17）。 */
+const dirtyPage = loadPanel({ 17: true });
+const dirtyBtns = buttonsIn([dirtyPage]).map((b) => textOf(b).trim());
+ok(dirtyBtns.includes('保存配置') && dirtyBtns.includes('撤销改动'),
+  '★ 有未保存改动时出现「保存配置 / 撤销改动」（实际 ' + dirtyBtns.join(',') + '）');
+ok(!pageBtns.includes('保存配置'), '★ 没有改动时不留空按钮行');
+
+ok(!loginBtns.includes('开始看课') && !courseBtns.includes('开始看课'),
+  '★「开始看课」只在「开始」页');
+ok(!courseBtns.includes('重启内核') && !courseBtns.includes('结束会话') && !loginBtns.includes('结束会话'),
+  '★「重启内核 / 结束会话」只在「内核」页');
 
 console.log('== 2. 已删除的答题 UI 不得回来 ==');
 const pageText = textOf(page);
 ok(!/答题方式/.test(pageText), '★ 不再有「答题方式」下拉');
-ok(!/模型/.test(pageText), '★ 页面上不再出现「模型」字样');
+/* AI 答题卡片有意引入「模型」输入框（留空走宿主默认）；
+   被删掉的是旧的「模型下拉选择」，不许以 select 的形式回来。 */
+{
+  const modelSelects = [];
+  walk(page, (el) => {
+    if (el.type === 'select' && /模型/.test(textOf(el))) modelSelects.push(textOf(el).slice(0, 40));
+  });
+  ok(modelSelects.length === 0, '★ 不再有「模型」下拉选择（实际 ' + modelSelects.join(',') + '）');
+}
 ok(!/ask-test|models\/health/.test(fs.readFileSync(path.join(ROOT, 'client.js'), 'utf8')), '★ client.js 不再调用已删除的答题接口');
 
 console.log('== 3. 前端调用的接口必须在后端存在 ==');
@@ -255,6 +294,10 @@ const noUiNeeded = new Map([
   ['/health', '监测用'], ['/status', 'UI 已用'], ['/config', 'UI 已用'], ['/log', 'UI 已用'],
   ['/questions', 'UI 已用'], ['/ask', '预留接口，不给 UI'], ['/browsers', '并进 /status'],
   ['/start', 'UI 走 /start-precheck'], ['/check-login', 'UI 走 /start-precheck'],
+  /* D-019：/llm-ask 是**引擎专用**内部端点，不是给设置页用的。
+     调用方是子进程引擎（读 CX_LLM_ASK_URL 发起），带本轮 spawn 的 x-cx-token 鉴权；
+     前端永远不该调它。给它配 UI 入口反而是安全倒退。 */
+  ['/llm-ask', '引擎专用内部端点（D-019），前端不得调用'],
 ]);
 const orphan = [...routes].filter((r) => !used.has(r) && !noUiNeeded.has(r));
 ok(orphan.length === 0, '★ 没有「后端实现了但前端从不调用」的路由（孤儿：' + orphan.join(',') + '）');
@@ -265,7 +308,9 @@ ok(orphan.length === 0, '★ 没有「后端实现了但前端从不调用」的
  * 顺序：0 st / 1 qr / 2 busy / 3 loginState / 4 loginHint / 5 msg / 6 zoom /
  *       7 url / 8 mode / 9 maxSections / 10 browserId / 11 chromiumPath /
  *       12 questions / 13 draftText / 14 needLogin / 15 courses /
- *       16 loadingCourses / 17 dirty
+ *       16 loadingCourses / 17 dirty / 18 questionsOpen /
+ *       19 aiEnabled / 20 aiDryRun / 21 aiModel / 22 aiVision / 23 aiOpen /
+ *       24 chapterQuiz / 25 aiChannel / 26 aiBatch / 27 aiSessionId
  * 改了 Panel 的 state 顺序 → 这里会红，同步更新即可。 */
 console.log('== 5. 数据态渲染（会话 / 二维码 / 题目 / 日志）==');
 const now = Date.now();
@@ -329,6 +374,139 @@ console.log('== 6. 待处理题目折叠（>3 条默认收起）==');
   ok(btns.includes('展开'), '★ 提供「展开」按钮');
   ok(!btns.includes('投递草稿'), '★ 默认折叠时不渲染题目列表');
   ok(t.includes('已折叠 5 条'), '★ 折叠时给出摘要');
+}
+
+console.log('== 7. 答题卡片（一句话开关：用不用 AI / 答完保留还是提交）==');
+{
+  const findOne = (root, key) => {
+    let hit = null;
+    walk(root, (el) => { if (!hit && el.props && el.props[key] !== undefined) hit = el; });
+    return hit;
+  };
+  /* state 顺序：19 aiEnabled / 20 aiDryRun / 21 aiModel / 22 aiVision / 23 aiOpen（高级） / 24 chapterQuiz */
+  const AI_ENABLED = 19;
+  const AI_OPEN = 23;
+  const CHAPTER_QUIZ = 24;
+
+  const page0 = loadPanel();
+  const toggle = findOne(page0, 'data-cx-ai-enabled');
+  const statusEl = findOne(page0, 'data-cx-ai-status');
+  ok(toggle && toggle.props.type === 'checkbox' && toggle.props.checked === false,
+    '★ 「用 AI 答题」默认关闭');
+  ok(statusEl && textOf(statusEl).trim() === '未开启',
+    '★ 默认状态文案为「未开启」（实际 ' + (statusEl ? textOf(statusEl).trim() : '无') + '）');
+
+  const saveRadio = findOne(page0, 'data-cx-quiz-after');
+  ok(saveRadio && saveRadio.props.type === 'radio', '★ 有「答完之后」单选组');
+  const allRadios = [];
+  walk(page0, (el) => { if (el.type === 'input' && el.props && el.props.name === 'cx-quiz-after') allRadios.push(el); });
+  ok(allRadios.length === 2, '★ 两个选项：保留 / 提交（实际 ' + allRadios.length + '）');
+  ok(allRadios.every((r) => r.props.disabled === true), '★ AI 关闭时两个选项都禁用');
+  ok(/盲试/.test(textOf(page0)), '★ AI 关闭时提示「随堂题按顺序盲试」');
+
+  /* 高级默认收起：技术项不该占版面 */
+  ok(findOne(page0, 'data-cx-ai-dryrun') === null, '★ 「高级」默认收起（不渲染模型/通道/题量）');
+  const advBtn = buttonsIn([page0]).filter((b) => /高级/.test(textOf(b)));
+  ok(advBtn.length === 1, '★ 有「高级」按钮');
+
+  /* 打开高级后技术项才出现 */
+  const adv = loadPanel({ [AI_ENABLED]: true, [AI_OPEN]: true });
+  ok(findOne(adv, 'data-cx-ai-dryrun') !== null, '★ 展开后出现「只判定不点选」调试开关');
+
+  /* 开关打开后单选可改，默认仍是「保留」 */
+  const live = loadPanel({ [AI_ENABLED]: true });
+  const liveRadios = [];
+  walk(live, (el) => { if (el.type === 'input' && el.props && el.props.name === 'cx-quiz-after') liveRadios.push(el); });
+  ok(liveRadios.every((r) => r.props.disabled === false), '★ AI 开启后两个选项可点');
+  const liveSave = liveRadios.find((r) => r.props['data-cx-quiz-after'] === 'save');
+  ok(liveSave && liveSave.props.checked === true, '★ 默认选「保留（存草稿）」');
+  ok(/只点「保存」存草稿，不交卷/.test(textOf(live)), '★ 保留档提示写明「只存草稿、不交卷」');
+
+  /* 选提交必须有醒目警示 */
+  const sub = loadPanel({ [AI_ENABLED]: true, [CHAPTER_QUIZ]: 'submit' });
+  const subRadios = [];
+  walk(sub, (el) => { if (el.type === 'input' && el.props && el.props.name === 'cx-quiz-after') subRadios.push(el); });
+  const subSubmit = subRadios.find((r) => r.props['data-cx-quiz-after'] === 'submit');
+  ok(subSubmit && subSubmit.props.checked === true, '★ 选提交时 radio 状态正确');
+  ok(/不可撤回/.test(textOf(sub)), '★ 选提交时给出「不可撤回」警示');
+}
+
+console.log('== 8. 高级项（模型 / 通道 / 题量 / 会话回显）==');
+{
+  const findSelectByLabel = (root, labelRe) => {
+    let hit = null;
+    walk(root, (el) => {
+      if (!hit && el.type === 'select' && el.props && el.props['data-cx-in'] !== undefined
+          && el.children.some((c) => c && c.type === 'option' && labelRe.test(textOf(c)))) hit = el;
+    });
+    return hit;
+  };
+  /* 23 aiOpen / 25 aiChannel / 26 aiBatch / 27 aiSessionId */
+  const AI_OPEN = 23;
+  const AI_CHANNEL = 25;
+  const AI_BATCH = 26;
+  const AI_SESSION = 27;
+
+  const adv = loadPanel({ 19: true, [AI_OPEN]: true });
+
+  const channelSel = findSelectByLabel(adv, /工作区窗口|隐藏直连/);
+  ok(!!channelSel, '★ 有「答题通道」下拉');
+  const channelVals = channelSel ? channelSel.children.filter((c) => c && c.type === 'option').map((o) => o.props.value) : [];
+  ok(JSON.stringify(channelVals) === JSON.stringify(['session', 'direct']),
+    '★ 通道两档：session / direct（实际 ' + channelVals.join(',') + '）');
+  ok(channelSel && channelSel.props.value === 'session', '★ 通道默认 session');
+
+  const batchSel = findSelectByLabel(adv, /逐题|题$/);
+  ok(!!batchSel, '★ 有「每次题量」下拉');
+  const batchVals = batchSel ? batchSel.children.filter((c) => c && c.type === 'option').map((o) => o.props.value) : [];
+  ok(JSON.stringify(batchVals) === JSON.stringify(['1', '5', '10', '16']),
+    '★ 题量四档：1 / 5 / 10 / 16（实际 ' + batchVals.join(',') + '）');
+  ok(batchSel && batchSel.props.value === '10', '★ 题量默认 10');
+
+  /* 索引反证 */
+  const wired = loadPanel({ 19: true, [AI_OPEN]: true, [AI_CHANNEL]: 'direct', [AI_BATCH]: 5 });
+  const chSel2 = findSelectByLabel(wired, /工作区窗口|隐藏直连/);
+  const btSel2 = findSelectByLabel(wired, /逐题|题$/);
+  ok(chSel2 && chSel2.props.value === 'direct', '★ INDEX 25 确为 aiChannel');
+  ok(btSel2 && btSel2.props.value === '5', '★ INDEX 26 确为 aiBatch');
+
+  const noSess = textOf(adv);
+  ok(!/答题窗口会话：/.test(noSess), '★ 没会话时不渲染会话提示');
+  const withSess = loadPanel({ 19: true, [AI_OPEN]: true, [AI_SESSION]: 'sess-abc123' });
+  ok(/答题窗口会话：sess-abc123/.test(textOf(withSess)), '★ 有会话时回显会话 id');
+}
+
+console.log('== 9. 保存体（一章策略由「用 AI」+「保留/提交」推导）==');
+{
+  const src = fs.readFileSync(path.join(ROOT, 'client.js'), 'utf8');
+  ok(/chapterQuiz:\s*aiEnabled\s*\?\s*\(chapterQuiz === 'submit' \? 'submit' : 'save'\)\s*:\s*'skip'/.test(src),
+    '★ 关掉 AI → chapterQuiz=skip；开着 → 保留 save / 提交 submit');
+  ok(/enabled:\s*aiEnabled/.test(src) && /dryRun:\s*aiDryRun/.test(src) && /model:\s*aiModel\.trim\(\)/.test(src),
+    '★ ai 段写入 enabled / dryRun / model');
+  ok(/channel:\s*aiChannel/.test(src), '★ ai 段写入 channel');
+  ok(/batchSize:\s*Number\(aiBatch\)/.test(src), '★ ai 段写入 batchSize');
+}
+
+/* ---- 10. ★ D-025：内核圆点 = 内核实测在跑；未启动是灰不是红 ---- */
+console.log('== 10. 内核圆点：未启动=灰、在跑=绿、文件缺=红 ==');
+{
+  const dotOf = (page, tab) => {
+    let color = null;
+    walk(page, (el) => {
+      if (el.type === 'button' && el.props && el.props['data-cx-tab-id'] === tab) {
+        walk(el, (c) => { if (c.props && 'data-cx-tabdot' in c.props) color = c.props.style && c.props.style.background; });
+      }
+    });
+    return color;
+  };
+  const cAlive = dotOf(loadPanel({ 0: stFull }), '内核');
+  ok(cAlive === '#16a34a', '★ 内核在跑 → 绿（实际 ' + cAlive + '）');
+  const cDead = dotOf(loadPanel({ 0: { ...stFull, browser: { alive: false, lastErrorKind: '', restarts: 0 } } }), '内核');
+  ok(cDead === '#9ca3af', '★ 内核只是没在跑（alive:false 无错）→ 灰不是红（实际 ' + cDead + '）');
+  const cNoBr = dotOf(loadPanel({ 0: { ...stFull, browser: null } }), '内核');
+  ok(cNoBr === '#9ca3af', '★ 浏览器状态缺失 → 灰（实际 ' + cNoBr + '）');
+  const cNoEnv = dotOf(loadPanel({ 0: { ...stFull, engineReady: false, browser: null } }), '内核');
+  ok(cNoEnv === '#ef4444', '★ 引擎文件缺失 → 红（实际 ' + cNoEnv + '）');
 }
 
 finish();

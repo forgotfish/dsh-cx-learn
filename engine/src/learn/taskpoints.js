@@ -31,6 +31,7 @@
 const TASK_KIND = {
   VIDEO: 'video',
   AUDIO: 'audio',
+  LIVE: 'live',
   DOCUMENT: 'document',
   QUIZ: 'quiz',
   DISCUSSION: 'discussion',
@@ -75,6 +76,13 @@ async function decideTaskPoint(kind, ctx) {
   if (k === TASK_KIND.VIDEO) {
     return { action: 'play', reason: '视频任务点：交给播放推进流程' };
   }
+  /* ★ D-026：直播回放走**独立动作** open_live，绝不复用 'play'。
+     原因：'play' 会落进 tick() 的视频路径，那条路径强依赖「同一个 frame 里的
+     <video> + objectid 对齐」；直播播放器在 zhibo.chaoxing.com 的**新标签页**、
+     页内无 objectid、也没有任务点 video 元素，走 'play' 必然死循环。 */
+  if (k === TASK_KIND.LIVE) {
+    return { action: 'open_live', reason: '直播回放任务点：在新标签页打开播放器并累计观看时长' };
+  }
 
   const fn = _handlers.get(k);
   if (fn) {
@@ -109,15 +117,16 @@ function kindOf(task) {
   return known.indexOf(k) >= 0 ? k : TASK_KIND.UNKNOWN;
 }
 
-/** 当前是否支持「真正推进」某个类型（只有 video 是） */
+/** 当前是否支持「真正推进」某个类型（video 与 live） */
 function isSupported(kind) {
-  return String(kind) === TASK_KIND.VIDEO;
+  const k = String(kind);
+  return k === TASK_KIND.VIDEO || k === TASK_KIND.LIVE;
 }
 
 /** 诊断用：列出当前注册情况 */
 function describe() {
   return {
-    supported: [TASK_KIND.VIDEO],
+    supported: [TASK_KIND.VIDEO, TASK_KIND.LIVE],
     registered: Array.from(_handlers.keys()),
     neverTouch: [TASK_KIND.QUIZ],
     defaultForUnknown: 'skip',

@@ -113,10 +113,17 @@ const SELECTORS = {
   quizQuestionSel: '.TiMu.newTiMu, .TiMu',
   /* 作业页选项字母来源（span.num_option 的 data 属性就是 A/B/C/D） */
   quizOptionLetterSel: 'span.num_option[data]',
-  /* 提交按钮：class 优先（学习通是英文按钮，靠中文文本必然失配） */
-  quizSubmitSel: ['.btnSubmit', '.btnSave', '.workBtnIndex'],
-  /* 提交按钮文本（英文界面下全是英文） */
-  quizSubmitText: ['提交', '确定', '交卷', 'Submit', 'Save', 'Confirm', 'OK'],
+  /* 提交按钮：class 优先（学习通是英文按钮，靠中文文本必然失配）
+     ★ 2026-11-15：`.btnSave` 已从「提交」候选里剔除。超星作业页有两个按钮：
+         A.btnSubmit.workBtnIndex（Submit，交卷）/ A.btnSave.workBtnIndex（Save，存草稿）。
+       以前两者混在一个候选表里，先命中的可能是「保存」——把存草稿当成交卷上报。
+       现在提交只认 .btnSubmit，保存走 quizSaveSel，二者严格分开。 */
+  quizSubmitSel: ['.btnSubmit', '.workBtnIndex'],
+  /* 提交按钮文本（英文界面下全是英文）。★ 不含 'Save'，否则「保存」会被当「提交」。 */
+  quizSubmitText: ['提交', '交卷', 'Submit'],
+  /* 保存按钮（只存草稿，不交卷）。章节测验默认模式就点它。 */
+  quizSaveSel: ['.btnSave', '.btnSave.workBtnIndex', 'a[onclick*="saveWork"]', 'a[onclick*="saveInfo"]'],
+  quizSaveText: ['保存', '暂存', 'Save'],
   /* 题块里的选项 li（一个 li = 一个选项；不能用 'label, li' 混抓，会重复一倍） */
   quizOptionClass: 'li.font-cxsecret.before-after',
   /* 经典弹题：可见单选框（页面侧第三层兜底） */
@@ -442,12 +449,14 @@ const PAGE_PROBE_SRC = `(function () {
 
   /* 提交按钮：先按 class 找（学习通是英文 class，最稳），再按文本找（中文界面兜底）。 */
   function findSubmit() {
-    for (var i = 0; i < S.quizSubmitSel.length; i++) {
+    var i, j;
+    for (i = 0; i < S.quizSubmitSel.length; i++) {
       var els = null;
       try { els = document.querySelectorAll(S.quizSubmitSel[i]); } catch (e) { els = null; }
       if (!els) continue;
-      for (var j = 0; j < els.length; j++) {
+      for (j = 0; j < els.length; j++) {
         if (!visible(els[j])) continue;
+        if (isSaveButton(els[j])) continue;      // ★ 保存按钮永远不算提交
         var t = norm(els[j].innerText || els[j].value || '');
         if (!t) continue;
         return { el: els[j], text: t.slice(0, 30) };
@@ -455,10 +464,47 @@ const PAGE_PROBE_SRC = `(function () {
     }
     var btns = findButtons(document);
     for (var b = 0; b < btns.length; b++) {
+      if (isSaveButton(btns[b])) continue;
       var t2 = norm(btns[b].innerText || btns[b].value || '');
       if (matchAny(t2, S.quizSubmitText)) return { el: btns[b], text: t2.slice(0, 30) };
     }
     return null;
+  }
+
+  /* 保存按钮（只存草稿）。找不到就返回 null —— 绝不退化成点提交。 */
+  function findSave() {
+    var i, j;
+    for (i = 0; i < S.quizSaveSel.length; i++) {
+      var els = null;
+      try { els = document.querySelectorAll(S.quizSaveSel[i]); } catch (e) { els = null; }
+      if (!els) continue;
+      for (j = 0; j < els.length; j++) {
+        if (!visible(els[j])) continue;
+        var t = norm(els[j].innerText || els[j].value || '') || 'Save';
+        return { el: els[j], text: t.slice(0, 30) };
+      }
+    }
+    var btns = findButtons(document);
+    for (var b = 0; b < btns.length; b++) {
+      if (!visible(btns[b])) continue;
+      var t2 = norm(btns[b].innerText || btns[b].value || '');
+      if (t2 && matchAny(t2, S.quizSaveText) && !matchAny(t2, S.quizSubmitText)) {
+        return { el: btns[b], text: t2.slice(0, 30) };
+      }
+    }
+    return null;
+  }
+
+  /* 判定一个元素是不是「保存」按钮：class 含 btnSave，或文本是 保存/Save。 */
+  function isSaveButton(el) {
+    try {
+      if (el.classList && el.classList.contains('btnSave')) return true;
+      var cls = String(el.className || '');
+      if (/(^|\s)btnSave(\s|$)/.test(cls)) return true;
+      var t = norm(el.innerText || el.value || '');
+      if (t && matchAny(t, S.quizSaveText) && !matchAny(t, S.quizSubmitText)) return true;
+    } catch (e) {}
+    return false;
   }
 
   function quizScan() {
@@ -858,6 +904,14 @@ const PAGE_PROBE_SRC = `(function () {
       if (!sub) return null;
       return { el: sub.el, layer: 2, note: 'work-submit:' + sub.text };
     }
+    /* 作业页「保存」按钮（只存草稿，不交卷）。
+       ★ 与 quizBlockSubmit 严格分开：找不到就返回 null，
+         绝不退化成「点提交」——那会产生真实成绩且不可撤回。 */
+    if (kind === 'quizBlockSave') {
+      var sav = findSave();
+      if (!sav) return null;
+      return { el: sav.el, layer: 2, note: 'work-save:' + sav.text };
+    }
     /* 作业提交确认框的「确定」按钮。
        超星 btnBlueSubmit() → validateTimeNew() → toadd() → workPop('Submit？','Submit','Cancel')
        会弹一个 #workpop 确认框；只有点了 #popok 才会 submitCheckTimes() → form1submit() 真提交。
@@ -1023,6 +1077,29 @@ const PAGE_PROBE_SRC = `(function () {
           var ifr = el.querySelector('iframe');
           var src = ifr ? (ifr.getAttribute('src') || '') : '';
           var label = icon ? (icon.getAttribute('aria-label') || '') : '';
+          /* ★ Issue #1：执行层要定位「该播哪个播放器」，必须带出 iframe 的
+             objectid / src / module。
+             - data 属性（HTML 属性名就是 "data"）是 JSON 字符串，形如
+               {"objectid":"a627ac35...","name":"P39….mp4"}；解析失败给 ''。
+             - iframeSrc 截断 200 字符（src 形如 /ananas/modules/video/index.html）。
+             - module 形如 insertvideo / insertaudio；没有给 ''。 */
+          var ifrData = ifr ? ifr.getAttribute('data') : null;
+          var objectid = '';
+          /* ★ 2026-11-16（D-026）：直播任务点的 iframe data JSON 里**没有 objectid**，
+             它的身份键是 liveId（回退到 vdoid/jobid/_jobid）。单独解析，
+             objectid 保持原样不动，视频路径零影响。 */
+          var liveId = '';
+          if (ifrData) {
+            try {
+              var parsedData = JSON.parse(ifrData);
+              objectid = (parsedData && parsedData.objectid) ? String(parsedData.objectid) : '';
+              if (parsedData) {
+                liveId = String(parsedData.liveId || parsedData.vdoid || parsedData.jobid || parsedData._jobid || '');
+              }
+            } catch (eD) { objectid = ''; liveId = ''; }
+          }
+          var iframeSrc = ifr ? String(ifr.getAttribute('src') || '').slice(0, 200) : '';
+          var moduleAttr = ifr ? String(ifr.getAttribute('module') || '') : '';
           var kind = 'unknown';
           var finishedByClass = el.classList.contains(S.jobFinishedClass);
           var finishedByLabel = false;
@@ -1031,6 +1108,7 @@ const PAGE_PROBE_SRC = `(function () {
           }
           if (/\\/modules\\/audio\\//i.test(src) || (ifr && ifr.getAttribute('module') === 'insertaudio')) kind = 'audio';
           else if (/\\/modules\\/video\\//i.test(src)) kind = 'video';
+          else if (/\\/modules\\/live\\//i.test(src) || /insertlive/i.test(moduleAttr)) kind = 'live';
           else if (/work|quiz|exam/i.test(src)) kind = 'quiz';
           else if (/pdf|doc|read|screen/i.test(src)) kind = 'document';
           else if (ifr && /insertbbs/i.test(ifr.getAttribute('module') || '')) kind = 'discussion';
@@ -1038,10 +1116,40 @@ const PAGE_PROBE_SRC = `(function () {
           tasks.push({
             kind: kind,
             finished: finishedByClass || finishedByLabel,
-            label: label.slice(0, 24)
+            label: label.slice(0, 24),
+            objectid: objectid,
+            liveId: liveId,
+            iframeSrc: iframeSrc,
+            module: moduleAttr
           });
         }
       } catch (e) { /* ignore */ }
+      /* ★ Issue #1：把当前 frame 里所有 <video> 全量列出（不能只取第一个）。
+         区域激活后同一 frame 里可能同时有 7 个 <video>；执行层要靠 src 里的
+         32 位十六进制 objectid 和任务点一一对应，才能挑出「该播哪个」。
+         注意：src 优先用 currentSrc（浏览器解析后的绝对地址），回退 getAttribute('src')。 */
+      var videos = [];
+      try {
+        var vels = document.querySelectorAll('video');
+        for (var vi = 0; vi < vels.length; vi++) {
+          var vv = vels[vi];
+          var vsrc = '';
+          try { vsrc = vv.currentSrc || vv.getAttribute('src') || ''; } catch (eV) { vsrc = ''; }
+          vsrc = String(vsrc).slice(0, 400);
+          var vObjId = '';
+          var vm = vsrc.match(/[0-9a-fA-F]{32}/);
+          if (vm) vObjId = vm[0];
+          videos.push({
+            src: vsrc,
+            duration: vv.duration,
+            currentTime: vv.currentTime,
+            paused: !!vv.paused,
+            ended: !!vv.ended,
+            readyState: vv.readyState,
+            objectid: vObjId
+          });
+        }
+      } catch (eV2) { /* ignore */ }
       return {
         url: String(location.href).slice(0, 160),
         video: videoState(),
@@ -1052,7 +1160,8 @@ const PAGE_PROBE_SRC = `(function () {
         toc: tocScan(),
         human: humanScan(),
         login: loginScan(),
-        tasks: tasks
+        tasks: tasks,
+        videos: videos
       };
     },
     videoState: videoState,

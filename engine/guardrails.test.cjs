@@ -230,6 +230,381 @@ function state(over) {
     ok(!sel.PAGE_PROBE_SRC.includes('[^。；' + String.fromCharCode(92) + 'n]'), '★ 正则里没有会被模板吃掉的换行转义');
   }
 
+  /* 【24】2026-11-15：skipChapterQuiz=true 时章节测验通路绝不触达 ai 模块（用 spy 计数） */
+  {
+    const aiCore = require('./src/core/ai.js');
+    let aiCalls = 0;
+    const origDecide = aiCore.decide;
+    aiCore.decide = function () { aiCalls += 1; return origDecide.apply(this, arguments); };
+    try {
+      const a = fakeAdapter();
+      /* ★ 2026-11-15 策略改了：默认不再跳过，而是「作答 + 只保存」。
+         本条用例专门验证「显式 skip」这条旧路径仍然可用，所以配置里手动打开。 */
+      const cfgSkip = E.mergeConfig(cfg, { safety: { skipChapterQuiz: true } });
+      const m = new E.LearnMachine(a, cfgSkip);
+      m.gatherState = async () => state({});
+      let advanced = 0;
+      m.advanceSection = async () => { advanced += 1; return { progress: true, outcome: 'ADVANCED' }; };
+      const chapterState = state({
+        quiz: {
+          present: true, kind: 'chapter_work', parseable: true,
+          options: [{ i: 0, letter: 'A', label: '甲' }, { i: 1, letter: 'B', label: '乙' }],
+          blocks: [{ i: 0, question: '题干', options: [{ i: 0, letter: 'A', label: '甲' }, { i: 1, letter: 'B', label: '乙' }] }],
+        },
+      });
+      const r = await m.handleQuiz(chapterState);
+      ok(aiCalls === 0, '★ 章节测验绝不触达 ai 模块（decide 调用 0 次，实际 ' + aiCalls + '）');
+      ok(r && r.outcome === 'ADVANCED', '★ skip 策略下章节测验跳过并切下一节（实际 ' + (r && r.outcome) + '）');
+      ok(advanced === 1, '跳过时只推进一次（advanced=' + advanced + '）');
+    } finally {
+      aiCore.decide = origDecide;
+    }
+  }
+
+  /* 【24b】2026-11-15 主人指令：默认 = 作答后只点「保存」，绝不点「提交」 */
+  {
+    const a = fakeAdapter();
+    const m = new E.LearnMachine(a, cfg);   // 默认配置：answerChapterQuiz=true, submitMode='save'
+    m.gatherState = async () => state({});
+    const kinds = [];
+    m.clickFound = async (_f, kind) => { kinds.push(kind); return { ok: true, text: kind === 'quizBlockSave' ? '保存' : 'A', note: kind }; };
+    m.askAI = async () => 1;
+    let advanced = 0;
+    m.advanceSection = async () => { advanced += 1; return { progress: true, outcome: 'ADVANCED' }; };
+    const r = await m.handleQuiz(state({
+      quiz: {
+        present: true, kind: 'chapter_work', parseable: true, frameId: 'top',
+        options: [{ i: 0, letter: 'A', label: '甲' }, { i: 1, letter: 'B', label: '乙' }],
+        blocks: [{ i: 0, question: '题干', options: [{ i: 0, letter: 'A', label: '甲' }, { i: 1, letter: 'B', label: '乙' }] }],
+      },
+    }));
+    ok(kinds.indexOf('quizBlockOption') >= 0, '选了选项（实际 ' + JSON.stringify(kinds) + '）');
+    ok(kinds.indexOf('quizBlockSave') >= 0, '★ 点了「保存」（实际 ' + JSON.stringify(kinds) + '）');
+    ok(kinds.indexOf('quizBlockSubmit') < 0, '★ 绝不点「提交」（实际 ' + JSON.stringify(kinds) + '）');
+    ok(m.counters.quizzesSaved === 1, '保存计数 +1（实际 ' + m.counters.quizzesSaved + '）');
+    ok(r && r.outcome === 'ADVANCED', '保存后切下一节（实际 ' + (r && r.outcome) + '）');
+    ok(advanced === 1, '只推进一次（advanced=' + advanced + '）');
+  }
+
+  /* 【24c】submitMode='none' → 只填选项，不点任何按钮 */
+  {
+    const a = fakeAdapter();
+    const cfgNone = E.mergeConfig(cfg, { safety: { chapterQuizSubmitMode: 'none' } });
+    const m = new E.LearnMachine(a, cfgNone);
+    const kinds = [];
+    m.clickFound = async (_f, kind) => { kinds.push(kind); return { ok: true, note: kind }; };
+    m.askAI = async () => 0;
+    m.advanceSection = async () => ({ progress: true, outcome: 'ADVANCED' });
+    const r = await m.handleQuiz(state({
+      quiz: {
+        present: true, kind: 'chapter_work', parseable: true, frameId: 'top',
+        options: [{ i: 0, letter: 'A', label: '甲' }],
+        blocks: [{ i: 0, question: '题干', options: [{ i: 0, letter: 'A', label: '甲' }] }],
+      },
+    }));
+    ok(kinds.indexOf('quizBlockSave') < 0 && kinds.indexOf('quizBlockSubmit') < 0,
+      '★ none 模式不点保存也不点提交（实际 ' + JSON.stringify(kinds) + '）');
+    ok(r && r.outcome === 'QUIZ_FILLED_ONLY', 'outcome=QUIZ_FILLED_ONLY（实际 ' + (r && r.outcome) + '）');
+  }
+
+  /* 【24d】submitMode='submit' → 才允许真交卷（必须显式开启） */
+  {
+    const a = fakeAdapter();
+    const cfgSub = E.mergeConfig(cfg, { safety: { chapterQuizSubmitMode: 'submit' } });
+    const m = new E.LearnMachine(a, cfgSub);
+    const kinds = [];
+    m.clickFound = async (_f, kind) => { kinds.push(kind); return { ok: true, note: kind }; };
+    m.askAI = async () => 0;
+    m.confirmWorkSubmit = async () => ({ confirmed: true, submitted: true });
+    const r = await m.handleQuiz(state({
+      quiz: {
+        present: true, kind: 'chapter_work', parseable: true, frameId: 'top',
+        options: [{ i: 0, letter: 'A', label: '甲' }],
+        blocks: [{ i: 0, question: '题干', options: [{ i: 0, letter: 'A', label: '甲' }] }],
+      },
+    }));
+    ok(kinds.indexOf('quizBlockSubmit') >= 0, 'submit 模式点了提交（实际 ' + JSON.stringify(kinds) + '）');
+    ok(r && r.outcome === 'QUIZ_ANSWERED', 'outcome=QUIZ_ANSWERED（实际 ' + (r && r.outcome) + '）');
+  }
+
+  /* 【31】v2 批量答题：batchSize>1 时只发一次批量请求，逐题 askAI 一次都不调，
+     按 answers[].index 点选（1/0/2），收尾仍是「只保存、不提交」 */
+  {
+    const a = fakeAdapter();
+    const cfgb = E.mergeConfig(cfg, { ai: { enabled: true, batchSize: 10 } });
+    const m = new E.LearnMachine(a, cfgb);
+    m.gatherState = async () => state({});
+    const prevAskUrl = process.env.CX_LLM_ASK_URL;
+    process.env.CX_LLM_ASK_URL = 'http://127.0.0.1:9/x';   // useAi=true（不会真发请求，下面全 stub）
+    try {
+      const clicks = [];
+      const kinds = [];
+      m.clickFound = async (_f, kind, arg) => {
+        kinds.push(kind);
+        if (kind === 'quizBlockOption') clicks.push({ b: arg && arg.b, o: arg && arg.o });
+        return { ok: true, text: kind === 'quizBlockSave' ? '保存' : 'A', note: kind };
+      };
+      let aiCalls = 0;
+      let batchCalls = 0;
+      m.askAI = async () => { aiCalls += 1; return 0; };
+      m.askAIBatch = async () => {
+        batchCalls += 1;
+        return { ok: true, answers: [{ id: 'q1', index: 1 }, { id: 'q2', index: 0 }, { id: 'q3', index: 2 }], unresolved: [], dropped: [] };
+      };
+      let advanced = 0;
+      m.advanceSection = async () => { advanced += 1; return { progress: true, outcome: 'ADVANCED' }; };
+      const two = [{ i: 0, letter: 'A', label: '甲' }, { i: 1, letter: 'B', label: '乙' }];
+      const r = await m.handleQuiz(state({
+        quiz: {
+          present: true, kind: 'chapter_work', parseable: true, frameId: 'top',
+          options: two,
+          blocks: [
+            { i: 0, question: '第一题', kind: 'single', options: two },
+            { i: 1, question: '第二题', kind: 'single', options: two },
+            { i: 2, question: '第三题', kind: 'single', options: two },
+          ],
+        },
+      }));
+      ok(batchCalls === 1, '★ 只发了一次批量请求（实际 ' + batchCalls + '）');
+      ok(aiCalls === 0, '★ 批量命中时逐题 askAI 一次都不调（实际 ' + aiCalls + '）');
+      ok(clicks.length === 3, '点了 3 个题块的选项（实际 ' + JSON.stringify(clicks) + '）');
+      ok(clicks.map((c) => c.o).join(',') === '1,0,2', '★ 按批量答案下标点选 1/0/2（实际 ' + JSON.stringify(clicks) + '）');
+      ok(m.counters.quizzesSaved === 1, '★ 保存计数 +1（实际 ' + m.counters.quizzesSaved + '）');
+      ok(kinds.indexOf('quizBlockSubmit') < 0, '★ 绝不点「提交」（实际 ' + JSON.stringify(kinds) + '）');
+      ok(r && r.outcome === 'ADVANCED', '保存后切下一节（实际 ' + (r && r.outcome) + '）');
+      ok(advanced === 1, '只推进一次（advanced=' + advanced + '）');
+    } finally {
+      if (prevAskUrl === undefined) delete process.env.CX_LLM_ASK_URL; else process.env.CX_LLM_ASK_URL = prevAskUrl;
+    }
+  }
+
+  /* 【32】v2 批量失败（AI_BAD_JSON）→ 整卷回退逐题 askAI，不中断，仍能保存 */
+  {
+    const a = fakeAdapter();
+    const cfgb = E.mergeConfig(cfg, { ai: { enabled: true, batchSize: 10 } });
+    const m = new E.LearnMachine(a, cfgb);
+    m.gatherState = async () => state({});
+    const prevAskUrl = process.env.CX_LLM_ASK_URL;
+    process.env.CX_LLM_ASK_URL = 'http://127.0.0.1:9/x';
+    try {
+      const clicks = [];
+      const kinds = [];
+      m.clickFound = async (_f, kind, arg) => {
+        kinds.push(kind);
+        if (kind === 'quizBlockOption') clicks.push({ b: arg && arg.b, o: arg && arg.o });
+        return { ok: true, text: kind === 'quizBlockSave' ? '保存' : 'A', note: kind };
+      };
+      let aiCalls = 0;
+      m.askAI = async () => { aiCalls += 1; return 0; };
+      m.askAIBatch = async () => ({ ok: false, code: 'AI_BAD_JSON', answers: [] });
+      let advanced = 0;
+      m.advanceSection = async () => { advanced += 1; return { progress: true, outcome: 'ADVANCED' }; };
+      const two = [{ i: 0, letter: 'A', label: '甲' }, { i: 1, letter: 'B', label: '乙' }];
+      const r = await m.handleQuiz(state({
+        quiz: {
+          present: true, kind: 'chapter_work', parseable: true, frameId: 'top',
+          options: two,
+          blocks: [
+            { i: 0, question: '第一题', kind: 'single', options: two },
+            { i: 1, question: '第二题', kind: 'single', options: two },
+            { i: 2, question: '第三题', kind: 'single', options: two },
+          ],
+        },
+      }));
+      ok(aiCalls === 3, '★ 批量失败 → 3 道题全部回退逐题 askAI（实际 ' + aiCalls + '）');
+      ok(clicks.length === 3, '3 道题仍然都点了选项（实际 ' + JSON.stringify(clicks) + '）');
+      ok(m.counters.quizzesSaved === 1, '★ 回退后仍能保存（quizzesSaved 实际 ' + m.counters.quizzesSaved + '）');
+      ok(kinds.indexOf('quizBlockSubmit') < 0, '★ 绝不点「提交」（实际 ' + JSON.stringify(kinds) + '）');
+      ok(r && r.outcome === 'ADVANCED', '回退流程不中断，保存后切下一节（实际 ' + (r && r.outcome) + '）');
+    } finally {
+      if (prevAskUrl === undefined) delete process.env.CX_LLM_ASK_URL; else process.env.CX_LLM_ASK_URL = prevAskUrl;
+    }
+  }
+
+  /* ==========================================================================
+   * GitHub Issue #1 回归（2026-11-15）：一节多个视频任务点时，
+   * 只播完第一个不能就切节，必须继续播下一个；只有本节所有 media 任务点
+   * 都播过，才允许 advanceSection。
+   * 下面用假 adapter 直接驱动 tick()，把 _lastInventory / _lastVideos 当作
+   * gatherState 的产物手动喂进去（探针在真实浏览器里的产物形状）。
+   * ======================================================================*/
+
+  /* 【27】一节 3 个 video 任务点（1 完成 2 未完成）→ 不切节，改播下一个 */
+  console.log('== 27. 一节 3 个视频任务点，仅 1 个完成 → 不切节，继续播下一个 ==');
+  {
+    const a = fakeAdapter();
+    /* clickFound 走 __cx.find('videoToggle')，返回一个可点坐标 → 记一次 videoToggle */
+    a.evalInFrame = async (_f, expr) => {
+      if (typeof expr === 'string' && expr.indexOf('__cx.find') >= 0) {
+        return { ok: true, text: '播放', layer: 1, note: 'videoToggle', rect: { x: 1, y: 1, w: 2, h: 2, __kind: 'videoToggle' } };
+      }
+      return null;
+    };
+    const oidA = 'a'.repeat(32), oidB = 'b'.repeat(32), oidC = 'c'.repeat(32);
+    const frameUrl = 'https://mooc1.chaoxing.com/mooc-ans/knowledge/cards?clazzid=1&knowledgeid=111';
+    const tasks = [
+      { kind: 'video', finished: true, objectid: oidA, frameUrl },
+      { kind: 'video', finished: false, objectid: oidB, frameUrl },
+      { kind: 'video', finished: false, objectid: oidC, frameUrl },
+    ];
+    /* 未完成的两个 task 各有对应播放器，均未启动过 */
+    const videos = [
+      { frameId: 'vfB', frameUrl, src: 'https://cdn.example/' + oidB + '.mp4', objectid: oidB, duration: 100, currentTime: 0, paused: true, ended: false, readyState: 4 },
+      { frameId: 'vfC', frameUrl, src: 'https://cdn.example/' + oidC + '.mp4', objectid: oidC, duration: 100, currentTime: 0, paused: true, ended: false, readyState: 4 },
+    ];
+    const tocItems = [{ title: '本节', id: 'cur1', chapterId: '111', current: true, done: false, unfinish: 2 }];
+    const stPlayed = state({
+      video: { found: true, frameId: 'vfA', src: 'https://cdn.example/' + oidA + '.mp4', objectid: oidA, ended: true, paused: false, progress: 99, currentTime: 100, duration: 100, readyState: 4 },
+      videoFrameId: 'vfA',
+      toc: { found: true, layer: 2, sel: '.posCatalog_select', frameId: 'top', items: tocItems },
+    });
+    const m = new E.LearnMachine(a, cfg);
+    m._currentTitle = '本节';
+    m._markVideoStarted({ src: 'https://cdn.example/' + oidA + '.mp4' }); // 第一个视频已播完（本次启动过）
+    m.gatherState = async () => {
+      m._lastInventory = { tasks, at: Date.now() };
+      m._lastVideos = videos;
+      return stPlayed;
+    };
+    let advances = 0;
+    m.advanceSection = async () => { advances += 1; return { progress: true, outcome: 'ADVANCED' }; };
+    m.confirmVideoWatched = async () => 1;
+    m.maybeHandleChapterQuiz = async () => 'none';
+    const r = await m.tick();
+    ok(advances === 0, '★ 不得切节（advanceSection 调用 0 次，实际 ' + advances + '）');
+    ok(a.clicks.filter((k) => k === 'videoToggle').length >= 1, '★ 调用了播放下一个视频（videoToggle 点击 ≥1，实际 ' + JSON.stringify(a.clicks) + '）');
+    ok(r.outcome === 'NEXT_VIDEO', '本拍产出 NEXT_VIDEO（不推进）（实际 ' + r.outcome + '）');
+    ok(m.counters.sectionsCompleted === 0, '未切节时 sectionsCompleted 不增加（实际 ' + m.counters.sectionsCompleted + '）');
+  }
+
+  /* 【28】本节 media 任务点全部 finished → 允许 advanceSection，sectionsCompleted 只 +1 */
+  console.log('== 28. 本节 media 任务点全部 finished → 允许切节，且计数只 +1 ==');
+  {
+    const a = fakeAdapter();
+    const oids = ['1', '2', '3'].map((c) => c.repeat(32));
+    const frameUrl = 'https://mooc1.chaoxing.com/mooc-ans/knowledge/cards?clazzid=1&knowledgeid=111';
+    const tasks = oids.map((o) => ({ kind: 'video', finished: true, objectid: o, frameUrl }));
+    const videos = oids.map((o, i) => ({ frameId: 'vf' + i, frameUrl, src: 'https://cdn.example/' + o + '.mp4', objectid: o, duration: 100, currentTime: 100, paused: false, ended: true, readyState: 4 }));
+    const tocItems = [{ title: '本节', id: 'cur1', chapterId: '111', current: true, done: false, unfinish: 1 }];
+    const stPlayed = state({
+      video: { found: true, frameId: 'vf0', src: 'https://cdn.example/' + oids[0] + '.mp4', objectid: oids[0], ended: true, paused: false, progress: 99, currentTime: 100, duration: 100, readyState: 4 },
+      videoFrameId: 'vf0',
+      toc: { found: true, layer: 2, sel: '.posCatalog_select', frameId: 'top', items: tocItems },
+    });
+    const m = new E.LearnMachine(a, cfg);
+    m._currentTitle = '本节';
+    m._markVideoStarted({ src: 'https://cdn.example/' + oids[0] + '.mp4' });
+    /* 绕开 tick 开头的「整节完成 → 直接跳过」短路，专门验证「播完计数 + 切节」这条路：
+       media 全部 finished 时最早那条闸门会以 sectionsSkipped 直接切节（不计数），
+       这里把它短路掉，专注校验 Issue #1 里挪动后的 sectionsCompleted 计数只加一次。 */
+    m._currentSectionDone = () => false;
+    m._videoTaskDone = () => ({ ok: false, by: 'not-done' });
+    m.gatherState = async () => {
+      m._lastInventory = { tasks, at: Date.now() };
+      m._lastVideos = videos;
+      return stPlayed;
+    };
+    let advances = 0;
+    m.advanceSection = async () => { advances += 1; return { progress: true, outcome: 'ADVANCED' }; };
+    m.confirmVideoWatched = async () => 1;   // 平台已确认（待办降到 1）
+    m.maybeHandleChapterQuiz = async () => 'none';
+    const r = await m.tick();
+    ok(advances === 1, '★ 全部完成 → 允许切节一次（advanceSection 调用 1 次，实际 ' + advances + '）');
+    ok(m.counters.sectionsCompleted === 1, '★ sectionsCompleted 只 +1（实际 ' + m.counters.sectionsCompleted + '）');
+    ok(r.outcome === 'ADVANCED', '本拍 outcome=ADVANCED（实际 ' + r.outcome + '）');
+  }
+
+  /* 【29】任务点全部来自别的 knowledgeid（stale）→ 不得据此判完成，也不得切节 */
+  console.log('== 29. 任务点全来自别的 knowledgeid（stale）→ 不判完成、不切节 ==');
+  {
+    const a = fakeAdapter();
+    const oidA = 'd'.repeat(32);
+    /* 任务点全部属于 knowledgeid=999（上一节残留），当前节是 111 */
+    const frameUrlOther = 'https://mooc1.chaoxing.com/mooc-ans/knowledge/cards?clazzid=1&knowledgeid=999';
+    const tasks = [
+      { kind: 'video', finished: true, objectid: oidA, frameUrl: frameUrlOther },
+      { kind: 'video', finished: false, objectid: 'e'.repeat(32), frameUrl: frameUrlOther },
+    ];
+    const tocItems = [{ title: '本节', id: 'cur1', chapterId: '111', current: true, done: false, unfinish: 2 }];
+    const stPlayed = state({
+      video: { found: true, frameId: 'vfA', src: 'https://cdn.example/' + oidA + '.mp4', objectid: oidA, ended: true, paused: false, progress: 99, currentTime: 100, duration: 100, readyState: 4 },
+      videoFrameId: 'vfA',
+      toc: { found: true, layer: 2, sel: '.posCatalog_select', frameId: 'top', items: tocItems },
+    });
+    /* 纯函数口径：stale ⇒ ok:false，且 sectionVideosDone 不得为 true */
+    const J = require('./src/learn/judge.js');
+    const pvUnit = J.pendingSectionVideos(tasks, '111');
+    ok(pvUnit.ok === false && pvUnit.stale === true, '★ pendingSectionVideos 对 stale 数据返回 ok:false/stale:true（实际 ' + JSON.stringify(pvUnit) + '）');
+    ok(J.sectionVideosDone(tasks, '111') === false, '★ sectionVideosDone 对 stale 数据返回 false');
+
+    const cfg29 = JSON.parse(JSON.stringify(cfg));
+    cfg29.safety.videoNotConfirmedMax = 1;   // 一拍未确认即停，避免空转
+    const m = new E.LearnMachine(a, cfg29);
+    m._currentTitle = '本节';
+    m._markVideoStarted({ src: 'https://cdn.example/' + oidA + '.mp4' });
+    m.gatherState = async () => {
+      m._lastInventory = { tasks, at: Date.now() };
+      m._lastVideos = [];
+      return stPlayed;
+    };
+    m.captureProblemSnapshot = async () => {};
+    let advances = 0;
+    m.advanceSection = async () => { advances += 1; return { progress: true, outcome: 'ADVANCED' }; };
+    m.confirmVideoWatched = async () => 'unknown';   // 坏数据下拿不到可信待办数
+    m.maybeHandleChapterQuiz = async () => 'none';
+    const r = await m.tick();
+    ok(r.outcome !== 'ADVANCED', '★ stale 一拍不产出 ADVANCED（实际 ' + r.outcome + '）');
+    ok(advances === 0, '★ stale 不得切节（advanceSection 调用 0 次，实际 ' + advances + '）');
+    ok(m.counters.sectionsCompleted === 0, '★ stale 不得计入完成（sectionsCompleted 实际 ' + m.counters.sectionsCompleted + '）');
+    ok(m._videoTaskDone(stPlayed).ok === false, '★ stale 下 _videoTaskDone 判为未完成');
+  }
+
+  /* 【30】剩余任务点都已播过一轮 → _pickUnplayedVideo 返回 null，tick 不前进 */
+  console.log('== 30. 剩余任务点都已播过一轮 → 不重复播、也不切节（WAIT_VIDEO_CONFIRM）==');
+  {
+    const a = fakeAdapter();
+    const oidA = 'f'.repeat(32), oidB = '1'.repeat(32), oidC = '2'.repeat(32);
+    const frameUrl = 'https://mooc1.chaoxing.com/mooc-ans/knowledge/cards?clazzid=1&knowledgeid=111';
+    const tasks = [
+      { kind: 'video', finished: false, objectid: oidB, frameUrl },
+      { kind: 'video', finished: false, objectid: oidC, frameUrl },
+    ];
+    const videos = [
+      { frameId: 'vfB', frameUrl, src: 'https://cdn.example/' + oidB + '.mp4', objectid: oidB, duration: 100, currentTime: 100, paused: false, ended: true, readyState: 4 },
+      { frameId: 'vfC', frameUrl, src: 'https://cdn.example/' + oidC + '.mp4', objectid: oidC, duration: 100, currentTime: 100, paused: false, ended: true, readyState: 4 },
+    ];
+    const tocItems = [{ title: '本节', id: 'cur1', chapterId: '111', current: true, done: false, unfinish: 2 }];
+    const stPlayed = state({
+      video: { found: true, frameId: 'vfA', src: 'https://cdn.example/' + oidA + '.mp4', objectid: oidA, ended: true, paused: false, progress: 99, currentTime: 100, duration: 100, readyState: 4 },
+      videoFrameId: 'vfA',
+      toc: { found: true, layer: 2, sel: '.posCatalog_select', frameId: 'top', items: tocItems },
+    });
+    const m = new E.LearnMachine(a, cfg);
+    m._currentTitle = '本节';
+    /* 播放器都已在本次运行播过一轮（含当前正在播的这个 A，否则 playedEnough 不成立） */
+    ['f', '1', '2'].forEach((c) => m._markVideoStarted({ src: 'https://cdn.example/' + c.repeat(32) + '.mp4' }));
+    m._lastInventory = { tasks, at: Date.now() };
+    m._lastVideos = videos;
+    m.gatherState = async () => {
+      m._lastInventory = { tasks, at: Date.now() };
+      m._lastVideos = videos;
+      return stPlayed;
+    };
+    let advances = 0;
+    m.advanceSection = async () => { advances += 1; return { progress: true, outcome: 'ADVANCED' }; };
+    m.confirmVideoWatched = async () => 1;
+    m.maybeHandleChapterQuiz = async () => 'none';
+
+    const pv = m._sectionPendingVideos(stPlayed);
+    ok(pv.ok === true && pv.pending.length === 2, '本节还剩 2 个未完成媒体任务点（实际 ' + JSON.stringify({ ok: pv.ok, pending: pv.pending.length }) + '）');
+    ok(m._pickUnplayedVideo(stPlayed, pv) === null, '★ 剩余任务点都播过一轮 → _pickUnplayedVideo 返回 null');
+
+    const r = await m.tick();
+    ok(r.outcome !== 'ADVANCED', '★ 不切节（outcome 非 ADVANCED，实际 ' + r.outcome + '）');
+    ok(r.outcome === 'WAIT_VIDEO_CONFIRM', '本拍 outcome=WAIT_VIDEO_CONFIRM（实际 ' + r.outcome + '）');
+    ok(advances === 0, 'advanceSection 未被调用（实际 ' + advances + '）');
+  }
+
   console.log('');
   if (fails.length) {
     console.log('== 失败 ' + fails.length + ' 项 / 通过 ' + pass + ' 项 ==');

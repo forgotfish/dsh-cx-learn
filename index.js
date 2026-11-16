@@ -23,6 +23,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createRequire } from 'node:module'
+import { randomBytes } from 'node:crypto'
 
 export const name = 'cx-learn'
 
@@ -112,16 +113,53 @@ const DEFAULT_CFG = {
   // 自定义内核路径（非空时优先于 browserId）
   chromiumPath: '',
   headless: true,
-  /* 默认 skip 模式（2026-10-28 行为已更新）：
-     · 视频内随堂题（.ans-videoquiz）：按选项顺序盲试，答错换下一个直到答对
-       （主人确认随堂题不计入课程成绩）；遇「回看」惩罚或次数耗尽立即停。
-     · 章节测验/作业（.TiMu）：只识别、记录，绝不作答、绝不提交；
-       视频看完后直接 advanceSection 跳到下一节继续看。
-     引擎侧对应开关：CONFIG.safety.skipChapterQuiz（默认 true）。 */
-  quizMode: 'skip',
+  /* 章节测验策略（2026-11-15 主人指令：解开限制，但默认只存草稿不交卷）
+       'save'   作答后只点「保存」，绝不交卷（默认）
+       'save' 之外还可以选：
+       'submit' 真交卷（有真实成绩、不可撤回，必须主人明确选）
+       'none'   只填选项，不点任何按钮
+       'skip'   完全不碰（旧行为）
+     注：视频内随堂题不受此开关影响，仍是「盲试直到答对」。
+     旧字段 quizMode 已废弃（老配置里恒为 'skip'，会覆盖新默认），不再读取。 */
+  chapterQuiz: 'save',
+  /* ── AI 答题（宿主侧 LLM）配置 ──────────────────────────────────────────
+     enabled=false 时宿主完全不碰模型；spawn 也**不注入任何** CX_LLM_* 环境
+     变量（引擎靠 `CX_LLM_ASK_URL || CX_LLM_MODEL` 判断 useAi，多设一条就会
+     让引擎以为自己能答题）。契约见 docs/AI-ANSWER-FRAMEWORK.md §3/§4。 */
+  ai: {
+    enabled: false,
+    /* dryRun=false：开启 AI 后就是「真的答」。仅调试时置 true（只判定不点选）。 */
+    dryRun: false,
+    provider: 'host',
+    model: '',
+    vision: true,
+    /* 传输通道（v2，见 docs/AI-ANSWER-FRAMEWORK.md §10）：
+       'session' = 走 DSH 会话窗口（可见），'direct' = 旧路径隐藏直连 */
+    channel: 'session',
+    batchSize: 10,
+    timeoutMs: 120000,
+    workspaceDir: '',
+    chapterQuiz: true,
+    maxRetries: 2,
+    minLetters: 1,
+  },
 }
 
 let child = null
+
+/* ── AI 答题运行期状态 ────────────────────────────────────────────────────
+   _ctxRef       : apply 时记下的 ctx，供调用点 `ctx.get('llm')` 拿服务（缺失不崩）
+   _webServerRef : apply 时拿到的 webServer 实例，用来读当前监听端口 `.port`
+   _askToken     : 每轮 spawn 新生成的 32-hex 令牌；/llm-ask 用它校验 x-cx-token */
+let _ctxRef = null
+let _webServerRef = null
+let _askToken = ''
+/* ── AI 答题「会话窗口」通道状态（v2，见 docs/AI-ANSWER-FRAMEWORK.md §11）──────
+   _qaSession  : { sessionId, createdAt, workspacePath }；null = 尚未创建/已重置
+   _qaLastSeq  : 上一次 wait 读到的最大 event.seq，下次 wait 用 afterSeq 续读 */
+let _qaSession = null
+let _qaLastSeq = 0
+const QA_SESSION_FILE = join(STATE, 'ai-session.json')
 /* ★ 2026-10-31：登录进程单独留个引用。
    原来 loginState() 用 `running()`（任何任务在跑）判断「是不是在等扫码」，
    于是看课跑到一半时 /login-state 仍返回 waiting，GUI 显示「等待扫码…」
@@ -133,9 +171,17 @@ const readJson = (p, fb) => { try { return JSON.parse(readFileSync(p, 'utf8')) }
 const writeJson = (p, v) => { ensureDir(); writeFileSync(p, JSON.stringify(v, null, 2)) }
 const nowLog = (s) => { ensureDir(); appendFileSync(LOG_FILE, `[plugin] ${new Date().toISOString()} ${s}\n`) }
 
-const getCfg = () => ({ ...DEFAULT_CFG, ...readJson(CFG_FILE, {}) })
+const getCfg = () => {
+  const stored = readJson(CFG_FILE, {}) || {}
+  const merged = { ...DEFAULT_CFG, ...stored }
+  // ai 段做浅合并，避免旧 config.json 里只存了部分 ai 字段时把默认值整体覆盖掉
+  merged.ai = { ...DEFAULT_CFG.ai, ...(stored.ai && typeof stored.ai === 'object' ? stored.ai : {}) }
+  return merged
+}
 const saveCfg = (patch) => {
-  const next = { ...getCfg(), ...(patch || {}) }
+  const p = patch || {}
+  const next = { ...getCfg(), ...p }
+  if (p.ai && typeof p.ai === 'object') next.ai = { ...getCfg().ai, ...p.ai }
   writeJson(CFG_FILE, next)
   return next
 }
@@ -150,6 +196,18 @@ const running = () => {
   const pid = Number(readJson(STATE_FILE, {}).pid || 0)
   if (!pid) return false
   try { process.kill(pid, 0); return true } catch { return false }
+}
+
+/**
+ * 清掉 state.json 里的 pid（引擎本轮已结束，pid 不再是「在跑」的证据）。
+ * 幂等：没有 pid 时不动。见 D-023：引擎「自终止」若不清理，会留下死 pid，
+ * 被系统复用后 running() 误判为在跑 → 设置页「开始」假绿灯。
+ */
+export function clearStatePid() {
+  try {
+    const st = readJson(STATE_FILE, {}) || {}
+    if (st.pid !== undefined) { delete st.pid; writeJson(STATE_FILE, st) }
+  } catch { /* ignore */ }
 }
 
 function readQuestionEvents() {
@@ -189,9 +247,9 @@ function questionDraft(q) {
     '\n\n请先分析这道题，但不要替我操作学习通页面。'
 }
 
-/* ── 预留的 AI 答题接口（占位，未实现）──────────────────────────────────
- * 主人要求「只给个接口，以后再用」：契约现在定死，实现时只改这一个函数，
- * 调用方（设置页 / 脚本 / 以后的引擎回调）不用跟着改。
+/* ── AI 答题接口（已实现，见下方 handleAsk / callLlm）──────────────────
+ * 契约现在定死，实现只改本文件的 handleAsk / callLlm，
+ * 调用方（设置页 / 脚本 / 引擎回调）不用跟着改。
  *
  * 契约（见 docs/SPEC.md §8.2）：
  *   POST /api/cx-learn/ask
@@ -206,19 +264,365 @@ function questionDraft(q) {
  *   · 这个函数**只返回文本**，不许在这里点页面、选选项或提交
  *   · 不引入新的出站依赖前，先确认宿主有没有 llm 服务
  */
-function askReserved(body) {
+/* ── AI 答题实现（宿主侧 LLM）────────────────────────────────────────────
+ * 契约见 docs/AI-ANSWER-FRAMEWORK.md §4，DSH LLM API 见 docs/_research/dsh-llm-api.md。
+ * 要点：
+ *   · 服务用 `ctx.get('llm')` 在调用点拿（缺失返回 undefined，不抛）——不要把 'llm'
+ *     之外的依赖硬塞，也不在这里假设宿主一定注入了服务。
+ *   · ctx.llm.stream() 是 AsyncIterable<StreamChunk>，没有一次性返回字符串的方法：
+ *     遍历流用 BlockAssembler 累积，最后取 type==='text' 块拼接。
+ *   · 错误不 throw：终止在 finish 块（reason.kind==='error'，看 reason.failure.code）。
+ *   · 图片不能塞 base64：先经 ctx.attachments.admitPromptContent 转 ImageAttachmentRef。
+ */
+const numOr = (v, d) => { const n = Number(v); return Number.isFinite(n) && n > 0 ? n : d }
+
+/** 当前插件监听端口（用于拼 CX_LLM_ASK_URL）。拿不到返回 0，绝不抛错。 */
+function pluginPortNum() {
+  try { const p = Number(_webServerRef && _webServerRef.port); if (p > 0) return p } catch { /* ignore */ }
+  try { const p = Number(process.env.CX_PLUGIN_PORT); if (p > 0) return p } catch { /* ignore */ }
+  try { const u = new URL(String(process.env.DSH_WEB_URL || '')); const p = Number(u.port); if (p > 0) return p } catch { /* ignore */ }
+  return 0
+}
+
+/**
+ * 解析 provider/model：配置留空（或填占位 'host'）时，自动取宿主第一个可用
+ * provider 及其第一个模型——这样 UI 上「留空 = 使用宿主默认模型」才算兑现。
+ * 解析不到就返回空串，由调用方报 LLM_UNAVAILABLE。绝不抛错。
+ */
+export async function resolveRoute(llm, provider, model) {
+  let p = String(provider || '').trim()
+  let m = String(model || '').trim()
+  if (!p || p === 'host') {
+    try {
+      const list = typeof llm.listProviders === 'function' ? await llm.listProviders() : []
+      const first = Array.isArray(list) && list.length ? list[0] : null
+      if (first) p = String(first.id || first.name || '')
+    } catch { /* 拿不到就保持空，下面报错 */ }
+  }
+  if (p && !m) {
+    try {
+      const list = typeof llm.listModels === 'function' ? await llm.listModels(p) : []
+      const first = Array.isArray(list) && list.length ? list[0] : null
+      if (first) m = String(first.id || first.name || '')
+    } catch { /* 同上 */ }
+  }
+  return { provider: p, model: m }
+}
+
+/** 把 `data:<mime>;base64,<data>` 拆成 { mediaType, base64 }；非法返回 null。 */
+function parseImageInput(image) {
+  const m = /^data:(image\/[a-z0-9.+-]+);base64,(.+)$/i.exec(String(image || ''))
+  if (!m) return null
+  return { mediaType: m[1].toLowerCase(), base64: m[2] }
+}
+
+/** 把 question+options 拼成喂模型的文本（options → 「A. xx」）。 */
+function buildAskPrompt(body) {
+  const q = String(body?.question || '').trim()
+  const opts = Array.isArray(body?.options) ? body.options : []
+  const optText = opts.map((o, i) => {
+    const letter = String.fromCharCode(65 + i)
+    if (o && typeof o === 'object') return (o.letter || letter) + '. ' + (o.label != null ? o.label : (o.text != null ? o.text : ''))
+    return letter + '. ' + String(o)
+  }).join('\n')
+  return (q || '（图片题目，请阅读图片后作答）') +
+    (optText ? '\n选项：\n' + optText : '') +
+    '\n\n请只回答一个选项字母（如 B），不要解释。'
+}
+
+/** 从模型输出里严格解析出唯一选项字母；解析不出返回 { index:-1, letter:null }。 */
+function parseAnswerLetter(text, options) {
+  const raw = String(text || '').trim()
+  const maxLetters = Array.isArray(options) && options.length > 0 ? options.length : 26
+  const valid = (ch) => { const idx = ch.toUpperCase().charCodeAt(0) - 65; return idx >= 0 && idx < maxLetters }
+  const pack = (ch) => { const L = ch.toUpperCase(); return { index: L.charCodeAt(0) - 65, letter: L } }
+  if (!raw) return { index: -1, letter: null }
+  // 1) 整段就是一个字母（可带括号/标点包裹）：B / b / B. / （B）
+  let m = raw.match(/^[\s（(【\[]*([A-Za-z])[\s.．、,，)）】\]:：]*$/)
+  if (m && valid(m[1])) return pack(m[1])
+  // 2) 「答案：B」「正确答案是 B」「answer: B」
+  m = raw.match(/(?:正确答案|答案|answer)\s*[:：是为]?\s*[（(【\[]?\s*([A-Za-z])\b/i)
+  if (m && valid(m[1])) return pack(m[1])
+  // 3) 开头就是「B.」「B、」「B)」这类
+  m = raw.match(/^[\s（(【\[]*([A-Za-z])\s*[.．、,，)）\]:：]/)
+  if (m && valid(m[1])) return pack(m[1])
+  return { index: -1, letter: null }
+}
+
+/** 一次真实的流式调用：useImage=true 时尝试带图（失败自动降级为纯文本）。 */
+/**
+ * 消费 `llm.stream()` 的异步迭代器，自己拼文本。形状依据
+ * `docs/_research/dsh-llm-api.md` 的 StreamChunk：
+ *   · `text-delta` → 累加；
+ *   · `block-end` 的完整 text 块 → 没收到 delta 时作兜底；
+ *   · `finish` 的 reason → 终止原因；`kind` 为 error/aborted 时按 failure 抛错（DSH 不 throw）。
+ * 导出是为了能用假的 chunk 序列单测（host-smoke 第 9 节）。
+ */
+export async function collectStream(iter) {
+  let text = ''
+  let lastBlockText = ''
+  let finish = null
+  for await (const chunk of iter) {
+    if (!chunk) continue
+    if (chunk.type === 'text-delta' && typeof chunk.text === 'string') text += chunk.text
+    else if (chunk.type === 'block-end' && chunk.block && chunk.block.type === 'text' && typeof chunk.block.text === 'string') lastBlockText = chunk.block.text
+    else if (chunk.type === 'finish') finish = chunk.reason
+  }
+  if (finish && (finish.kind === 'error' || finish.kind === 'aborted')) {
+    const f = finish.failure || {}
+    const err = new Error('LLM 失败 [' + (f.code || 'ERROR') + '] ' + (f.message || ''))
+    err.code = f.code || 'LLM_ERROR'
+    if (f.status !== undefined) err.status = f.status
+    throw err
+  }
+  if (!text && lastBlockText) text = lastBlockText
+  return { text, finish }
+}
+
+async function doStream(opts, useImage) {
+  const llm = (_ctxRef && typeof _ctxRef.get === 'function') ? _ctxRef.get('llm') : null
+  if (!llm || typeof llm.stream !== 'function') {
+    const e = new Error('llm 服务不可用'); e.code = 'LLM_UNAVAILABLE'; throw e
+  }
+  /* ★ 工具包按需加载：DSH 运行时里 `@deepseek-ai/dsh-llm` 一定存在，但从插件目录
+     解析不一定成功（profile 的 node_modules 布局各有不同）。**不能**让它成为硬依赖：
+     解析失败就退回「自己拼消息对象 + 自己拼文本」，功能等价，不抛错。
+     2026-11-15：助手包（BlockAssembler）本来只用于拼文本，我们已经自己拼了，
+     这里只借 createUserMessage 生成规范消息对象。 */
+  let createUserMessage = null
+  try {
+    const kit = await import('@deepseek-ai/dsh-llm')
+    if (kit && typeof kit.createUserMessage === 'function') createUserMessage = kit.createUserMessage
+  } catch { /* 解析失败 → 用字面量消息对象（下面兜底） */ }
+
+  const promptText = String(opts.prompt ?? '')
+  const content = [{ type: 'text', text: promptText }]
+  let visionUsed = false
+  if (useImage && opts.image) {
+    const parsed = parseImageInput(opts.image)
+    const att = (_ctxRef && typeof _ctxRef.get === 'function') ? _ctxRef.get('attachments') : null
+    if (parsed && att && typeof att.admitPromptContent === 'function') {
+      try {
+        const admitted = await att.admitPromptContent([
+          { type: 'text', text: promptText },
+          { type: 'image', mediaType: parsed.mediaType, data: parsed.base64 },
+        ])
+        content.length = 0
+        for (const part of admitted) {
+          if (part && part.type === 'text') content.push({ type: 'text', text: part.text })
+          else if (part && part.type === 'image') { content.push({ type: 'image', attachment: part.attachment }); visionUsed = true }
+        }
+      } catch {
+        // 图片入附件失败 → 忽略图片，只用文本
+        visionUsed = false
+        content.length = 0
+        content.push({ type: 'text', text: promptText })
+      }
+    }
+  }
+
+  const route = await resolveRoute(llm, opts.provider, opts.model)
+  if (!route.provider || !route.model) {
+    const e = new Error('宿主没有可用的 provider/model（配置留空且自动探测失败）')
+    e.code = 'LLM_UNAVAILABLE'; throw e
+  }
+
+  const messages = [createUserMessage
+    ? createUserMessage({ content, source: { kind: 'user' } })
+    : { role: 'user', content, source: { kind: 'user' } }]
+  const streamOpts = { provider: route.provider, model: route.model, messages }
+  if (opts.system) streamOpts.system = String(opts.system)
+
+  const ac = new AbortController()
+  let timedOut = false
+  const to = numOr(opts.timeoutMs, 20000)
+  const timer = setTimeout(() => { timedOut = true; try { ac.abort() } catch { /* ignore */ } }, to)
+  if (timer && typeof timer.unref === 'function') timer.unref()
+
+  /* 自己拼文本，不依赖 BlockAssembler（据 docs/_research/dsh-llm-api.md）：
+     · text-delta 累加；
+     · block-end 里的完整 text 块做兜底（没收到 delta 时用）；
+     · finish 块的 reason 就是终止原因，错误不 throw。 */
+  let text = ''
+  try {
+    text = (await collectStream(llm.stream({ ...streamOpts, signal: ac.signal }))).text
+  } catch (e) {
+    // 超时优先报超时（abort 会让流以 aborted 结束，别把超时误报成 LLM_ERROR）
+    if (timedOut) {
+      const te = new Error('LLM 请求超时（' + to + 'ms）'); te.code = 'LLM_TIMEOUT'; throw te
+    }
+    throw e
+  } finally {
+    clearTimeout(timer)
+  }
+
+  if (timedOut) {
+    const e = new Error('LLM 请求超时（' + to + 'ms）'); e.code = 'LLM_TIMEOUT'; throw e
+  }
+  return { text, visionUsed, model: route.model, provider: route.provider }
+}
+
+/** 调用 LLM；图片被目标模型拒绝（UNSUPPORTED_CONTENT）时自动降级为纯文本重试一次。 */
+async function callLlm(opts) {
+  const wantImage = !!opts.image
+  try {
+    return await doStream(opts, wantImage)
+  } catch (e) {
+    if (wantImage && e && e.code === 'UNSUPPORTED_CONTENT') {
+      return await doStream(opts, false)
+    }
+    throw e
+  }
+}
+
+/** 统一的错误码归类（503 用）。 */
+function llmErrCode(e) {
+  const code = e && e.code
+  if (code === 'LLM_TIMEOUT' || code === 'LLM_UNAVAILABLE' || code === 'LLM_EMPTY' || code === 'SESSION_UNAVAILABLE') {
+    return code
+  }
+  return 'LLM_ERROR'
+}
+
+/* ── 会话窗口通道（v2）──────────────────────────────────────────────────────
+   契约见 docs/AI-ANSWER-FRAMEWORK.md §11/§12。宿主是哑管道：只把 prompt 丢进一个
+   真实的 DSH 会话窗口，等它的 assistant 回复，取出纯文本回给引擎。 */
+
+/** 重置会话：清内存状态 + 删落盘文件（失败忽略）。start() 每轮开跑成功时调用。 */
+export function resetQaSession() {
+  _qaSession = null
+  _qaLastSeq = 0
+  try { rmSync(QA_SESSION_FILE, { force: true }) } catch { /* 文件不存在/被占用都忽略 */ }
+}
+
+/**
+ * 确保有一个可用的答题会话。已有且 state 可读则复用，否则懒创建。
+ * ctx.sessionController 缺失 → SESSION_UNAVAILABLE（引擎退回逐题/盲试，不阻塞看课）。
+ */
+/** 取可选服务：走 ctx.get(name)（缺失返回 undefined，不抛）。
+ *  ★ 不要写成 ctx.sessionController —— 属性访问在服务缺失时会抛，本项目踩过 ctx.webServer。 */
+export function getOptionalService(ctx, name) {
+  if (!ctx) return null
+  try {
+    if (typeof ctx.get === 'function') {
+      const v = ctx.get(name)
+      if (v) return v
+    }
+  } catch { /* ignore */ }
+  try { return ctx[name] || null } catch { return null }
+}
+
+export async function ensureQaSession(ctx, cfg) {
+  const sc = getOptionalService(ctx, 'sessionController')
+  if (!sc) {
+    const e = new Error('sessionController 不可用'); e.code = 'SESSION_UNAVAILABLE'; throw e
+  }
+  if (_qaSession) {
+    let alive = false
+    try { sc.state({ sessionId: _qaSession.sessionId }); alive = true } catch { alive = false }
+    if (alive) return _qaSession
+  }
+  const ai = (cfg && cfg.ai) || {}
+  const dir = ai.workspaceDir || join(STATE, 'ai-workspace')
+  try { mkdirSync(dir, { recursive: true }) } catch { /* ignore */ }
+  /* 建项目失败不阻断 —— 退化为不建项目，直接 create({cwd}) */
+  const wr = getOptionalService(ctx, 'workspaceRegistry')
+  if (wr && typeof wr.create === 'function') {
+    try { await wr.create(dir, 'CX 答题') } catch { /* ignore */ }
+  }
+  const r = await sc.create({ cwd: dir, agentPreset: undefined })
+  _qaSession = { sessionId: r.sessionId, createdAt: Date.now(), workspacePath: dir }
+  /* ★ 2026-11-15 修 BUG：会话重建（旧的死了）后必须归零 _qaLastSeq，
+     否则 askViaSession 会用**旧会话**的 maxSeq 去 wait 新会话的 afterSeq，
+     新会话 seq 起点更低 → wait 空返回 → 误报 LLM_EMPTY、答案丢失。 */
+  _qaLastSeq = 0
+  try { writeJson(QA_SESSION_FILE, _qaSession) } catch { /* ignore */ }
+  return _qaSession
+}
+
+/**
+ * 从 wait 的 output.records 里提取「最后一条 assistant/message」的文本。
+ * 纯函数，返回 { text, maxSeq }。content 非数组/缺失 → 该条视为空串。
+ */
+export function extractAssistantText(records) {
+  let last = ''
+  let maxSeq = 0
+  const arr = Array.isArray(records) ? records : []
+  for (const rec of arr) {
+    const ev = rec && rec.event
+    if (!ev) continue
+    if (typeof ev.seq === 'number' && ev.seq > maxSeq) maxSeq = ev.seq
+    if (ev.type !== 'assistant/message') continue
+    const content = ev.data && ev.data.message && ev.data.message.content
+    if (!Array.isArray(content)) { last = ''; continue }
+    let buf = ''
+    for (const blk of content) {
+      if (blk && blk.type === 'text' && typeof blk.text === 'string') buf += blk.text
+    }
+    last = buf
+  }
+  return { text: last, maxSeq }
+}
+
+/**
+ * 经会话窗口提问一次：ensure 会话 → prompt（queue）→ wait（afterSeq 续读）→ 取文本。
+ * 超时 → LLM_TIMEOUT；空回复 → LLM_EMPTY。
+ */
+export async function askViaSession(ctx, cfg, { prompt, image, provider, model, timeoutMs } = {}) {
+  const s = await ensureQaSession(ctx, cfg)
+  const sc = getOptionalService(ctx, 'sessionController')
+  if (!sc) {
+    const e = new Error('sessionController 不可用'); e.code = 'SESSION_UNAVAILABLE'; throw e
+  }
+  const content = [{ type: 'text', text: String(prompt || '') }]
+  if (image) {
+    content.push({ type: 'image', mediaType: 'image/png', data: String(image).replace(/^data:[^,]+,/, '') })
+  }
+  await sc.prompt({
+    requestId: 'cx-' + Date.now().toString(16) + '-' + Math.random().toString(16).slice(2, 8),
+    sessionId: s.sessionId,
+    mode: 'queue',
+    content,
+  })
+  const w = await sc.wait({ sessionId: s.sessionId, timeoutMs, afterSeq: _qaLastSeq })
+  if (w && w.reason === 'timeout') {
+    const e = new Error('会话应答超时'); e.code = 'LLM_TIMEOUT'; throw e
+  }
+  const { text, maxSeq } = extractAssistantText((w && w.output && w.output.records) || [])
+  if (maxSeq) _qaLastSeq = maxSeq
+  if (!text) {
+    const e = new Error('会话无文本回复'); e.code = 'LLM_EMPTY'; throw e
+  }
+  return { text, model: model || '', sessionId: s.sessionId }
+}
+
+/**
+ * POST /api/cx-learn/ask 的实现（真答题）。
+ *   · enabled=false → 保持 D-015 契约：200 { ok:false, code:'AI_ANSWER_DISABLED' }（有测试断言）
+ *   · enabled=true  → 喂 question+options，返回 { ok:true, answer:'B', model, raw }
+ */
+async function handleAsk(body) {
+  const ai = (getCfg().ai) || {}
   const question = String(body?.question || '').trim()
   const image = String(body?.image || '').trim()
   if (!question && !image) {
     return { status: 400, body: { ok: false, error: 'question 或 image 必填（options 可选）' } }
   }
-  return {
-    status: 200,
-    body: {
-      ok: false,
-      code: 'AI_ANSWER_DISABLED',
-      error: 'AI 答题未启用：接口已预留，实现后自动生效',
-    },
+  if (ai.enabled !== true) {
+    return { status: 200, body: { ok: false, code: 'AI_ANSWER_DISABLED', error: 'AI 答题未启用' } }
+  }
+  try {
+    const provider = String(ai.provider || '').trim()
+    const model = String(ai.model || '').trim()
+    if (!provider || !model) { const e = new Error('provider/model 未配置'); e.code = 'LLM_UNAVAILABLE'; throw e }
+    const r = await callLlm({ provider, model, prompt: buildAskPrompt(body), image, timeoutMs: numOr(ai.timeoutMs, 20000) })
+    const parsed = parseAnswerLetter(r.text, body?.options)
+    if (parsed.index < 0) {
+      return { status: 200, body: { ok: false, code: 'AI_AMBIGUOUS', error: '无法从模型输出解析出唯一选项字母', model, raw: r.text } }
+    }
+    return { status: 200, body: { ok: true, answer: parsed.letter, model, raw: r.text } }
+  } catch (e) {
+    return { status: 503, body: { ok: false, code: llmErrCode(e), error: String((e && e.message) || e).slice(0, 300) } }
   }
 }
 
@@ -498,9 +902,9 @@ function startSessionWatcher() {
 
 /* ── 引擎进程 ──────────────────────────────────────────────────────────── */
 
-function spawnEngine(args) {
-  ensureDir()
-  clearProfileLock()
+/* 组装引擎子进程环境变量（纯函数，便于单测，不真正 spawn）。
+   ★ AI 答题注入只在这里做，且仅在 config.ai.enabled === true 时。 */
+export function buildSpawnEnv(args = []) {
   const cfg = getCfg()
   const env = {
     ...process.env,
@@ -516,14 +920,41 @@ function spawnEngine(args) {
     // 登录态用完就废：引擎跑在独立临时 profile 里
     CX_EPHEMERAL_LOGIN: '1',
   }
-  // 强制安全闸门：本任务只负责观看视频，绝不自主答题或提交。
-  // 即使旧 config.json 保存过 ai，也不能通过配置把真实作业答题打开。
-  env.CX_QUIZ_MODE = 'skip'
+  /* ★ 2026-11-15 主人指令：不再是「一律 skip」。
+     章节测验策略来自配置 chapterQuiz（默认 'save' = 答完只存草稿、不交卷）。 */
+  {
+    const cq = String(cfg.chapterQuiz || 'save').toLowerCase()
+    env.CX_QUIZ_MODE = (cq === 'skip' || cq === 'submit' || cq === 'none' || cq === 'save') ? cq : 'save'
+  }
 
   /* ★ B-精简：看课任务结束时**不要**关内核/删 profile，因为会话可能还开着
-     （用户要接着刷第二门课）。引擎侧据此走 detach 而不是 shutdown。
-     其它命令（--login / --check-login / --list-courses）有自己的收尾逻辑，不设这个。 */
+     （用户要接着刷第二门课）。引擎侧据此走 detach 而不是 shutdown。 */
   if (isWatchRun(args)) env.CX_KEEP_BROWSER = '1'
+
+  /* ★ AI 答题注入（仅 config.ai.enabled === true），一字不差按框架 §4.2：
+       CX_LLM_ASK_URL / CX_LLM_ASK_TOKEN / CX_LLM_PROVIDER / CX_LLM_MODEL /
+       CX_AI_DRYRUN / CX_AI_VISION
+     enabled=false 时**一个都不设**——引擎靠 `CX_LLM_ASK_URL || CX_LLM_MODEL`
+     判断 useAi，多设任何一条都会让引擎以为自己能答题。先清掉任何残留再按需注入。 */
+  for (const k of Object.keys(env)) { if (/^CX_LLM_|^CX_AI_/.test(k)) delete env[k] }
+  const ai = cfg.ai || {}
+  if (ai.enabled === true) {
+    const port = pluginPortNum()
+    _askToken = randomBytes(16).toString('hex')
+    env.CX_LLM_ASK_URL = 'http://127.0.0.1:' + (port > 0 ? port : 0) + '/api/cx-learn/llm-ask'
+    env.CX_LLM_ASK_TOKEN = _askToken
+    env.CX_LLM_PROVIDER = String(ai.provider || '')
+    env.CX_LLM_MODEL = String(ai.model || '')
+    env.CX_AI_DRYRUN = ai.dryRun ? '1' : '0'
+    env.CX_AI_VISION = ai.vision ? '1' : '0'
+  }
+  return env
+}
+
+function spawnEngine(args) {
+  ensureDir()
+  clearProfileLock()
+  const env = buildSpawnEnv(args)
 
   const c = spawn(process.execPath, [ENGINE, ...args], {
     cwd: STATE, env, stdio: ['ignore', 'pipe', 'pipe'],
@@ -532,7 +963,14 @@ function spawnEngine(args) {
   c.stderr.on('data', (d) => { try { appendFileSync(LOG_FILE, d) } catch { /* ignore */ } })
   c.on('exit', (code) => {
     try { appendFileSync(LOG_FILE, `\n[engine exit] code=${code}\n`) } catch { /* ignore */ }
-    if (child === c) child = null
+    /* ★ 2026-11-15：引擎「自己」结束时（如 max_sections_reached）也要清掉 state.json 里的 pid。
+       原来只有手动 stop() 才删 pid，自终止的运行会把一个已死 pid 留在 state.json；
+       running() 用 process.kill(pid, 0) 探活，一旦该 pid 被系统复用给别的进程，
+       就误判「还在跑」——表现正是设置页「开始」标签在登录阶段就变绿、「内核」却还是红的。 */
+    if (child === c) {
+      child = null
+      clearStatePid()
+    }
 
     /* ★ 2026-10-31：引擎把「为什么停」写在自己的 engine/.state/learn.json，
        而 /status.state 读的是宿主 state.json —— 两边从来没对上过，
@@ -631,12 +1069,15 @@ function spawnEngine(args) {
       }
     }
   })
-  child = c
+  /* ★ 2026-11-16 修「开始」假绿灯的真正根因：只有「看课任务」才登记为 child（=在跑）。
+     登录/预检/读课程/自测等 spawn 绝不能设 child，否则 running() 立刻变 true，
+     设置页「开始」标签在登录阶段就亮绿。isWatchRun 之前只用于 env/purge，漏了这里。 */
+  if (isWatchRun(args)) child = c
   return c
 }
 
 /** 判断这次 spawn 是不是「看课任务」（登录/预检/读课程/自测都不算）。 */
-function isWatchRun(args) {
+export function isWatchRun(args) {
   const skip = ['--login', '--check-login', '--self-test', '--list-courses', '--serve-mcp']
   return !skip.some((f) => args.includes(f))
 }
@@ -685,6 +1126,8 @@ function sleepSync(ms) {
 
 function start(args = {}) {
   if (running()) return { ok: false, error: '已经有一轮在跑了，先停止' }
+  /* 登录进行中不许开看课（两个任务会抢浏览器）。登录不再算 running，故单列一条。 */
+  if (loginChild && loginChild.exitCode === null) return { ok: false, error: '登录进行中，请先等登录完成或停止登录' }
   const cfg = getCfg()
   const url = String(args.courseUrl || cfg.courseUrl || '').trim()
   if (!url) return { ok: false, error: '还没填课程地址（学习通 studentstudy 页 URL）' }
@@ -702,6 +1145,8 @@ function start(args = {}) {
     // 记 pid：插件重启后靠它探活，避免「界面空闲但实际还在跑」
     writeJson(STATE_FILE, { startedAt: Date.now(), mode, maxSections, url, pid: c.pid })
     nowLog('start pid=' + c.pid + ' mode=' + mode + ' max=' + maxSections)
+    /* v2：每轮开跑成功即重置答题会话 —— 下次 /llm-ask 懒创建，跨运行不膨胀。 */
+    resetQaSession()
     return { ok: true, pid: c.pid }
   } catch (e) {
     return { ok: false, error: '启动失败：' + (e?.message ?? e) }
@@ -759,11 +1204,15 @@ function precheckLogin() {
   })
 }
 
-function stop() {  if (!running()) return { ok: false, error: '当前没有任务在跑' }
+function stop() {
+  const loginLive = !!(loginChild && loginChild.exitCode === null)
+  if (!running() && !loginLive) return { ok: false, error: '当前没有任务在跑' }
   const pid = child && child.exitCode === null ? child.pid : Number(readJson(STATE_FILE, {}).pid || 0)
   try {
     if (child && child.exitCode === null) child.kill('SIGTERM')
-    else if (pid) process.kill(pid, 'SIGTERM')
+    else if (running() && pid) process.kill(pid, 'SIGTERM')  // 仅在 running() 为真时才按 state.pid 探活杀，避免误杀复用的旧 pid
+    // 登录不再登记为 child，running() 覆盖不到，这里显式收掉登录进程
+    if (loginLive) loginChild.kill('SIGTERM')
   } catch { /* ignore */ }
   nowLog('stop requested pid=' + pid)
   // SIGTERM 可能让引擎来不及跑 finally，这里兜底关浏览器，避免一直占着调试端口。
@@ -909,6 +1358,8 @@ function closeBrowserViaWs(wsUrl) {
 
 function login() {
   if (running()) return { ok: false, error: '先停止当前任务，再点登录' }
+  /* 登录不再登记 child，故 running() 覆盖不到「登录正在进行」——这里单独挡重复登录。 */
+  if (loginChild && loginChild.exitCode === null) return { ok: false, error: '登录已在进行中' }
   if (!existsSync(ENGINE)) return { ok: false, error: '引擎文件缺失' }
   try {
     const c = spawnEngine(['--login'])
@@ -1139,6 +1590,15 @@ async function status() {
     pid: running() && child ? child.pid : null,
     state: readJson(STATE_FILE, {}),
     config: cfg,
+    /* ★ v2：AI 答题传输层现状（只读快照，供设置页回显「打开答题窗口」）。
+       放 config 旁边，不动既有字段。 */
+    ai: {
+      enabled: cfg.ai && cfg.ai.enabled === true,
+      channel: String((cfg.ai && cfg.ai.channel) || 'session'),
+      batchSize: Number((cfg.ai && cfg.ai.batchSize) || 10),
+      hasSession: !!_qaSession,
+      sessionId: _qaSession ? _qaSession.sessionId : '',
+    },
     chromium: cp,
     chromiumReady: cp !== 'chromium' && existsSync(cp),
     browserRoot: BROWSER_ROOT,
@@ -1362,6 +1822,8 @@ async function readBody(req) {
 
 export function apply(ctx, config) {
   ensureDir()
+  // 记下 ctx 供 /llm-ask、/ask 调用点用 ctx.get('llm')/_ctx.get('attachments')（缺失不崩）
+  _ctxRef = ctx
   nowLog('mounted, plugin dir=' + PLUGIN_DIR)
   /* ★ B-精简：会话看护。插件一挂上就开始盯着——
      内核死了要清账，闲置超时要收尾，否则浏览器会一直挂着占内存。 */
@@ -1384,6 +1846,8 @@ export function apply(ctx, config) {
     nowLog('警告：宿主无 webServer 服务，设置页/HTTP 接口不可用（仅 CLI 可用）')
     return
   }
+  // 记住 webServer 实例，供 buildSpawnEnv 读当前监听端口（.port getter）。取值已 try/catch 过。
+  _webServerRef = webServer
 
   /* ★ 2026-10-30 踩坑记录：这里**不能**把 ctx.webServer 抽成外部变量 webServer。
      试过 `ctx.effect(() => webServer.register(...))`，结果 cordis 的 effect 依赖
@@ -1436,8 +1900,44 @@ export function apply(ctx, config) {
           // 只生成文本返回给 client；client 负责显式调用 setDraft，宿主不发送消息。
           return sendJson(res, 200, { ok: true, id, draft: questionDraft(q), submitted: false })
         }
+        /* ★ 内部 LLM 代理端点：只服务本插件的引擎子进程（凭 x-cx-token 校验，
+           令牌每轮 spawn 新生成，只在 env 里给引擎）。会话外不可用。
+           契约：body { provider?, model?, prompt, image? } → 200 { ok:true, text, model, ms, visionUsed }
+           任何异常 → 503 { ok:false, code:'LLM_UNAVAILABLE'|'LLM_ERROR'|'LLM_TIMEOUT', error }，绝不 500。 */
+        if (path === '/llm-ask' && req.method === 'POST') {
+          const tk = String((req.headers && (req.headers['x-cx-token'] || req.headers['X-Cx-Token'])) || '')
+          if (!_askToken || tk !== _askToken) return sendJson(res, 401, { ok: false, error: '无效的 x-cx-token' })
+          const ai = (getCfg().ai) || {}
+          const prompt = String(body?.prompt ?? '')
+          if (!prompt && !body?.image) return sendJson(res, 400, { ok: false, error: 'prompt 必填（image 可选）' })
+          const provider = String(body?.provider || ai.provider || '').trim()
+          const model = String(body?.model || ai.model || '').trim()
+          const channel = String(body?.channel || ai.channel || 'session')
+          const t0 = Date.now()
+          try {
+            if (channel === 'session') {
+              const r = await askViaSession(_ctxRef, getCfg(), {
+                prompt, image: body?.image, provider, model,
+                timeoutMs: numOr(ai.timeoutMs, 120000),
+              })
+              return sendJson(res, 200, {
+                ok: true, text: r.text, model, ms: Date.now() - t0,
+                channel: 'session', sessionId: r.sessionId,
+              })
+            }
+            if (!provider || !model) { const e = new Error('provider/model 未配置'); e.code = 'LLM_UNAVAILABLE'; throw e }
+            const r = await callLlm({
+              provider, model, prompt,
+              image: body?.image, system: body?.system,
+              timeoutMs: numOr(ai.timeoutMs, 20000),
+            })
+            return sendJson(res, 200, { ok: true, text: r.text, model, ms: Date.now() - t0, visionUsed: r.visionUsed === true, channel: 'direct' })
+          } catch (e) {
+            return sendJson(res, 503, { ok: false, code: llmErrCode(e), error: String((e && e.message) || e).slice(0, 300) })
+          }
+        }
         if (path === '/ask' && req.method === 'POST') {
-          const r = askReserved(body)
+          const r = await handleAsk(body)
           return sendJson(res, r.status, r.body)
         }
         if (path === '/browsers' && req.method === 'GET') return sendJson(res, 200, { ok: true, browsers: listBrowsers(), root: BROWSER_ROOT })

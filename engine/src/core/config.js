@@ -68,6 +68,24 @@ const CONFIG = {
   /* 视频判定：progress >= progressDoneRatio% 或 ended === true 视为自然结束 */
   video: { progressDoneRatio: 98.5, mute: true },
 
+  /* 直播回放（D-026）：超星直播不是 <video>，播放器在独立标签页
+     （live.chaoxing.com/courseLive/pclive → 内嵌 zhibo.chaoxing.com）。
+     进度由播放器页面自己每 30s 打一次 saveTimePc 心跳、按**墙钟**累计，
+     服务端每 5 分钟落一次 percentValue（实测）——所以引擎只需
+     「把播放器页面开着并保持 playing 态」，然后轮询 liveinfo 的 percentValue。
+
+     2026-11-16 实测：headless 里 HLS+MSE 的 currentTime 不推进
+     （webkitVideoDecodedByteCount 恒 0，同浏览器的 mp4 却正常解码），
+     但 paused=false 时心跳照样发、percentValue 照样涨（241s → 6.83%）。
+     ⇒ 判定口径用服务端 percentValue，不用本地 currentTime。 */
+  live: {
+    donePercent: 90,          // 服务端 percentValue ≥ 90 视为完成（超星口径：达总时长 90%）
+    pollMs: 60000,            // 轮询 liveinfo 的间隔（服务端 5 分钟才更新，1 分钟足够及时发现）
+    startTimeoutMs: 60000,    // 等播放器页面出现 <video> 并进入 playing 的超时
+    maxMs: 150 * 60 * 1000,   // 单条直播最多等 150 分钟（实测最长 59 分钟一条）
+    keepAliveMs: 5000,        // 每次轮询时确认播放器仍在 playing 的等待
+  },
+
   /* 拟人化节奏（所有随机范围集中在 CONFIG，便于统一调节与审计） */
   humanize: {
     clickDelayMs: [300, 1200],        // 每次点击/按键前随机延迟
@@ -84,11 +102,19 @@ const CONFIG = {
     maxLoadRetries: 6,                // 切节后等待新页面加载的探测次数
     maxNoVideoWaitTicks: 4,           // 新节迟迟无视频的等待轮数，超过按非视频任务点跳过
     maxRuntimeMs: 12 * 60 * 60 * 1000, // 单次运行时长兜底（12 小时，覆盖看完一整门课）
-    /* ★ 2026-10-28：遇到章节测验时，跳过不答、直接进下一节继续看视频。
-       主人要求「课后题一定不要做」，跳过等于不拿这部分分，与要求一致；
-       且此时视频任务点已完成（超星已确认），不跳会永远卡在本节。
-       设为 false 可恢复旧行为（停下等人）。 */
-    skipChapterQuiz: true,
+    /* ★ 2026-11-15 主人指令：解开章节测验限制，允许自动作答。
+       但**默认只保存草稿，绝不提交**（提交=交卷，会产生真实成绩且不可撤回）。
+
+       两个开关分开，避免「允许答」被误解成「允许交」：
+         answerChapterQuiz      是否处理章节测验（默认 true）
+         chapterQuizSubmitMode  'save'（默认，只点保存）| 'submit'（真提交）| 'none'（只填不点）
+
+       ⚠ 'submit' 只应在主人明确要求时打开：章节测验计入成绩，交卷后不可重答。 */
+    answerChapterQuiz: true,
+    chapterQuizSubmitMode: 'save',
+    /* 兼容旧字段（旧代码/旧配置里可能还在用）。true 时一律不处理章节测验，
+       优先级高于 answerChapterQuiz。 */
+    skipChapterQuiz: false,
     /* ★ 2026-10-30 主人指令：题目「识别不出来」不再停机，只忽略。
        同一弹层连续忽略到这一次数，才当作「本节没视频可看」切下一节，
        避免弹层永久遮挡导致无限空转。 */
@@ -142,6 +168,20 @@ const CONFIG = {
     retryWaitMs: 30000,      // 每次重试前等待时长（30 秒）
     maxRetries: 2,           // 最多重试次数（2 次 → 共尝试 3 轮）
     retryJitterMs: 5000      // 等待时长随机浮动，避免固定节奏被识别
+  },
+
+  /* AI 答题策略（契约 docs/AI-ANSWER-FRAMEWORK.md §3）：默认关、默认只观察不点选。
+     三级开关逐级放开：enabled=false（完全不调模型）→ enabled=true,dryRun=true
+     （调模型算答案写审计，但点选仍走原盲试）→ enabled=true,dryRun=false（按 AI 点选）。 */
+  ai: {
+    enabled: false,        // 总开关，默认关
+    dryRun: true,          // 默认「只判定不点选」，先看准确率
+    provider: 'host',      // 'host' | 'openai'
+    model: '',             // 空 = 用宿主默认模型
+    vision: true,          // 允许发截图（超星题干是加密字体，文本无意义）
+    timeoutMs: 20000,
+    maxRetries: 2,
+    minLetters: 1,         // 解析约束：只接受单个字母
   },
 
   /* MCP 工具注册 */

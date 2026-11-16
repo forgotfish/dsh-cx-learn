@@ -10,12 +10,12 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const { BUS, busEmit, sleep } = require('../core/base.js');
-const { parseAnswerLetter } = require('../core/config.js');
+const aiCore = require('../core/ai.js');
 const { humanize, logger } = require('../core/logging.js');
 const { emitQuestionEvent } = require('../core/questions.js');
 const { installProbeExpression } = require('./selectors.js');
 const { decideTaskPoint, kindOf, TASK_KIND } = require('./taskpoints.js');
-const { isVideoTaskDone, pickNextSection, pickStart } = require('./judge.js');
+const { isVideoTaskDone, pendingSectionVideos, pickNextSection, pickStart } = require('./judge.js');
 
 /* ============================================================================
  * 第 6 节 · 业务状态机
@@ -28,7 +28,7 @@ class LearnMachine {
   constructor(adapter, cfg) {
     this.adapter = adapter;
     this.cfg = cfg;
-    this.counters = { sectionsCompleted: 0, sectionsSkipped: 0, quizzesAnswered: 0, dialogsDismissed: 0 };
+    this.counters = { sectionsCompleted: 0, sectionsSkipped: 0, quizzesAnswered: 0, quizzesSaved: 0, dialogsDismissed: 0 };
     this.failures = 0;
     this.stopReason = null;
     this.stoppedNormally = false;
@@ -45,6 +45,16 @@ class LearnMachine {
        一律不能作为完成证据 —— 这正是 3.3↔3.4 空转的根因。
        CDP 侧拿不到元素引用，改用 currentSrc 指纹代替。 */
     this._startedVideoSrcs = new Set();
+    /* ★ 2026-11-15（GitHub Issue #1）：本节「各 frame 里的 <video> 清单」，
+       由 gatherState 每次扫描填充（带 frameId / frameUrl / objectid）。
+       一节课可能有多个视频任务点、每个任务点一个独立播放器 iframe，
+       只有这份清单才能把「未完成的任务点」映射到「该播哪个播放器」。 */
+    this._lastVideos = [];
+    /* ★ 2026-11-16（D-027）：直播回放状态。
+       _livePlayer = { targetId, liveId } —— 复用同一个播放器标签页，杜绝越堆越多；
+       _liveCtx = { key, userid, clazzid, courseid } —— liveinfo 需要的上下文，抓一次缓存。 */
+    this._livePlayer = null;
+    this._liveCtx = null;
     // 视频播放停滞检测（CDN 签名过期 → 源 403 → 进度卡住）
     this._stallTicks = 0;
     this._lastProgressTime = undefined;
@@ -61,6 +71,8 @@ class LearnMachine {
     this._quizTabWaitTicks = 0;
     this._quizTabDoneFor = null;
     this._quizTabChapter = null;
+    // 随堂题：记住「这道题已经问过 AI 了」，避免同一题反复问模型（D-019）
+    this._videoQuizAiForKey = null;
   }
 
   /**
@@ -204,20 +216,26 @@ class LearnMachine {
        只按 ans-job-finished 判会拿上一节的「已完成」去跳过这一节 —— 那是误跳。 */
     {
       const allTasks = [];
+      const allVideos = [];
       for (const f of probes) {
         const ts = f.probe && f.probe.tasks;
         if (Array.isArray(ts)) {
           for (const t of ts) allTasks.push(Object.assign({ frameUrl: String(f.url || '') }, t));
         }
+        /* ★ 2026-11-15（Issue #1）：同时汇总每个 frame 的 <video> 清单。
+           任务点带 objectid、video 也从 src 里抽了 objectid，两者能对上，
+           才能回答「本节还剩哪几个视频没播」以及「该播哪个播放器」。 */
+        const vs = f.probe && f.probe.videos;
+        if (Array.isArray(vs)) {
+          for (const v of vs) {
+            allVideos.push(Object.assign({ frameId: f.frameId, frameUrl: String(f.url || '') }, v));
+          }
+        }
       }
       this._lastInventory = { tasks: allTasks, at: Date.now() };
+      this._lastVideos = allVideos;
     }
     for (const f of probes) {
-      const v = f.probe.video;
-      if (v && v.found && (!st.video || (v.progress || 0) > (st.video.progress || 0))) {
-        st.video = Object.assign({}, v, { frameId: f.frameId });
-        st.videoFrameId = f.frameId;
-      }
       for (const d of f.probe.dialogs || []) {
         st.dialogs.push(Object.assign({}, d, { frameId: f.frameId }));
         if (d.kind === 'human') st.human.push({ evidence: d.evidence, frameId: f.frameId });
@@ -235,6 +253,31 @@ class LearnMachine {
       if (qt && qt.present && !st.quizTab) st.quizTab = Object.assign({}, qt, { frameId: f.frameId });
       const t = f.probe.toc;
       if (t && t.found && !st.toc) st.toc = Object.assign({}, t, { frameId: f.frameId });
+    }
+    /* ★★ 2026-11-15（Issue #1）：视频选择放在这里（不能再放上面那个循环里）——
+       必须等 st.toc 收集完，才能算出「本节还剩哪几个视频任务点」，
+       进而优先挑「未完成任务点」对应的播放器。
+       旧逻辑按 progress 最大挑 ⇒ 一节多视频时永远挑回刚播完那个（progress≈98%），
+       于是每轮都判「本节已播完」→ 提前切节，剩下 9 个视频一次没播。 */
+    const pendingVids = this._sectionPendingVideos(st);
+    for (const f of probes) {
+      const v = f.probe.video;
+      if (!v || !v.found) continue;
+      const cand = Object.assign({}, v, { frameId: f.frameId });
+      if (!st.video) {
+        st.video = cand;
+        st.videoFrameId = f.frameId;
+        continue;
+      }
+      const candPending = this._videoMatchesPending(cand, pendingVids);
+      const curPending = this._videoMatchesPending(st.video, pendingVids);
+      if (candPending && !curPending) {
+        st.video = cand;
+        st.videoFrameId = f.frameId;
+      } else if (candPending === curPending && (v.progress || 0) > (st.video.progress || 0)) {
+        st.video = cand;
+        st.videoFrameId = f.frameId;
+      }
     }
     if (top) {
       const lg = top.probe.login || {};
@@ -487,7 +530,43 @@ class LearnMachine {
         this._markVideoStarted(st.video);
       }
       if (playedEnough) {
-        this.counters.sectionsCompleted += 1;
+        /* ★★ 2026-11-15（GitHub Issue #1）P0：判定与动作解耦。
+           播完「一个视频」≠「本节看完」。本节还有没播过的视频任务点时，
+           必须接着播下一个，**绝不** advanceSection()。
+           旧逻辑只要 playedEnough 就往切节走 —— 一节 12 个任务点（10 个视频）
+           只播第 1 个就切走，剩下 9 个一次没播，这就是 Issue #1。 */
+        const pv = this._sectionPendingVideos(st);
+        /* ★ 只有「本节确实有多个 media 任务点」才启用连播逻辑；
+           单视频节保持原行为（老页面/拿不到 objectid 时不至于误判）。 */
+        const multiVideo = !!(pv.ok && pv.total > 1);
+        const blockAdvance = multiVideo && pv.pending.length > 0;
+        if (blockAdvance) {
+          const nextVid = this._pickUnplayedVideo(st, pv);
+          if (nextVid) {
+            logger.info('ADVANCE', '本节还有未播的视频任务点，继续播下一个（不切节）', {
+              title: this._currentTitle,
+              pendingVideos: pv.pending.length,
+              totalVideos: pv.total,
+              finishedVideos: pv.finished,
+              nextObjectId: String(nextVid.objectid || '').slice(0, 32),
+              nextFrame: nextVid.frameId,
+            });
+            const r = await this.playSectionVideo(st, nextVid);
+            if (r.ok) return { progress: true, outcome: 'NEXT_VIDEO' };
+            /* ★ 定位不到/点不开播放器 → 停，绝不拿「上一节/上一个视频」冒充，
+               也绝不静默切节（红线：宁可停，不假装）。 */
+            logger.warn('ADVANCE', '本节仍有未播完的视频任务点，但无法驱动下一个播放器，停止本轮', {
+              title: this._currentTitle, reason: r.reason, pendingVideos: pv.pending.length,
+            });
+            this.stop('video_task_unreachable');
+            return { progress: false, outcome: 'STOPPED' };
+          }
+          /* 剩下的任务点都已被本次运行播过一轮，平台还没记账 →
+             不切节，走下面的「未确认」路径（拍快照 + 累积 streak），这一拍只等。 */
+          logger.warn('ADVANCE', '本节仍有未确认的视频任务点（已各播过一轮），等待平台记账，本轮不切节', {
+            title: this._currentTitle, pendingVideos: pv.pending.length, totalVideos: pv.total,
+          });
+        }
         /* ★ 播放器走到 98.5% 不等于超星记了完成。目录里的待办数才是硬证据。
            播完后重新读一次目录：待办从 2 变 1 ⇒ 视频已被服务端记为看完。 */
         const pendingNow = await this.confirmVideoWatched(6000);
@@ -547,10 +626,18 @@ class LearnMachine {
           this._unconfirmedStreak = 0;
           this._unconfirmedTitle = '';
         }
+        /* ★ 2026-11-15（Issue #1）：本节还有未完成的视频任务点 → 不管本节「当前视频」
+           判成什么，都**不允许**切节、也不许 +1 计数。绝不提前跳节。 */
+        if (blockAdvance) {
+          return { progress: false, outcome: 'WAIT_VIDEO_CONFIRM' };
+        }
         // 本章若有「章节测验」标签，先切过去把题答完，再进入下一节
         const quizDone = await this.maybeHandleChapterQuiz(st);
         if (quizDone === 'handled') return { progress: true, outcome: 'CHAPTER_QUIZ_HANDLED' };
         if (quizDone === 'pending') return { progress: true, outcome: 'CHAPTER_QUIZ_PENDING' };
+        /* ★ 2026-11-15（Issue #1）：本节所有视频任务点都播过了，才真正算「完成一节」。
+           计数挪到真切节之前（以前写在播完那一刻，任务点没播也 +1，上报虚高）。 */
+        this.counters.sectionsCompleted += 1;
         return this.advanceSection(st);
       }
       if (st.video.paused) {
@@ -641,6 +728,10 @@ class LearnMachine {
     if (!this._videoSeenThisSection && this._waitTicks < this.cfg.safety.maxNoVideoWaitTicks) {
       this._waitTicks += 1;
       logger.info('WAIT_LOAD', '当前节尚未出现视频，等待加载', { tick: this._waitTicks, max: this.cfg.safety.maxNoVideoWaitTicks });
+      /* ★ 2026-11-17（D-028）：真机 16.2 实测——点完目录切节后，knowledge/cards iframe
+         一直没起来（诊断里 10 个 frame 有 9 个是 about:blank），任务点一个都读不到，
+         纯等下去只会撞「连续 9 轮无进展」的防呆。等一半时主动重载当前节页面，等同人工刷新。 */
+      await this._kickReloadIfNoTasks();
       await humanize.pollDelay();
       return { progress: false, outcome: 'WAIT_LOAD' };
     }
@@ -662,6 +753,13 @@ class LearnMachine {
         reason: decision.reason,
         layer: st.toc ? st.toc.layer : 0,
       });
+      /* ★ 2026-11-16（D-026）：直播回放任务点。
+         它没有 <video>、没有 objectid，播放器在独立的 zhibo 标签页里，
+         所以绝不复用下面的「无视频 → 跳过/切节」路径，也不复用 play（视频路径
+         强依赖同 frame 的 <video> 与 objectid 对齐）。走专用 handler。 */
+      if (kind === TASK_KIND.LIVE || decision.action === 'open_live') {
+        return await this.handleLiveTask(st);
+      }
       if (decision.action === 'wait') {
         /* handler 认为还要等（异步加载的文档常见） */
         await humanize.pollDelay();
@@ -695,36 +793,77 @@ class LearnMachine {
    * @param {string} imageB64  该题的截图 base64（PNG）。超星题干是加密字体，
    *                          DOM 读出来是密文，只有截图才是明文——有图就以图为准。
    */
-  async askAI(question, options, imageB64) {
+  async askAI(question, options, imageB64, kind) {
     const askUrl = process.env.CX_LLM_ASK_URL || '';
     const base = process.env.CX_LLM_BASE || '';
     const key = process.env.CX_LLM_KEY || '';
-    const model = process.env.CX_LLM_MODEL || '';
+    const envModel = process.env.CX_LLM_MODEL || '';
     if (!options || !options.length) return -1;
-    if (!askUrl && !(base && key && model)) return -1;
-    const labels = options.map(function (o, i) {
-      return (o.letter || String.fromCharCode(65 + i)) + '. ' + (o.label || '');
-    }).join('\n');
-    const prompt = imageB64
-      ? '这是考试题目的截图（超星用加密字体渲染，截图里才是明文）。\n' +
-        '请读出题干和全部选项，判断正确答案是哪一个。\n' +
-        '只输出正确选项的字母（A/B/C/D），不要任何解释。'
-      : '题目：' + (question || '') + '\n选项：\n' + labels +
-        '\n\n只输出正确选项的字母（A/B/C/D…），不要任何解释。';
+    if (!askUrl && !(base && key && envModel)) return -1;
 
-    let text = '';
-    const attempts = 3;
-    for (let attempt = 1; attempt <= attempts; attempt++) {
-      text = '';
+    /* 决策层已抽到 engine/src/core/ai.js：这里只提供可插拔 transport，
+       范围锁 / prompt 构造 / 严格解析 / 审计 全部交给 ai.decide()。
+       ai 模块只返回选项下标，永不碰页面；点选与提交仍在本状态机原逻辑。 */
+    const cfgAi = (this.cfg && this.cfg.ai) || {};
+    const timeoutMs = Number(cfgAi.timeoutMs) > 0 ? Number(cfgAi.timeoutMs) : 20000;
+
+    /* transport 抽到 _aiTransport()，与 askAIBatch 共用同一套通路 */
+    const transport = this._aiTransport(timeoutMs);
+
+    const r = await aiCore.decide({
+      kind: kind || '',
+      question,
+      options,
+      image: imageB64 || '',
+      cfg: { ai: cfgAi },
+      transport,
+    });
+    if (r && !r.ok && r.code) {
+      logger.warn('QUIZ', 'AI 未给出可用答案，回退原逻辑', { code: r.code, model: r.model, ms: r.ms });
+    }
+    return r && r.ok && r.index >= 0 ? r.index : -1;
+  }
+
+  /**
+   * 构造「模型传输层」——`askAI`（逐题）与 `askAIBatch`（批量）共用同一套通路。
+   *
+   * 两条通路（与旧 askAI 内联实现完全一致，行为不变）：
+   *   1) CX_LLM_ASK_URL —— 回调宿主（DSH 插件）端点，用 DSH 已配置的模型
+   *   2) CX_LLM_BASE/CX_LLM_KEY —— 直连 OpenAI 兼容接口
+   *
+   * transport 只负责「把 prompt 送出去、把文本拿回来」，返回值固定为
+   * `{ok:true, text, model}`；失败抛错，由 ai.js 的 decide/decideBatch 统一重试/判错。
+   * **不做任何题目推理**（决策层在 engine/src/core/ai.js）。
+   *
+   * @param {number} timeoutMs 单次请求超时
+   * @param {number} [maxTokens] 直连通路的 max_tokens；缺省 16（逐题只回一个字母）
+   */
+  _aiTransport(timeoutMs, maxTokens) {
+    const askUrl = process.env.CX_LLM_ASK_URL || '';
+    const base = process.env.CX_LLM_BASE || '';
+    const key = process.env.CX_LLM_KEY || '';
+    const envModel = process.env.CX_LLM_MODEL || '';
+    const cfgAi = (this.cfg && this.cfg.ai) || {};
+    const provider = process.env.CX_LLM_PROVIDER || cfgAi.provider || 'host';
+    const model = envModel || cfgAi.model || '';
+    const waitMs = Number(timeoutMs) > 0 ? Number(timeoutMs) : 20000;
+    const limit = Number(maxTokens) > 0 ? Number(maxTokens) : 16;
+
+    const fetchWithTimeout = async (url, init) => {
+      const ac = new AbortController();
+      const timer = setTimeout(() => ac.abort(), waitMs);
+      try { return await fetch(url, Object.assign({}, init, { signal: ac.signal })); }
+      finally { clearTimeout(timer); }
+    };
+
+    /* transport({prompt,image}) → {ok,text,model}；失败抛错，由 ai.decide 统一重试 */
+    return async ({ prompt, image }) => {
+      let text = '';
       if (askUrl) {
-        // 通路 1：回调宿主，由宿主用 ctx.llm 调用户配置的模型
-        const payload = {
-          provider: process.env.CX_LLM_PROVIDER || '',
-          model: model,
-          prompt: prompt,
-        };
-        if (imageB64) payload.image = 'data:image/png;base64,' + imageB64;
-        const res = await fetch(askUrl, {
+        /* 通路 1：回调宿主，由宿主用 ctx.llm 调用户配置的模型 */
+        const payload = { provider, model, prompt };
+        if (image) payload.image = 'data:image/png;base64,' + image;
+        const res = await fetchWithTimeout(askUrl, {
           method: 'POST',
           headers: {
             'content-type': 'application/json',
@@ -737,34 +876,61 @@ class LearnMachine {
         if (!j || j.ok !== true) throw new Error(String((j && j.error) || '宿主答题回调失败'));
         text = String(j.text || '');
       } else {
-        // 通路 2：直连 OpenAI 兼容接口
+        /* 通路 2：直连 OpenAI 兼容接口 */
         const url = base.replace(/\/+$/, '') + '/chat/completions';
-        const msgContent = imageB64
-          ? [{ type: 'text', text: prompt }, { type: 'image_url', image_url: { url: 'data:image/png;base64,' + imageB64 } }]
+        const msgContent = image
+          ? [{ type: 'text', text: prompt }, { type: 'image_url', image_url: { url: 'data:image/png;base64,' + image } }]
           : prompt;
-        const res = await fetch(url, {
+        const res = await fetchWithTimeout(url, {
           method: 'POST',
           headers: { 'content-type': 'application/json', authorization: 'Bearer ' + key },
           body: JSON.stringify({
             model: model,
             messages: [{ role: 'user', content: msgContent }],
             temperature: 0,
-            max_tokens: 16,
+            max_tokens: limit,
           }),
         });
         if (!res.ok) throw new Error('HTTP ' + res.status + ' ' + (await res.text()).slice(0, 120));
         const j = await res.json();
         text = String((j && j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content) || '');
       }
-      if (text.trim()) break;
-      // 上游偶尔「成功返回但正文为空」，重试一次再判定不可用
-      if (attempt < attempts) {
-        logger.warn('QUIZ', '模型返回空内容，重试中 ' + attempt + '/' + (attempts - 1), { model: model });
-        await new Promise(function (r) { setTimeout(r, 800 * attempt); });
-      }
-    }
+      return { ok: true, text, model };
+    };
+  }
 
-    return parseAnswerLetter(text, options.length);
+  /**
+   * 批量作答：一次把一批题投给模型，拿回「每题选哪个下标」。
+   *
+   * 边界（与 askAI 同宗）：
+   *   - 本方法**只做传输**，prompt 拼装 / 严格解析 / 范围校验 全在
+   *     `engine/src/core/ai.js` 的 `decideBatch()`，本层绝不推理「题目 → 字母」。
+   *   - **不碰页面**：点选与保存/提交仍由 handleQuiz 原逻辑执行。
+   *
+   * @param {Array<{id,type,question,options}>} items 一批题
+   * @returns {Promise<null|{ok:true,answers,unresolved,dropped,model,ms}>}
+   *   未配置模型环境 或 异常 → null（调用方据此回退逐题）
+   */
+  async askAIBatch(items) {
+    const askUrl = process.env.CX_LLM_ASK_URL || '';
+    const base = process.env.CX_LLM_BASE || '';
+    const key = process.env.CX_LLM_KEY || '';
+    const envModel = process.env.CX_LLM_MODEL || '';
+    /* 环境判据与 askAI 完全一致：两条通路二者其一即可，都没有就只能逐题 */
+    if (!Array.isArray(items) || !items.length) return null;
+    if (!askUrl && !(base && key && envModel)) return null;
+
+    const cfgAi = (this.cfg && this.cfg.ai) || {};
+    const timeoutMs = Number(cfgAi.timeoutMs) > 0 ? Number(cfgAi.timeoutMs) : 20000;
+    try {
+      /* 批量一次要回多条 JSON，max_tokens 不能按逐题的 16 卡死 */
+      const transport = this._aiTransport(timeoutMs, 1024);
+      const r = await aiCore.decideBatch({ items, cfg: { ai: cfgAi }, transport });
+      return r;
+    } catch (e) {
+      logger.warn('AI', '批量答题失败', { err: String((e && e.message) || e).slice(0, 120) });
+      return null;
+    }
   }
 
   /**
@@ -797,6 +963,33 @@ class LearnMachine {
     return chapter || ('§' + curIdx);
   }
 
+  /**
+   * 章节测验处理策略（唯一判定入口）。
+   *   'skip'   完全不碰
+   *   'save'   作答后只点「保存」存草稿，绝不交卷（默认）
+   *   'submit' 作答后真交卷（必须主人明确打开）
+   *   'none'   只填选项，不点任何按钮
+   *
+   * 优先级：CX_QUIZ_MODE（宿主/CLI 显式下传，宿主配置 chapterQuiz 的镜像）
+   *        → 配置文件 safety.answerChapterQuiz / chapterQuizSubmitMode
+   *        → 'save'
+   * 说明：引擎与宿主不是同一个进程，引擎读不到宿主的 state/config.json，
+   *       所以宿主必须用环境变量把策略传下来；直接跑引擎时才用配置默认值。
+   * @returns {'skip'|'save'|'submit'|'none'}
+   */
+  _chapterQuizMode() {
+    const env = String(process.env.CX_QUIZ_MODE || '').toLowerCase();
+    if (env === 'skip' || env === 'save' || env === 'submit' || env === 'none') return env;
+    const s = (this.cfg && this.cfg.safety) || {};
+    if (s.skipChapterQuiz === true) return 'skip';
+    if (s.answerChapterQuiz === true) {
+      const m = String(s.chapterQuizSubmitMode || 'save').toLowerCase();
+      if (m === 'submit' || m === 'save' || m === 'none') return m;
+      return 'save';
+    }
+    return 'save';
+  }
+
   async maybeHandleChapterQuiz(st) {
     /* ★★★ 2026-10-31 修：开关只认配置，不再读环境变量 ★★★
        原实现是：
@@ -807,11 +1000,7 @@ class LearnMachine {
        同一个引擎两种入口两种行为，这是最容易出事的那种不一致。
 
        现在只认配置 safety.skipChapterQuiz（默认 true），与入口无关。 */
-    if (this.cfg.safety.skipChapterQuiz !== false) {
-      return 'none';
-    }
-    /* 兼容：显式要求跳过时也不点（防止旧配置/旧调用方传 env 才有预期） */
-    if (String(process.env.CX_QUIZ_MODE || '') === 'skip') {
+    if (this._chapterQuizMode() === 'skip') {
       return 'none';
     }
     // 本章已处理过测验 → 不重复（测验是章级任务，同章多节共用）
@@ -1118,7 +1307,14 @@ class LearnMachine {
       if (this._videoQuizKey !== qkey) { this._videoQuizKey = qkey; this._videoQuizTried = new Set(); }
       const tried = this._videoQuizTried;
 
-      for (let i = 0; i < optCount; i++) {
+      /* ★ 视频随堂题**永不**用 AI（主人 2026-11-15 定）：
+         随堂题不计入课程成绩，用模型判断纯属浪费资源，还会拖慢播放。
+         这里固定「按 A→B→C 顺序盲试直到答对」，不再读 cfg.ai / CX_LLM_*。
+         AI 只服务章节测验（见 handleQuiz / AI_SCOPE.chapterQuiz）。 */
+      const order = [];
+      for (let i = 0; i < optCount; i++) order.push(i);
+
+      for (const i of order) {
         if (tried.has(i)) continue;
         tried.add(i);
         logger.info('QUIZ', '随堂题盲试选项 ' + (i + 1) + '/' + optCount, {
@@ -1143,14 +1339,14 @@ class LearnMachine {
         if (!fb || !fb.present) {
           logger.info('QUIZ', '提交后弹题消失，视为已通过');
           this.counters.quizzesAnswered += 1;   // 随堂题已答（计入统计）
-          this._videoQuizTried = null; this._videoQuizKey = null;
+          this._videoQuizTried = null; this._videoQuizKey = null; this._videoQuizAiForKey = null;
           return { progress: true, outcome: 'VIDEO_QUIZ_PASSED' };
         }
         if (fb.correct || fb.continueVisible) {
           logger.info('QUIZ', '随堂题答对了，点「继续」恢复播放', { option: i });
           await this.clickFound(frameId, 'videoQuizContinue');
           this.counters.quizzesAnswered += 1;   // 随堂题已答（计入统计）
-          this._videoQuizTried = null; this._videoQuizKey = null;
+          this._videoQuizTried = null; this._videoQuizKey = null; this._videoQuizAiForKey = null;
           this._videoProgressTicks = 0;
           return { progress: true, outcome: 'VIDEO_QUIZ_CORRECT' };
         }
@@ -1190,7 +1386,20 @@ class LearnMachine {
       if (!q || !q.present) return { progress: false, outcome: 'QUIZ_NONE' };
       const blocks = q.blocks || [];
       const isWorkPage = q.kind === 'chapter_work' || blocks.length > 0;
-      const quizMode = String(process.env.CX_QUIZ_MODE || 'skip');
+      /* 本章测验本轮已作答/已保存过 → 不再答第二遍（只针对作业页，随堂弹题不走这条）。
+         没有这个闸门，保存后页面停在原处，每轮都会重新点一遍选项。 */
+      if (isWorkPage) {
+        const chapterKey = this.currentChapterTitle(st);
+        if (this._quizFilledFor && this._quizFilledFor === chapterKey) {
+          this._quizTabDoneFor = chapterKey;
+          return { progress: true, outcome: 'QUIZ_ALREADY_HANDLED' };
+        }
+      }
+      /* 作业页（章节测验）走配置策略：save / submit / none / skip。
+         非作业页（页面里的泛化弹层）**没有「保存」可点**，只能沿用旧语义：
+         CX_QUIZ_MODE=ai 时才作答并提交，否则一律忽略（不点任何东西）。 */
+      const legacyAi = String(process.env.CX_QUIZ_MODE || '') === 'ai';
+      const quizMode = isWorkPage ? this._chapterQuizMode() : (legacyAi ? 'submit' : 'skip');
       if (quizMode === 'skip' || quizMode === 'manual') {
         const eventIds = this.emitDetectedQuestions(q, {
           kind: q.kind || 'popup_quiz',
@@ -1210,7 +1419,9 @@ class LearnMachine {
 
            安全：只跳过，不点任何题目的选项/提交按钮。 */
         const isChapterWork = q.kind === 'chapter_work' || blocks.length > 0;
-        if (isChapterWork && this.cfg.safety.skipChapterQuiz !== false) {
+        /* 走到这里说明 quizMode 已被判成 'skip'（要么配置显式 skip，要么不是作业页）。
+           作业页 = 章节测验，按策略跳过并切下一节；非作业页走下面的「忽略继续」。 */
+        if (isChapterWork) {
           logger.warn('QUIZ', '章节测验：按安全策略跳过（不答题），继续下一节看视频', {
             kind: q.kind || 'unknown',
             question: (q.question || '').slice(0, 60),
@@ -1263,6 +1474,50 @@ class LearnMachine {
       }
       this._quizIgnoreTicks = 0;
       const useAi = !!(process.env.CX_LLM_ASK_URL || process.env.CX_LLM_MODEL);
+
+      /* —— 批量作答（v2，见 docs/AI-ANSWER-FRAMEWORK.md §14）——
+         只在「作业页 + 有多题 + batchSize>1」时开启；任何一片失败/缺答案
+         都退回下面的逐题 askAI，绝不因此中断整卷。
+         batchSize 未配置时 batchOn=false，行为与旧版逐题完全一致。 */
+      const aiCfg = (this.cfg && this.cfg.ai) || {};
+      const batchSize = Math.max(1, Number(aiCfg.batchSize) || 1);
+      const batchOn = useAi && isWorkPage && blocks.length > 1 && batchSize > 1;
+      const batchIdx = {};   // blockIndex -> 0基选项下标
+      if (batchOn) {
+        const picks = [];
+        for (let bi = 0; bi < blocks.length; bi++) {
+          const b = blocks[bi] || {};
+          const opts = Array.isArray(b.options) ? b.options : [];
+          if (!opts.length) continue;
+          const kindTxt = String(b.kind || '').toLowerCase();
+          picks.push({
+            blockIndex: bi,
+            item: {
+              id: 'q' + (bi + 1),
+              kind: 'chapter_work',
+              type: kindTxt.indexOf('multi') >= 0 ? 'multi' : (/true\s*or\s*false|判断/i.test(String(b.question || '')) ? 'judge' : 'single'),
+              question: String(b.question || '').slice(0, 500),
+              options: opts.map(function (o, k) { return { letter: (o && o.letter) || String.fromCharCode(65 + k), label: String((o && o.label) || '').slice(0, 300) }; }),
+            },
+          });
+        }
+        for (let s = 0; s < picks.length; s += batchSize) {
+          const slice = picks.slice(s, s + batchSize);
+          const r = await this.askAIBatch(slice.map(function (p) { return p.item; }));
+          if (!r || r.ok !== true) { logger.warn('AI', '批量作答不可用，回退逐题', { code: (r && r.code) || 'AI_BATCH_NULL', n: slice.length }); break; }
+          const byId = {};
+          (r.answers || []).forEach(function (a) { byId[a.id] = a; });
+          slice.forEach(function (p) {
+            /* 多选题本期不点选：只点一个选项必然是错的（连草稿都不该这么存）。
+               decideBatch 会把它记为 indexList，这里主动忽略，交给下面的逐题/首个逻辑。 */
+            if (p.item.type === 'multi') return;
+            const a = byId[p.item.id];
+            if (a && a.index >= 0) batchIdx[p.blockIndex] = a.index;
+          });
+          if ((r.unresolved || []).length) logger.info('AI', '批量里有未确定题（将回退逐题）', { ids: r.unresolved });
+        }
+      }
+
       const targets = isWorkPage ? blocks : [{ i: 0, question: q.question, options: q.options, kind: 'single' }];
 
       /* —— 逐题作答 —— */
@@ -1273,7 +1528,17 @@ class LearnMachine {
         let pickBy = 'first';
         let imgB64 = '';
 
-        if (useAi) {
+        /* 批量答案优先。探针里 blocks 的 i 就是数组下标（`i: blocks.length`），
+           万一遇到 i 与下标错位的页面，再按数组下标兜底查一次。 */
+        const _ti = isWorkPage ? blocks.indexOf(blk) : -1;
+        const _hasBatch = (idx) => isWorkPage && Object.prototype.hasOwnProperty.call(batchIdx, idx);
+        const hasBatch = _hasBatch(blk.i) || (_ti >= 0 && _hasBatch(_ti));
+        if (hasBatch) {
+          pickIdx = _hasBatch(blk.i) ? batchIdx[blk.i] : batchIdx[_ti];
+          pickBy = 'ai-batch';
+        }
+
+        if (useAi && !hasBatch) {
           /* 截图：超星题干用 font-cxsecret 加密字体渲染，DOM 里是密文，
              截图才是明文。有图走图，没图才退回文本（文本此时无意义）。 */
           if (isWorkPage) {
@@ -1286,7 +1551,7 @@ class LearnMachine {
             }
           }
           try {
-            const ai = await this.askAI(blk.question, blk.options, imgB64);
+            const ai = await this.askAI(blk.question, blk.options, imgB64, isWorkPage ? 'chapter_work' : 'popup_quiz');
             if (ai >= 0) { pickIdx = ai; pickBy = imgB64 ? 'ai-vision' : 'ai'; }
             logger.info('QUIZ', 'AI 作答结果', { block: blk.i, idx: pickIdx, by: pickBy, model: process.env.CX_LLM_MODEL, hasImage: !!imgB64 });
           } catch (e) {
@@ -1306,7 +1571,50 @@ class LearnMachine {
         logger.info('QUIZ', '已选择选项', { block: blk.i, by: pickBy, note: pick.note, options: (blk.options || []).map((o) => o.letter) });
       }
 
-      /* —— 提交 —— */
+      /* —— 收尾：保存草稿 / 交卷 / 只填不点 —— */
+      /* ★★★ 2026-11-15 主人指令：章节测验默认「答完只保存，不提交」★★★
+         保存 = 把答案写进草稿，本人随时可以改、可以自己交；不产生成绩。
+         交卷 = 真实成绩，且不可撤回。所以默认只点「保存」，交卷必须显式开启。 */
+      if (quizMode === 'none') {
+        logger.info('QUIZ', '章节测验已填好，按配置不点任何按钮（不保存也不提交）', {
+          answered, blocks: blocks.length,
+        });
+        this._quizFilledFor = this.currentChapterTitle(st);
+        return { progress: true, outcome: 'QUIZ_FILLED_ONLY' };
+      }
+
+      if (quizMode === 'save') {
+        const sav = isWorkPage
+          ? await this.clickFound(q.frameId, 'quizBlockSave')
+          : { ok: false, reason: 'not-work-page' };
+        if (!sav.ok) {
+          /* 找不到保存按钮 → 绝不能退化成点提交。答案留在页面上，交给人处理。 */
+          logger.warn('QUIZ', '未找到「保存」按钮，保留已填答案不提交（请人工确认）', {
+            reason: sav.reason, answered, blocks: blocks.length,
+          });
+          this.counters.quizzesSaved = (this.counters.quizzesSaved || 0) + 1;
+          this._quizFilledFor = this.currentChapterTitle(st);
+          this.failures = 0;
+          return { progress: true, outcome: 'QUIZ_SAVED_NO_BUTTON' };
+        }
+        /* 保存结果校验：超星可能弹一个小提示，也可能静默。这里只等页面稳定后复核，
+           不把「没看到提示」当成失败。 */
+        await sleep(1500);
+        const after = await this.gatherState();
+        const stillThere = !!(after && after.quiz && after.quiz.present);
+        this.counters.quizzesSaved = (this.counters.quizzesSaved || 0) + 1;
+        this._quizFilledFor = this.currentChapterTitle(st);
+        this.failures = 0;
+        logger.info('QUIZ', '章节测验已保存草稿（未交卷）', {
+          answered, blocks: blocks.length, saveText: sav.text,
+          stillOnPage: stillThere, note: '如需交卷请把 chapterQuizSubmitMode 设为 submit',
+        });
+        /* 保存不改任务点完成状态，本节仍算未完成；但继续停在测验页只会空转，
+           所以按「已处理」切到下一节继续看视频（旧跳过逻辑同此处理）。 */
+        return this.advanceSection(st);
+      }
+
+      /* —— 提交（quizMode === 'submit'，仅在明确开启时走这里）—— */
       const sub = isWorkPage
         ? await this.clickFound(q.frameId, 'quizBlockSubmit')
         : await this.clickFound(q.frameId, 'quizSubmit');
@@ -1554,6 +1862,37 @@ class LearnMachine {
    *
    * @returns {Promise<boolean>} 是否成功重新加载并恢复播放
    */
+  /**
+   * 任务点一个都读不到时，重载当前节页面（D-028）。
+   * 只在「等待加载」的中途调用一次，避免热循环里反复刷新。
+   */
+  async _kickReloadIfNoTasks() {
+    try {
+      const tasks = (this._lastInventory && this._lastInventory.tasks) || [];
+      if (tasks.length) return;                       // 任务点已读到，不需要重载
+      if (this._waitTicks !== 2) return;              // 只在第 2 次等待时踢一次
+      const cid = this._currentChapterId();
+      if (!cid) return;
+      /* 优先用「当前页 URL」换 chapterId（cfg.course.url 是 stucoursemiddle 入口页，没有 chapterId） */
+      let url = '';
+      try { url = String(await this.adapter.getCurrentUrl() || ''); } catch (_) { url = ''; }
+      if (/[?&]chapterId=\d+/.test(url)) {
+        url = url.replace(/([?&]chapterId=)\d+/, '$1' + cid);
+      } else {
+        const base = String((this.cfg && this.cfg.course && this.cfg.course.url) || '');
+        if (!/[?&]chapterId=\d+/.test(base)) return;   // 两个来源都拼不出目标地址就放弃
+        url = base.replace(/([?&]chapterId=)\d+/, '$1' + cid);
+      }
+      logger.info('WAIT_LOAD', '任务点一直读不到，重载当前节页面', {
+        chapterId: cid, url: url.slice(0, 120),
+      });
+      await this.adapter.navigate(url);
+      await sleep(8000);
+    } catch (e) {
+      logger.warn('WAIT_LOAD', '重载当前节页面失败', { error: String((e && e.message) || e).slice(0, 140) });
+    }
+  }
+
   async reloadForFreshVideo() {
     const adapter = this.adapter;
     logger.warn('PLAYING_CHECK', '视频卡死（源加载失败，通常是 CDN 签名过期 403），重新加载页面取新签名', {
@@ -1709,6 +2048,416 @@ class LearnMachine {
     });
     if (!r.done) return { ok: false, by: r.by };
     return { ok: true, by: r.by, count: r.count, unfinish: r.unfinish, total: cur ? cur.taskTotal : undefined };
+  }
+
+  /**
+   * 本节未完成的 media 任务点（judge.pendingSectionVideos 的薄封装）。
+   * 拿不到/不可信时一律返回 ok:false —— 调用方据此退回「不猜」的保守路径。
+   */
+  _sectionPendingVideos(st) {
+    const EMPTY = { ok: false, stale: false, pending: [], total: 0, finished: 0 };
+    try {
+      const cur = this._currentTocItem(st);
+      const inv = this._lastInventory;
+      const tasks = (inv && Array.isArray(inv.tasks)) ? inv.tasks : [];
+      const r = pendingSectionVideos(tasks, cur && cur.chapterId ? String(cur.chapterId) : '');
+      return (r && typeof r === 'object') ? r : EMPTY;
+    } catch (_) { return EMPTY; }
+  }
+
+  /** 这个播放器是否对应「某个未完成的 media 任务点」（按 objectid 对齐，对不上就 false） */
+  _videoMatchesPending(video, pv) {
+    try {
+      if (!pv || !pv.ok || !Array.isArray(pv.pending) || !pv.pending.length) return false;
+      const oid = String((video && video.objectid) || '');
+      if (!oid) return false;
+      return pv.pending.some((t) => String((t && t.objectid) || '') === oid);
+    } catch (_) { return false; }
+  }
+
+  /**
+   * 挑「本节未完成、且本次运行还没开始播过」的那个播放器。
+   * 找不到（或任务点没有 objectid、无法定位）返回 null —— 绝不猜、绝不拿别的视频冒充。
+   * 全部未完成任务点都已播过一次（平台还没记账）时也返回 null，
+   * 交给后面的「未确认」逻辑（拍快照 / 累积 streak / 停止）。
+   */
+  _pickUnplayedVideo(st, pv) {
+    try {
+      if (!pv || !pv.ok || !Array.isArray(pv.pending) || !pv.pending.length) return null;
+      const vids = Array.isArray(this._lastVideos) ? this._lastVideos : [];
+      const notStarted = [];
+      for (const t of pv.pending) {
+        const oid = String((t && t.objectid) || '');
+        if (!oid) continue;
+        for (const v of vids) {
+          if (String(v.objectid || '') !== oid) continue;
+          if (!this._isVideoStartedHere(v)) notStarted.push(v);
+          break;
+        }
+      }
+      return notStarted.length ? notStarted[0] : null;
+    } catch (_) { return null; }
+  }
+
+  /* ==========================================================================
+   * 直播回放任务点（D-026）
+   * --------------------------------------------------------------------------
+   * 超星直播不是 <video>：
+   *   卡片 iframe = mooc1 .../ananas/modules/live/index.html（只是入口，无 video）
+   *   真播放器   = https://live.chaoxing.com/courseLive/pclive?streamName=..&vdoid=..
+   *                └─ 内嵌 https://zhibo.chaoxing.com/live/course/watch?...（video.js + HLS）
+   *
+   * 进度口径（2026-11-16 实测，唯一可信来源）：
+   *   播放器页每 30s 打一次 GET https://zhibo.chaoxing.com/saveTimePc?...&isStart=1，
+   *   服务端按**墙钟**累计，每 5 分钟落一次 liveinfo 的 percentValue/timeLong。
+   *   ⇒ 引擎只需「把播放器页开着并保持 playing 态」，再轮询 liveinfo 等 percentValue ≥ 90。
+   *
+   * 为什么不用本地 currentTime 判定：headless 里 HLS+MSE 的 currentTime 恒为 0
+   * （webkitVideoDecodedByteCount 恒 0；同一浏览器播 mp4 正常解码 442 帧），
+   * 但 paused=false 时心跳照发、percentValue 照涨（实测 241s → 6.83%）。
+   * ========================================================================*/
+
+  /** 读 liveinfo 的服务端进度。
+   *
+   * ★ 2026-11-16 真机教训（D-027）：原来只在 cards frame 里 `evalInFrame` 发请求，
+   *   而轮询循环每分钟 `attachTarget(播放器)` ↔ `attachTarget(学习页)` 来回切。
+   *   实测后果：多次 attach 后 `Runtime.evaluate` 集体超时（一次播放器标签页的
+   *   渲染进程吃到 793MB），进度彻底读不到，播放器越堆越多。
+   *
+   *   现在优先走 **Node 侧 fetch**（adapter.getAllCookies() 拿真实 cookie 自己发请求），
+   *   完全不依赖 CDP 附着，也不受页面卡顿影响；只有拿不到 cookie/上下文时才回退到
+   *   页面内 fetch（_liveInfoFrame）。
+   */
+  async _liveInfo(knowledgeId, liveId, ctx) {
+    if (ctx && typeof fetch === 'function') {
+      const n = await this._liveInfoNode(knowledgeId, liveId, ctx).catch(() => null);
+      if (n && n.ok) return n;
+    }
+    return this._liveInfoFrame(knowledgeId, liveId);
+  }
+
+  /** Node 侧带 cookie 直接请求 liveinfo（最快、最稳，不碰 CDP） */
+  async _liveInfoNode(knowledgeId, liveId, ctx) {
+    const getCk = this.adapter && this.adapter.getAllCookies;
+    if (typeof getCk !== 'function') return { ok: false, error: 'no-cookie-api' };
+    const all = await getCk.call(this.adapter);
+    if (!Array.isArray(all) || !all.length) return { ok: false, error: 'no-cookies' };
+    const jar = all
+      .filter((c) => /chaoxing\.com$/i.test(String((c && c.domain) || '').replace(/^\./, ''))
+        || /chaoxing\.com/i.test(String((c && c.domain) || '')))
+      .map((c) => c.name + '=' + c.value).join('; ');
+    if (!jar) return { ok: false, error: 'no-chaoxing-cookies' };
+    const p = new URLSearchParams();
+    p.set('liveid', String(liveId));
+    p.set('userid', String((ctx && ctx.userid) || ''));
+    p.set('clazzid', String((ctx && ctx.clazzid) || ''));
+    p.set('knowledgeid', String(knowledgeId || ''));
+    p.set('courseid', String((ctx && ctx.courseid) || ''));
+    p.set('jobid', 'live-' + String(liveId));
+    p.set('ut', 's');
+    const res = await fetch('https://mooc1.chaoxing.com/ananas/live/liveinfo?' + p.toString(), {
+      headers: {
+        cookie: jar,
+        accept: 'application/json, text/javascript, */*; q=0.01',
+        'x-requested-with': 'XMLHttpRequest',
+        referer: 'https://mooc1.chaoxing.com/mycourse/studentstudy',
+      },
+    });
+    const txt = await res.text();
+    let j = null;
+    try { j = JSON.parse(txt); } catch (_) { return { ok: false, error: 'bad-json:' + txt.slice(0, 40) }; }
+    const dd = j && j.temp && j.temp.data;
+    if (!dd) return { ok: false, error: 'no-data' };
+    return {
+      ok: true,
+      percent: Number(dd.percentValue) || 0,
+      timeLong: Number(dd.timeLong) || 0,
+      duration: Number(dd.duration) || 0,
+      viewUrl: dd.viewUrl || '',
+      streamName: dd.streamName || '',
+    };
+  }
+
+  /** 页面内读（回退路径）：在 cards frame 里带 cookie 请求，同源 mooc1 */
+  async _liveInfoFrame(knowledgeId, liveId) {
+    try {
+      const docs = await this.adapter.getFrameDocuments();
+      const want = String(knowledgeId || '');
+      const cards = (docs || []).filter((d) => /knowledge\/cards/i.test(String(d.url || '')));
+      const f = cards.find((d) => want && String(d.url).indexOf('knowledgeid=' + want) >= 0) || cards[0];
+      if (!f) return { ok: false, error: 'no-cards-frame' };
+      const lid = JSON.stringify(String(liveId));
+      const kid = JSON.stringify(want);
+      const expr = '(async () => { try {' +
+        ' var d = (window.AttachmentSetting && window.AttachmentSetting.defaults) || {};' +
+        ' var p = new URLSearchParams();' +
+        ' p.set("liveid", ' + lid + ');' +
+        ' p.set("userid", d.userid || "");' +
+        ' p.set("clazzid", d.clazzId || d.clazzid || "");' +
+        ' p.set("knowledgeid", d.knowledgeid || ' + kid + ');' +
+        ' p.set("courseid", d.courseid || d.courseId || "");' +
+        ' p.set("jobid", "live-" + ' + lid + ');' +
+        ' p.set("ut", "s");' +
+        ' var r = await fetch("https://mooc1.chaoxing.com/ananas/live/liveinfo?" + p.toString(), { credentials: "include" });' +
+        ' var j = await r.json();' +
+        ' var dd = (j && j.temp && j.temp.data) || null;' +
+        ' if (!dd) return { ok: false, error: "no-data" };' +
+        ' return { ok: true, percent: Number(dd.percentValue) || 0, timeLong: Number(dd.timeLong) || 0,' +
+        '   duration: Number(dd.duration) || 0, viewUrl: dd.viewUrl || "", streamName: dd.streamName || "" };' +
+        ' } catch (e) { return { ok: false, error: String((e && e.message) || e) }; } })()';
+      const r = await this.adapter.evalInFrame(f.frameId, expr);
+      if (r && typeof r === 'object') return r;
+      return { ok: false, error: 'bad-result' };
+    } catch (e) {
+      return { ok: false, error: String((e && e.message) || e).slice(0, 150) };
+    }
+  }
+
+  /** 抓一次 liveinfo 需要的学生上下文（userid/clazzid/courseid），成功即缓存 */
+  async _liveCtxOf(knowledgeId) {
+    const key = String(knowledgeId || '');
+    if (this._liveCtx && this._liveCtx.key === key) return this._liveCtx;
+    try {
+      const docs = await this.adapter.getFrameDocuments();
+      const cards = (docs || []).filter((d) => /knowledge\/cards/i.test(String(d.url || '')));
+      const f = cards.find((d) => key && String(d.url).indexOf('knowledgeid=' + key) >= 0) || cards[0];
+      if (!f) return null;
+      const expr = '(() => { var d = (window.AttachmentSetting && window.AttachmentSetting.defaults) || {};'
+        + ' return { userid: String(d.userid || ""), clazzid: String(d.clazzId || d.clazzid || ""),'
+        + '   courseid: String(d.courseid || d.courseId || ""), knowledgeid: String(d.knowledgeid || "") }; })()';
+      const r = await this.adapter.evalInFrame(f.frameId, expr);
+      if (r && r.userid) {
+        this._liveCtx = { key, userid: r.userid, clazzid: r.clazzid, courseid: r.courseid };
+        return this._liveCtx;
+      }
+    } catch (_) { /* 拿不到就走回退路径 */ }
+    return null;
+  }
+
+  /**
+   * 让直播播放器进入 playing 态（muted + play）。
+   * 只读 + 播放，不点任何「提交/报名/发送」类按钮。
+   */
+  async _liveEnsurePlaying(timeoutMs) {
+    const deadline = Date.now() + (Number(timeoutMs) || 10000);
+    let lastErr = 'no-zhibo-frame';
+    const expr = '(() => { var v = document.querySelector("video");' +
+      ' if (!v) return { ok: false, why: "no-video" };' +
+      ' try { v.muted = true; } catch (e) {}' +
+      ' var p = null; try { p = v.play(); } catch (e) {}' +
+      ' if (p && p.catch) p.catch(function () {});' +
+      ' return { ok: true, paused: !!v.paused, dur: Number(v.duration) || 0, rs: v.readyState }; })()';
+    while (Date.now() < deadline) {
+      let docs = [];
+      try { docs = await this.adapter.getFrameDocuments(); } catch (e) {
+        lastErr = String((e && e.message) || e);
+        await sleep(1500);
+        continue;
+      }
+      const z = (docs || []).find((d) => /zhibo\.chaoxing\.com/i.test(String(d.url || '')));
+      if (!z) { lastErr = 'zhibo-frame-missing'; await sleep(1500); continue; }
+      let r = null;
+      try { r = await this.adapter.evalInFrame(z.frameId, expr); } catch (e) {
+        lastErr = String((e && e.message) || e);
+        await sleep(1500);
+        continue;
+      }
+      if (r && r.ok && r.dur > 0) {
+        if (!r.paused) return { ok: true, dur: r.dur };
+        /* autoplay 可能需要第二次触发 */
+        await sleep(1200);
+        let r2 = null;
+        try { r2 = await this.adapter.evalInFrame(z.frameId, expr); } catch (_) { /* ignore */ }
+        if (r2 && r2.ok) return { ok: true, dur: r2.dur, paused: !!r2.paused };
+      }
+      await sleep(1500);
+    }
+    return { ok: false, error: lastErr };
+  }
+
+  /**
+   * 直播回放：开播放器标签页 → 保持 playing → 轮询 liveinfo percentValue → 达标切节。
+   * 返回与其它 tick 分支相同的 { progress, outcome } 形状。
+   */
+  async handleLiveTask(st) {
+    const task = this._currentTask(st);
+    const cur = this._currentTocItem(st);
+    const knowledgeId = String((cur && cur.chapterId) || '');
+    const liveId = String((task && task.liveId) || '');
+    const liveCfg = (this.cfg && this.cfg.live) || {};
+    const donePercent = Number(liveCfg.donePercent) || 90;
+    const pollMs = Number(liveCfg.pollMs) || 60000;
+    const startTimeoutMs = Number(liveCfg.startTimeoutMs) || 60000;
+    const maxMs = Number(liveCfg.maxMs) || 150 * 60 * 1000;
+
+    if (!liveId) {
+      this.failures += 1;
+      logger.warn('LIVE', '直播任务点缺少 liveId，无法定位播放器', { section: this._currentTitle, kind: 'live' });
+      return { progress: false, outcome: 'LIVE_NO_ID' };
+    }
+
+    /* 上下文只需抓一次（userid/clazzid/courseid），之后 Node 侧直接发请求 */
+    const ctx = await this._liveCtxOf(knowledgeId);
+    const info = await this._liveInfo(knowledgeId, liveId, ctx);
+    if (!info || !info.ok) {
+      this.failures += 1;
+      logger.warn('LIVE', '读取直播信息失败', {
+        section: this._currentTitle, liveId, error: (info && info.error) || 'unknown',
+      });
+      return { progress: false, outcome: 'LIVE_INFO_FAIL' };
+    }
+
+    if (info.percent >= donePercent) {
+      logger.info('LIVE', '直播回放已达超星完成线，切下一节', {
+        section: this._currentTitle, percent: info.percent, donePercent,
+      });
+      this._videoSeenThisSection = true;
+      this.failures = 0;
+      return this.advanceSection(st);
+    }
+
+    const studyTarget = (typeof this.adapter.getTargetId === 'function') ? this.adapter.getTargetId() : null;
+
+    /* ── 播放器标签页：复用优先，绝不多开（D-027 真机教训） ──
+     * 原来每进一次 handleLiveTask 就 openTarget 一个新播放器，且轮询里来回
+     * attachTarget 切换，实测堆到 8+ 个 HLS 播放器标签页，单个渲染进程 793MB，
+     * Runtime.evaluate 集体超时，进度彻底读不到。现在同 liveId 复用同一个。 */
+    let playerId = null;
+    if (this._livePlayer && this._livePlayer.liveId !== liveId) {
+      /* 上一条直播遗留的播放器：关掉，避免标签页越堆越多 */
+      try { await this.adapter.closeTarget(this._livePlayer.targetId); } catch (_) { /* ignore */ }
+      logger.info('LIVE', '关闭上一条直播遗留的播放器标签页', {
+        section: this._currentTitle, targetId: this._livePlayer.targetId,
+      });
+      this._livePlayer = null;
+    }
+    if (this._livePlayer && this._livePlayer.liveId === liveId) {
+      try {
+        await this.adapter.attachTarget(this._livePlayer.targetId);
+        playerId = this._livePlayer.targetId;
+        logger.info('LIVE', '复用已在播放的播放器标签页', { section: this._currentTitle, targetId: playerId });
+      } catch (_) {
+        this._livePlayer = null;
+      }
+    }
+    if (!playerId) {
+      try {
+        const opened = await this.adapter.openTarget(info.viewUrl);
+        playerId = opened && opened.id;
+        if (!playerId) throw new Error('openTarget 未返回 targetId');
+        await this.adapter.attachTarget(playerId);
+        this._livePlayer = { targetId: playerId, liveId };
+      } catch (e) {
+        logger.warn('LIVE', '直播播放器打开失败', {
+          section: this._currentTitle, error: String((e && e.message) || e).slice(0, 160),
+        });
+        try { if (playerId) await this.adapter.closeTarget(playerId); } catch (_) { /* ignore */ }
+        this._livePlayer = null;
+        if (studyTarget) { try { await this.adapter.attachTarget(studyTarget); } catch (_) { /* ignore */ } }
+        this.failures += 1;
+        return { progress: false, outcome: 'LIVE_START_FAIL' };
+      }
+    }
+
+    /* 确保在播（此时已附着在播放器 target 上） */
+    const started = await this._liveEnsurePlaying(startTimeoutMs);
+    if (!started.ok) {
+      logger.warn('LIVE', '直播播放器未能开始播放', {
+        section: this._currentTitle, error: started.error || 'not-playing',
+      });
+      try { await this.adapter.closeTarget(playerId); } catch (_) { /* ignore */ }
+      this._livePlayer = null;
+      if (studyTarget) { try { await this.adapter.attachTarget(studyTarget); } catch (_) { /* ignore */ } }
+      this.failures += 1;
+      return { progress: false, outcome: 'LIVE_START_FAIL' };
+    }
+    logger.info('LIVE', '直播播放器正在播放（服务端进度按墙钟累计）', {
+      section: this._currentTitle, percent: info.percent, durationSec: info.duration, targetId: playerId,
+    });
+
+    /* ── 轮询：进度走 Node 侧 fetch，循环内不再切 target ── */
+    const deadline = Date.now() + maxMs;
+    let last = info;
+    let reviveAttempts = 0;
+    while (Date.now() < deadline) {
+      await sleep(pollMs);
+      const now = await this._liveInfo(knowledgeId, liveId, ctx);
+      if (now && now.ok) {
+        last = now;
+        logger.info('LIVE', '直播观看进度（服务端口径）', {
+          section: this._currentTitle,
+          percent: now.percent,
+          watchedMin: +(now.timeLong / 60000).toFixed(1),
+          durationMin: +(now.duration / 60).toFixed(1),
+          donePercent,
+        });
+        if (now.percent >= donePercent) break;
+      } else {
+        logger.warn('LIVE', '本轮读进度失败', { error: (now && now.error) || 'unknown' });
+      }
+      /* 保活：我们从头到尾都附着在播放器上，直接确认它还在 playing（不切 target） */
+      let alive = { ok: false };
+      try {
+        alive = await this._liveEnsurePlaying(8000);
+      } catch (e) {
+        alive = { ok: false, error: String((e && e.message) || e).slice(0, 120) };
+        /* 连接可能掉了，重新附着一次播放器再试 */
+        try { await this.adapter.attachTarget(playerId); } catch (_) { /* ignore */ }
+      }
+      if (!alive.ok) {
+        reviveAttempts += 1;
+        logger.warn('LIVE', '播放器掉线，尝试重新播放', { attempt: reviveAttempts, error: alive.error });
+        if (reviveAttempts > 8) {
+          logger.warn('LIVE', '播放器反复掉线，放弃本条直播', { attempts: reviveAttempts });
+          break;
+        }
+      }
+    }
+
+    if (last.percent >= donePercent) {
+      /* 达标才关播放器，并清掉复用记录 */
+      try { await this.adapter.closeTarget(playerId); } catch (_) { /* ignore */ }
+      this._livePlayer = null;
+      if (studyTarget) { try { await this.adapter.attachTarget(studyTarget); } catch (_) { /* ignore */ } }
+      logger.info('LIVE', '直播回放完成', {
+        section: this._currentTitle, percent: last.percent, watchedMin: +(last.timeLong / 60000).toFixed(1),
+      });
+      this._videoSeenThisSection = true;
+      this.failures = 0;
+      return this.advanceSection(st);
+    }
+
+    /* 超时：**故意不关播放器**，让它继续累计，下一轮 tick 复用同一个标签页 */
+    if (studyTarget) { try { await this.adapter.attachTarget(studyTarget); } catch (_) { /* ignore */ } }
+    this.failures += 1;
+    logger.warn('LIVE', '等待超时，直播未达完成线（播放器保留，稍后继续）', {
+      section: this._currentTitle, percent: last.percent, donePercent,
+    });
+    return { progress: false, outcome: 'LIVE_TIMEOUT' };
+  }
+
+  /** 驱动指定的那个播放器开始播放（只点它自己的 frame，不碰其它播放器） */
+  async playSectionVideo(st, video) {
+    const frameId = video && video.frameId;
+    if (!frameId) return { ok: false, reason: 'no-frame' };
+    try {
+      const r = await this.clickFound(frameId, 'videoToggle');
+      if (!r || !r.ok) return { ok: false, reason: (r && r.reason) || 'toggle-failed' };
+      await this.muteIfPossible(frameId);
+      await sleep(3000);
+      /* 必须登记成「本次启动」，否则 ended/进度 判定永远不认它 */
+      let after = null;
+      try {
+        const st2 = await this.gatherState();
+        after = st2.video;
+      } catch (_) { /* ignore */ }
+      this._markVideoStarted(after && after.found ? after : video);
+      this._stallTicks = 0;
+      this._resumeAttempts = 0;
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, reason: 'play-error: ' + String((e && e.message) || e).slice(0, 80) };
+    }
   }
 
   /**

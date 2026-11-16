@@ -86,8 +86,8 @@ async function main() {
   console.log('== 5. 注册表完整性 ==');
   {
     const d = T.describe();
-    ok(Array.isArray(d.supported) && d.supported.length === 1 && d.supported[0] === 'video',
-      'supported 只有 video（实际 ' + JSON.stringify(d.supported) + '）');
+    ok(Array.isArray(d.supported) && d.supported.indexOf('video') >= 0,
+      'supported 含 video（实际 ' + JSON.stringify(d.supported) + '）');
     ok(d.neverTouch.includes('quiz'), 'neverTouch 含 quiz');
     ok(d.defaultForUnknown === 'skip', '未知类型默认 skip');
 
@@ -102,6 +102,24 @@ async function main() {
     ok(T.kindOf({ kind: 'weird' }) === 'unknown', '未知 kind → unknown');
     ok(T.kindOf(null) === 'unknown', 'null 任务点 → unknown');
     ok(T.kindOf({}) === 'unknown', '缺 kind → unknown');
+  }
+
+  console.log('== 7. 直播任务点（D-026） ==');
+  {
+    ok(T.TASK_KIND.LIVE === 'live', 'TASK_KIND.LIVE 存在（实际 ' + T.TASK_KIND.LIVE + '）');
+    const r = await T.decideTaskPoint(T.TASK_KIND.LIVE);
+    ok(r.action === 'open_live', '★ live → open_live（不能复用 play，实际 ' + r.action + '）');
+    ok(/直播/.test(r.reason), 'reason 说明是直播回放', r.reason);
+    ok(T.isSupported('live') === true, 'isSupported 含 live');
+    ok(T.isSupported('video') === true, 'isSupported 仍含 video');
+    ok(T.isSupported('document') === false, 'isSupported 不含 document（未实现不谎报）');
+    ok(T.describe().supported.includes('live'), 'describe.supported 含 live');
+    ok(T.kindOf({ kind: 'live' }) === 'live', 'kindOf 认 live');
+    /* 红线依旧：quiz 即使注册了 handler 也必须 never */
+    T.registerHandler(T.TASK_KIND.QUIZ, async () => ({ action: 'play' }));
+    const q = await T.decideTaskPoint(T.TASK_KIND.QUIZ);
+    ok(q.action === 'never', '★ 红线：quiz 永远 never，handler 覆盖不了（实际 ' + q.action + '）');
+    T._resetHandlers();
   }
 
   console.log(fails.length ? '\n== 失败 ' + fails.length + ' 项 ==' : '\n== 全部通过 ==');

@@ -1211,6 +1211,36 @@ function createCdpAdapter(cfg) {
       return { found: true, ended: !!v.ended || (v.progress || 0) >= cfg.video.progressDoneRatio, raw: v };
     },
 
+    /** 当前附着中的 target id（直播任务需要「切走再切回」） */
+    getTargetId() { return _targetId || null; },
+
+    /**
+     * 新建一个标签页并打开指定 URL。
+     *
+     * ★ 2026-11-16（D-026）：直播回放的播放器**必须**在独立标签页里跑 ——
+     *   卡片里那个 iframe 只是入口，真正的播放器在
+     *   https://live.chaoxing.com/courseLive/pclive?...（内嵌 zhibo.chaoxing.com）。
+     *   实测 headless 下点卡片那个隐藏 `<a target=_blank>.click()` 不生效，
+     *   所以直接拿 liveinfo 返回的 viewUrl 自己开页，稳定可测。
+     *   不自动 attach：调用方先记下当前 target，再决定何时切过去。
+     */
+    async openTarget(url) {
+      const path = '/json/new?' + encodeURIComponent(url || 'about:blank');
+      let t = null;
+      try { t = await cdpHttp(path, 'PUT'); } catch (_) { t = await cdpHttp(path); }
+      if (!t || !t.id) throw new Error('openTarget: 新建标签页失败');
+      logger.info('LIVE', '已打开标签页', {
+        targetId: String(t.id).slice(0, 12), url: String(url || '').slice(0, 140),
+      });
+      return { id: t.id, webSocketDebuggerUrl: t.webSocketDebuggerUrl, url: t.url || url };
+    },
+
+    /** 关闭指定标签页（忽略错误，用于收尾直播播放器） */
+    async closeTarget(targetId) {
+      if (!targetId) return false;
+      try { await cdpHttp('/json/close/' + targetId); return true; } catch (_) { return false; }
+    },
+
     async getCurrentUrl() {
       if (!_conn) return '';
       try {
