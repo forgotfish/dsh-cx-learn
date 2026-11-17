@@ -167,7 +167,15 @@ const QA_SESSION_FILE = join(STATE, 'ai-session.json')
 let loginChild = null
 
 const ensureDir = () => { if (!existsSync(STATE)) mkdirSync(STATE, { recursive: true }) }
-const readJson = (p, fb) => { try { return JSON.parse(readFileSync(p, 'utf8')) } catch { return fb } }
+const readJson = (p, fb) => {
+  try {
+    const v = JSON.parse(readFileSync(p, 'utf8'))
+    /* ★ 2026-11-17（D-030）：文件内容是 null / 数字 / 字符串时，按「读不到」返回兜底值。
+       破坏性测试实测：state.json 写成 `null` 时，readJson 返回 null，随后 `.pid` 取值抛
+       TypeError → /status 直接 500（整页拿不到状态）。数组仍按对象保留。 */
+    return (v && typeof v === 'object') ? v : fb
+  } catch { return fb }
+}
 const writeJson = (p, v) => { ensureDir(); writeFileSync(p, JSON.stringify(v, null, 2)) }
 const nowLog = (s) => { ensureDir(); appendFileSync(LOG_FILE, `[plugin] ${new Date().toISOString()} ${s}\n`) }
 
@@ -191,11 +199,36 @@ const saveCfg = (patch) => {
  * 但引擎子进程可能还活着 —— 那样界面会显示「空闲」而实际还在刷课，
  * 主人点「开始看课」就会重复启动。所以额外用 pid 探活兜底。
  */
+/**
+ * 引擎心跳过期阈值。
+ * 浏览器层（engine-ensureBrowser 起的 HEALTH）每 15s 往 browser.json 写一次 heartbeatAt，
+ * 所以 3 分钟没更新基本可以断定「进程已死 / pid 被系统复用给了别的程序」。
+ */
+const ENGINE_HB_STALE_MS = 3 * 60 * 1000
+
 const running = () => {
   if (child && child.exitCode === null) return true
-  const pid = Number(readJson(STATE_FILE, {}).pid || 0)
+  const st = readJson(STATE_FILE, {}) || {}
+  const pid = Number((st && st.pid) || 0)
   if (!pid) return false
-  try { process.kill(pid, 0); return true } catch { return false }
+  try { process.kill(pid, 0) } catch { return false }
+  /* ★ 2026-11-17（D-031）：pid 活着**不足以**证明「我们的引擎还在跑」。
+     破坏性测试实测：把 state.json 的 pid 写成任意一个活着的无关进程（例如 pwsh），
+     /status 与 /health 都会报 running=true —— 界面上「开始」变绿、点「开始看课」被误挡
+     （「已经有一轮在跑了」）。这正是 D-023 留下的残留风险。
+     现在要求「pid 活着 + 浏览器层心跳的 ownerPid 就是这个 pid + 心跳足够新」。
+     注意不能用 learn.json 的 updatedAt 做判据：它只在切节/停止时写，
+     直播一跑 57 分钟不写盘，会被误判成「没在跑」。 */
+  const b = readBrowserState() || {}
+  const ownerPid = Number(b.ownerPid || 0)
+  if (ownerPid && ownerPid === pid) {
+    const hb = Date.parse(b.heartbeatAt || b.updatedAt || '')
+    if (Number.isFinite(hb) && (Date.now() - hb) <= ENGINE_HB_STALE_MS) return true
+    nowLog('running(): pid ' + pid + ' 活着但心跳过期（' + Math.round((Date.now() - hb) / 1000) + 's），按未在跑处理')
+    return false
+  }
+  nowLog('running(): pid ' + pid + ' 活着但无心跳证据（ownerPid=' + ownerPid + '），按未在跑处理')
+  return false
 }
 
 /**
@@ -1491,6 +1524,21 @@ async function loginState() {
     out.hint = '扫码后验证失败，请重新点「开始登录」'
     return out
   }
+  /* ★ 2026-11-17（D-032）：以前只要 profile 目录还在就一律说「上次扫码流程被中断」。
+     实测会骗人：会话因**闲置超时**正常结束后 profile 目录仍留着，用户看到的是
+     「扫码被中断」，以为是登录坏了（主人就是这么被误导的）。按 session.json 里
+     记录的结束原因给出真实文案。 */
+  const sReason = String((ses.session && ses.session.reason) || '')
+  if (sReason === 'idle_timeout') {
+    out.state = 'idle'
+    out.hint = '登录会话已闲置超时结束，请点「开始登录」重新扫码（一次性登录：每次任务结束登录态即销毁）'
+    return out
+  }
+  if (sReason === 'user' || sReason === 'closed') {
+    out.state = 'idle'
+    out.hint = '登录会话已结束，请点「开始登录」重新扫码'
+    return out
+  }
   if (hasProfile) {
     out.state = 'stale'
     out.hint = '上次扫码流程被中断，登录态未确认，请点「开始登录」重新扫码'
@@ -1641,7 +1689,9 @@ async function status() {
  */
 function readBrowserState() {
   try {
-    const p = join(PLUGIN_DIR, 'engine', '.state', 'browser.json')
+    /* ★ 2026-11-17（D-031）：允许用 CX_BROWSER_STATE_FILE 覆盖路径 —— 只给测试做隔离，
+       生产环境不设置，行为与原来完全一致（PLUGIN_DIR/engine/.state/browser.json）。 */
+    const p = process.env.CX_BROWSER_STATE_FILE || join(PLUGIN_DIR, 'engine', '.state', 'browser.json')
     if (!existsSync(p)) return null
     const o = JSON.parse(readFileSync(p, 'utf8'))
     return o && typeof o === 'object' ? o : null

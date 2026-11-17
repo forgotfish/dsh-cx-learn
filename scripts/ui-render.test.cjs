@@ -509,6 +509,33 @@ console.log('== 10. 内核圆点：未启动=灰、在跑=绿、文件缺=红 ==
   ok(cNoEnv === '#ef4444', '★ 引擎文件缺失 → 红（实际 ' + cNoEnv + '）');
 }
 
+/* ---- 11. ★ D-029：选课圆点必须「登录成功 + 已选课」才绿 ---- */
+console.log('== 11. 选课圆点：未登录不绿、登录且有课程才绿 ==');
+{
+  const dotOf = (page, tab) => {
+    let color = null;
+    walk(page, (el) => {
+      if (el.type === 'button' && el.props && el.props['data-cx-tab-id'] === tab) {
+        walk(el, (c) => { if (c.props && 'data-cx-tabdot' in c.props) color = c.props.style && c.props.style.background; });
+      }
+    });
+    return color;
+  };
+  const URL_OK = 'https://mooc1.chaoxing.com/mycourse/studentstudy?chapterId=143117166&courseId=204169157';
+  /* 复现截图现场：有课程 URL，但登录态是 stale（上次扫码被中断）→ 必须灰 */
+  const cStale = dotOf(loadPanel({ 0: stFull, 3: 'stale', 7: URL_OK }), '选课');
+  ok(cStale === '#9ca3af', '★ 未登录(stale) + 有课程 URL → 灰（实际 ' + cStale + '）');
+  /* 从未登录过（idle）也一样 */
+  const cIdle = dotOf(loadPanel({ 0: stFull, 3: 'idle', 7: URL_OK }), '选课');
+  ok(cIdle === '#9ca3af', '★ 未登录(idle) + 有课程 URL → 灰（实际 ' + cIdle + '）');
+  /* 登录成功 + 有课程 → 绿 */
+  const cOk = dotOf(loadPanel({ 0: stFull, 3: 'logged_in', 7: URL_OK }), '选课');
+  ok(cOk === '#16a34a', '★ 登录成功 + 有课程 → 绿（实际 ' + cOk + '）');
+  /* 登录成功但没选课 → 灰 */
+  const cNoUrl = dotOf(loadPanel({ 0: stFull, 3: 'logged_in', 7: '   ' }), '选课');
+  ok(cNoUrl === '#9ca3af', '★ 登录成功但课程地址为空 → 灰（实际 ' + cNoUrl + '）');
+}
+
 finish();
 
 function finish() {

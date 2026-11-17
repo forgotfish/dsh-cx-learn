@@ -463,7 +463,9 @@ window.__ModuleLoader__.load({
         if (t === '内核') return !envOk ? '#ef4444' : ((br && br.alive === true) ? '#16a34a' : '#9ca3af')
         if (t === '登录') return loginState === 'logged_in' ? '#16a34a'
           : (loginState === 'waiting' ? '#f59e0b' : (needLogin ? '#ef4444' : '#9ca3af'))
-        if (t === '选课') return url.trim() ? '#16a34a' : '#9ca3af'
+        /* 选课 = 「登录成功 且 已选好课程」。2026-11-17 修（D-029）：原来只看 url 有没有值，
+           配置里存过一次课程地址就永远绿 —— 未登录时也绿，等于谎报。 */
+        if (t === '选课') return (loginState === 'logged_in' && url.trim()) ? '#16a34a' : '#9ca3af'
         if (t === '答题') return aiEnabled ? '#16a34a' : '#9ca3af'
         return runningFlag ? '#16a34a' : '#9ca3af'
       }

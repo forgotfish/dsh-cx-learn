@@ -41,6 +41,9 @@ function ok(cond, name, extra) {
 const TMP_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'cx-host-smoke-'));
 process.env.DSH_HOME = TMP_HOME;
 process.env.CX_INJECT_MINIMAL = '1';
+/* ★ D-031：浏览器层状态文件默认在仓库 engine/.state/ 下，测试里指到临时目录做隔离 */
+const TMP_BROWSER_STATE = path.join(TMP_HOME, 'browser.json');
+process.env.CX_BROWSER_STATE_FILE = TMP_BROWSER_STATE;
 
 /** 假响应：收集 writeHead / end */
 function fakeRes() {
@@ -169,9 +172,9 @@ async function main() {
     ok(status.json && !(f in status.json), '★ /status 不再有 ' + f);
   }
 
-  /* ---- 3c. ★ status() 在 child === null 时仍返回 200 ----
-   * 插件重启后 child 为 null，但 state.json 里的 pid 可能还活着；
-   * 旧写法 `running() ? child.pid : null` 会在这里抛 TypeError → 500。 */
+  /* ---- 3c. ★ status() 在 child === null 时仍返回 200（D-031 后判据升级） ----
+   * 插件重启后 child 为 null，但引擎可能还在跑。判据从「pid 活着」升级为
+   * 「pid 活着 + 浏览器层心跳的 ownerPid 匹配且新鲜」，见 D-031。 */
   console.log('== 3c. status() 在 child 为 null 时不许抛 ==');
   {
     const stPath = path.join(TMP_HOME, 'cx-learn', 'state.json');
@@ -179,8 +182,16 @@ async function main() {
     fs.writeFileSync(stPath, JSON.stringify({ pid: process.pid, startedAt: Date.now() }));
     const s2 = await callRoute(H, 'GET', '/api/cx-learn/status');
     ok(s2.code === 200 && s2.json && s2.json.ok === true, '★ 内核 pid 活着但 child 为 null 时 /status 仍 200（实际 ' + s2.code + '）');
-    ok(s2.json && s2.json.running === true, '  ↳ running 按 pid 探活为 true');
+    ok(s2.json && s2.json.running === false, '  ↳ 仅 pid 无心跳证据 → running=false（D-031）');
     ok(s2.json && s2.json.pid === null, '  ↳ pid 字段安全降级为 null');
+    /* 补上匹配的新鲜心跳 → 认出「引擎还在跑」 */
+    fs.writeFileSync(TMP_BROWSER_STATE, JSON.stringify({
+      alive: true, port: 1, pid: process.pid, ownerPid: process.pid,
+      heartbeatAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+    }));
+    const s2b = await callRoute(H, 'GET', '/api/cx-learn/status');
+    ok(s2b.code === 200 && s2b.json && s2b.json.running === true, '  ↳ pid + 匹配的新鲜心跳 → running=true');
+    try { fs.unlinkSync(TMP_BROWSER_STATE) } catch { /* ignore */ }
     fs.unlinkSync(stPath);
     const s3 = await callRoute(H, 'GET', '/api/cx-learn/status');
     ok(s3.code === 200 && s3.json && s3.json.running === false, '  ↳ 清掉 state.json 后 running 回到 false');
@@ -217,6 +228,96 @@ async function main() {
     ok(mod.isWatchRun(['--mode=continue_chapters', '--max-sections=5', '--course-url=x']) === true,
       '★ 正常看课参数算看课任务（登录时才是 false）');
   }
+
+  /* ---- 3f. ★ D-030 / D-031：破坏性测试暴露的两处健壮性问题 ---- */
+  console.log('== 3f. state.json 坏值不 500；假 pid 不误判 running ==');
+  {
+    const stPath = path.join(TMP_HOME, 'cx-learn', 'state.json');
+    fs.mkdirSync(path.dirname(stPath), { recursive: true });
+
+    /* D-030：state.json 内容为 null → 以前 readJson 返回 null，.pid 抛 TypeError → 500 */
+    fs.writeFileSync(stPath, 'null');
+    const rNull = await callRoute(H, 'GET', '/api/cx-learn/status');
+    ok(rNull.code === 200, '★ state.json = null → /status 仍 200（实际 ' + rNull.code + '）');
+    ok(rNull.json && rNull.json.ok === true, '  ↳ 返回 ok:true');
+    ok(rNull.json && rNull.json.state && typeof rNull.json.state === 'object' && !Array.isArray(rNull.json.state),
+      '  ↳ state 归一化成对象（实际 ' + JSON.stringify(rNull.json && rNull.json.state) + '）');
+
+    /* 其它坏值同样不许 500 */
+    for (const bad of ['"str"', '123', 'false']) {
+      fs.writeFileSync(stPath, bad);
+      const r1 = await callRoute(H, 'GET', '/api/cx-learn/status');
+      ok(r1.code === 200, '★ state.json = ' + bad + ' → /status 200（实际 ' + r1.code + '）');
+    }
+
+    /* D-031：pid 指向「真实存在但与我们无关」的进程 → 不许判成在跑。
+       用本进程 pid 模拟：它一定活着，但 browser.json 里没有匹配的 ownerPid 心跳。 */
+    fs.writeFileSync(stPath, JSON.stringify({ pid: process.pid, startedAt: Date.now() }));
+    const rAlive = await callRoute(H, 'GET', '/api/cx-learn/status');
+    ok(rAlive.code === 200 && rAlive.json && rAlive.json.running === false,
+      '★ 活着的无关 pid 不再误判 running（实际 ' + JSON.stringify(rAlive.json && rAlive.json.running) + '）');
+    ok(rAlive.json && rAlive.json.pid === null, '  ↳ pid 字段仍安全降级为 null');
+
+    const hAlive = await callRoute(H, 'GET', '/api/cx-learn/health');
+    ok(hAlive.code === 200 && hAlive.json && hAlive.json.task && hAlive.json.task.running === false,
+      '★ /health 的 task.running 同样不误判');
+
+    /* 反例：ownerPid 与 pid 一致且心跳新鲜 → 必须仍然认出「在跑」 */
+    const brPath = TMP_BROWSER_STATE;
+    fs.mkdirSync(path.dirname(brPath), { recursive: true });
+    fs.writeFileSync(brPath, JSON.stringify({
+      alive: true, port: 1234, pid: process.pid, ownerPid: process.pid,
+      heartbeatAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+    }));
+    const rHbd = await callRoute(H, 'GET', '/api/cx-learn/status');
+    ok(rHbd.code === 200 && rHbd.json && rHbd.json.running === true,
+      '★ pid + 匹配的新鲜心跳 → 仍判在跑（实际 ' + JSON.stringify(rHbd.json && rHbd.json.running) + '）');
+
+    /* 心跳过期 → 不再算在跑 */
+    fs.writeFileSync(brPath, JSON.stringify({
+      alive: true, port: 1234, pid: process.pid, ownerPid: process.pid,
+      heartbeatAt: new Date(Date.now() - 10 * 60 * 1000).toISOString(),
+    }));
+    const rStale = await callRoute(H, 'GET', '/api/cx-learn/status');
+    ok(rStale.code === 200 && rStale.json && rStale.json.running === false,
+      '★ 心跳过期（10 分钟前）→ 不算在跑（实际 ' + JSON.stringify(rStale.json && rStale.json.running) + '）');
+
+    try { fs.unlinkSync(brPath) } catch { /* ignore */ }
+    try { fs.unlinkSync(stPath) } catch { /* ignore */ }
+  }
+
+
+  /* ---- 3g. ★ D-032：会话闲置结束不许谎报「扫码被中断」 ---- */
+  console.log('== 3g. D-032 登录态文案按真实原因 ==');
+  {
+    const sesPath = path.join(TMP_HOME, 'cx-learn', 'session.json');
+    fs.mkdirSync(path.dirname(sesPath), { recursive: true });
+    /* 闲置超时正常结束：profile 目录仍在，旧代码会报 stale「上次扫码流程被中断」 */
+    fs.writeFileSync(sesPath, JSON.stringify({
+      active: false, reason: 'idle_timeout', closedAt: new Date().toISOString(),
+      loginVerified: true, port: null, kernelPid: null,
+    }));
+    const r1 = await callRoute(H, 'GET', '/api/cx-learn/login-state');
+    ok(r1.code === 200, '/login-state 200（实际 ' + r1.code + '）');
+    ok(r1.json && r1.json.state === 'idle', '★ idle_timeout → state=idle（实际 ' + (r1.json && r1.json.state) + '）');
+    ok(r1.json && /闲置/.test(r1.json.hint || ''), '★ 文案点明「闲置超时」而不是「扫码被中断」（实际 ' + (r1.json && r1.json.hint) + '）');
+
+    /* 手动结束 */
+    fs.writeFileSync(sesPath, JSON.stringify({ active: false, reason: 'user', loginVerified: true }));
+    const r2 = await callRoute(H, 'GET', '/api/cx-learn/login-state');
+    ok(r2.json && r2.json.state === 'idle', '★ reason=user → state=idle（实际 ' + (r2.json && r2.json.state) + '）');
+
+    /* 真·扫码被中断（没有任何会话原因）→ 仍报 stale */
+    try { fs.unlinkSync(sesPath) } catch { /* ignore */ }
+    const profDir = path.join(require('node:os').tmpdir(), 'cx-learn-ephemeral', 'session');
+    let madeDir = false;
+    try { fs.mkdirSync(profDir, { recursive: true }); madeDir = true } catch { /* ignore */ }
+    const r3 = await callRoute(H, 'GET', '/api/cx-learn/login-state');
+    ok(r3.json && (r3.json.state === 'stale' || r3.json.state === 'idle'),
+      '★ 无会话记录时 state 合法（实际 ' + (r3.json && r3.json.state) + '）');
+    if (madeDir) { try { fs.rmSync(profDir, { recursive: true, force: true }) } catch { /* ignore */ } }
+  }
+
 
   const cfg = await callRoute(H, 'GET', '/api/cx-learn/config');
   ok(cfg.code === 200 && cfg.json && cfg.json.config, '/config GET 返回 config');
