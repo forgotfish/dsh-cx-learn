@@ -10,7 +10,7 @@ const { createCdpAdapter } = require('../browser/cdp.js');
 const { CONTRACT, FatalStop, busEmit, fs, sleep } = require('../core/base.js');
 const { CONFIG, mergeConfig, validateConfig } = require('../core/config.js');
 const { humanize, logBanner, logger } = require('../core/logging.js');
-const { openChapterAndWait, openCourseByClick, openSectionByClick } = require('../courses.js');
+const { openChapterAndWait, openCourseByClick, openSectionByClick, listTargets } = require('../courses.js');
 const { LearnMachine } = require('./machine.js');
 const { EPHEMERAL_DIR, cleanupEphemeralProfile, ensureEphemeralProfile, shutdownBrowser } = require('../login/index.js');
 const { pickStart } = require('./judge.js');
@@ -66,6 +66,22 @@ async function run(overrides, options) {
 
     /* —— 前置检查 —— */
     await adapter.ensureBrowser();
+    /* ★★ 2026-11-18（D-044）：**开跑前清掉本插件遗留的旧学习页标签**。
+       实测：跑过几轮后浏览器里堆着多个 `mooc1/mycourse/studentstudy` 旧标签
+       （不同 chapterId），而 D-041 的选页逻辑会被它们干扰（误当「已进入课程」）。
+       这里只关 studentstudy 页，不动课程列表/登录页；关不掉也不阻断。 */
+    try {
+      const list = await listTargets(cfg).catch(() => []);
+      const stale = (list || []).filter((t) =>
+        t && t.type === 'page' && /mycourse\/studentstudy/i.test(t.url || '')
+      );
+      for (const t of stale) {
+        try { await adapter.closeTarget(t.id); } catch (_) { /* ignore */ }
+      }
+      if (stale.length) {
+        logger.info('PRECHECK', '已清理遗留的旧学习页标签', { count: stale.length });
+      }
+    } catch (_) { /* 清理失败不影响主流程 */ }
     if (cfg.course.url) {
       logger.info('PRECHECK', '导航到课程页', { url: String(cfg.course.url).slice(0, 120) });
       await adapter.navigate(cfg.course.url);
@@ -94,6 +110,13 @@ async function run(overrides, options) {
          · gatherState 后 hasVideo=false 且 tocFound=false
 
        安全：全部是导航类点击（进课程/切 tab/点小节），不触碰任何学习元素。 */
+    /* ★★ 2026-11-18（D-043，真机实证修正版）：enc 的处理要**分级**，不能一律剥离。
+       实测两种事实：
+         (a) `studentstudy?...&enc=<有效>` 能正常打开（带新 enc 的页面是可用的）；
+         (b) 同一 URL 过几分钟再访问 → 「enc校验失败」错误页（1 frame、无目录）。
+       所以：**带 enc 就先按直接入口用**（不强剥、不去点课程）；
+       只有在预检发现「打不开/无目录/疑似错误页」时，才退回去走入口页链路。
+       这样既不破坏原本可用的场景，也能从失效 enc 里恢复。 */
     const isEntryPageUrl = (u) => /stucoursemiddle|ismooc2=1/i.test(String(u || ''));
     let needDrillDown = isEntryPageUrl(cfg.course.url);
 

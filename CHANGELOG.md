@@ -2,6 +2,45 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.2.3] — 2026-11-18
+
+### 修复
+
+- **一节多视频：第 2 个视频起不来导致 108 次空转**（D-039，Issue #1 复测反馈）：
+  - 动作带目标：`videoToggle` 支持按 `objectid` 精确点播（以前固定点第一个 `<video>`）
+  - 起播验证：点完轮询 4s，`paused===false` 或 `currentTime` 前进 >0.5s 才算成功
+    （以前点完就 `return ok`，失败不可见）
+  - 账本改按 `objectid`（以前按 `src`，MSE 空 src 时全塌缩成一个键）
+  - 「尝试」与「成功」解耦：点击**之前**写 attempted；单候选试满 3 次即排除
+  - 候选耗尽分两种收口：确实起播失败 → 停机 + 诊断快照；只是等平台记账 → 继续等
+- **「答题」圆点假绿灯**（D-040）：以前只看 `ai.enabled`。`chapterQuiz=skip` 时引擎根本不碰
+  章节测验、AI 一次都不会被调用，灯却还是绿的。改为 **AI 启用且章节测验策略不是 `skip`**
+  才绿，否则灰（与 D-029「选课」假绿同类）。
+- **课程入口三处真机 bug**（D-041/D-042/D-043/D-044，实测化工热力学）：
+  - **D-041 进了残留旧页**：选页正则含 `mycourse/studentstudy`，且点击后无新页时
+    fallback 到 `coursePages[last]` → 实测池里残留两个旧 `studentstudy`
+    （`643076150`/`643076170`）被当成「进入成功」，进旧页 → 无有效 enc →「温馨提示」
+    → 1 frame / `tocFound=false` → `UNRECOGNIZED_PAGE`。
+    改为**只认 `mooc2-ans/mycourse/stu` 且必须是点击后新出现的**，否则明确失败 + `pagesSeen`。
+  - **D-042 删掉 `element.click()` 兜底**：鼠标点不中时旧代码偷偷派发 JS `hit.click()`，走
+    `<a target="_blank">` 默认链路，落地页与真实鼠标点击不同（假成功）。现在点不中即失败返回，
+    并写下点击点 + 命中元素 + `scrollY` 快照。
+  - **D-043 enc 分级处理**：带有效 `enc` 的 `studentstudy` 是可用的直接入口（几分钟后会失效成
+    「enc校验失败」）。改为带 enc 先按直接入口用（不强剥、不 drilldown），仅失效才退回入口页链路。
+    （最初写成一刀切「一律剥离」，导致 self-test 入口误判，已改回分级。）
+  - **D-044 清理旧标签污染**：开跑前关闭本插件遗留的 `studentstudy` 标签，避免越跑越多并干扰选页。
+
+### 新增
+
+- 破坏性测试 `engine/entry-chaos.test.cjs`（11 项，起真 http server 模拟 `/json/list`）：
+  只有残留旧页 → 必须失败不许附着；出现新课程页 → 成功且附着新页；命中被遮罩 →
+  不 `element.click` 兜底直接失败；只出现老域新页 → 不认；完全没有课程页 → 失败。
+- 破坏性测试 `engine/multi-video-chaos.test.cjs`（17 项）：专砸「起播失败」的各种形态，
+  事故原样复现（点击成功但永不起播）现在 **3 拍收口**且每个候选只点一次，
+  收口时落 `diagnostics/video_unstartable` 快照。
+
+---
+
 ## [0.2.2] — 2026-11-18
 
 > 承接 v0.2.1 之后的一轮真机排障：AI 会话通道（v2）在 DSH 0.2.2-rc.3 上连炸三处，

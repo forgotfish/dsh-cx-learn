@@ -465,9 +465,31 @@ function state(over) {
     const m = new E.LearnMachine(a, cfg);
     m._currentTitle = '本节';
     m._markVideoStarted({ src: 'https://cdn.example/' + oidA + '.mp4' }); // 第一个视频已播完（本次启动过）
+    /* ★ D-039：现在点完会**验证是否真的起播**。这里模拟「点了 B 之后 B 真的在播」，
+       否则验证不通过（旧版不验证，所以老代码下这个用例是靠假象通过的）。 */
+    let clickedPlay = false;
+    m.clickFound = async (frameId, kind, arg) => {
+      a.clicks.push(kind);
+      if (kind === 'videoToggle') clickedPlay = true;
+      return { ok: true, note: 'fake' };
+    };
+    m.muteIfPossible = async () => {};
     m.gatherState = async () => {
       m._lastInventory = { tasks, at: Date.now() };
       m._lastVideos = videos;
+      if (clickedPlay) {
+        /* 点击之后：B 正在播（currentTime 在走、paused=false） */
+        const stB = state({
+          video: { found: true, frameId: 'vfB', src: 'https://cdn.example/' + oidB + '.mp4', objectid: oidB, ended: false, paused: false, progress: 3, currentTime: 3, duration: 100, readyState: 4 },
+          videoFrameId: 'vfB',
+          videos: [
+            { frameId: 'vfB', frameUrl, src: 'https://cdn.example/' + oidB + '.mp4', objectid: oidB, duration: 100, currentTime: 3, paused: false, ended: false, readyState: 4 },
+            { frameId: 'vfC', frameUrl, src: 'https://cdn.example/' + oidC + '.mp4', objectid: oidC, duration: 100, currentTime: 0, paused: true, ended: false, readyState: 4 },
+          ],
+          toc: { found: true, layer: 2, sel: '.posCatalog_select', frameId: 'top', items: tocItems },
+        });
+        return stB;
+      }
       return stPlayed;
     };
     let advances = 0;
@@ -587,6 +609,10 @@ function state(over) {
     m._currentTitle = '本节';
     /* 播放器都已在本次运行播过一轮（含当前正在播的这个 A，否则 playedEnough 不成立） */
     ['f', '1', '2'].forEach((c) => m._markVideoStarted({ src: 'https://cdn.example/' + c.repeat(32) + '.mp4' }));
+    /* ★ D-039：候选筛选改用 objectid 账本（src 账本会因 MSE 空 src 塌缩，不可靠）。
+       「已经尝试过一轮」= 写进 _attemptedVideoIds。 */
+    m._attemptedVideoIds.add(oidB);
+    m._attemptedVideoIds.add(oidC);
     m._lastInventory = { tasks, at: Date.now() };
     m._lastVideos = videos;
     m.gatherState = async () => {

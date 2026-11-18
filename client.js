@@ -466,7 +466,10 @@ window.__ModuleLoader__.load({
         /* 选课 = 「登录成功 且 已选好课程」。2026-11-17 修（D-029）：原来只看 url 有没有值，
            配置里存过一次课程地址就永远绿 —— 未登录时也绿，等于谎报。 */
         if (t === '选课') return (loginState === 'logged_in' && url.trim()) ? '#16a34a' : '#9ca3af'
-        if (t === '答题') return aiEnabled ? '#16a34a' : '#9ca3af'
+        /* 答题 = 「AI 真的会被用到」。2026-11-18 修（D-040）：以前只看 ai.enabled，
+           但 chapterQuiz=skip 时引擎根本不碰章节测验 → AI 一次都不会被调用，
+           绿灯是谎报（和 D-029 选课假绿同一类病）。 */
+        if (t === '答题') return (aiEnabled && chapterQuiz !== 'skip') ? '#16a34a' : '#9ca3af'
         return runningFlag ? '#16a34a' : '#9ca3af'
       }
 

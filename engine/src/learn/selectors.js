@@ -854,6 +854,39 @@ const PAGE_PROBE_SRC = `(function () {
   /* ---- 统一解析：kind → 元素（find / jsClick 复用；点击前实时解析防矩形过期）---- */
   function resolve(kind, arg) {
     if (kind === 'videoToggle') {
+      /* ★ 2026-11-18（D-039，Issue #1 复测）：必须能**按目标**点播放器。
+         以前固定 querySelector('video') → 永远点第一个；
+         一节多个 video 时会反复点「已看完的那个」，导致死循环。
+         arg 支持：{objectid:'32位hex'} 按 src 里的 objectid 精确匹配；
+                   {index:N} 按可见 video 的第 N 个（0 基）。
+         匹配不到就返回 null（不回退去点别的播放器），把失败暴露给上层。 */
+      var wantId = '';
+      var wantIdx = -1;
+      if (arg && typeof arg === 'object') {
+        if (arg.objectid) wantId = String(arg.objectid).toLowerCase();
+        if (typeof arg.index === 'number' && arg.index >= 0) wantIdx = arg.index;
+      }
+      if (wantId || wantIdx >= 0) {
+        var all = [];
+        try {
+          var vlist = document.querySelectorAll('video');
+          for (var k = 0; k < vlist.length; k++) if (visible(vlist[k])) all.push(vlist[k]);
+        } catch (e0) { all = []; }
+        var target = null;
+        if (wantId) {
+          for (var k2 = 0; k2 < all.length; k2++) {
+            var s2 = '';
+            try { s2 = String(all[k2].currentSrc || all[k2].getAttribute('src') || ''); } catch (e3) { s2 = ''; }
+            var mid = s2.match(/[0-9a-fA-F]{32}/);
+            if (mid && mid[0].toLowerCase() === wantId) { target = all[k2]; break; }
+          }
+        } else if (wantIdx < all.length) {
+          target = all[wantIdx];
+        }
+        if (target) return { el: target, layer: 2, note: 'video-element(targeted)' };
+        /* 目标没找到：不要回退去点别的播放器（那正是死循环的成因），直接报告失败 */
+        return null;
+      }
       var big = document.querySelector(S.playBigSel);
       if (big && visible(big)) return { el: big, layer: 1, note: 'vjs-big-play-button' };
       var v = document.querySelector('video');

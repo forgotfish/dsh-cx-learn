@@ -45,6 +45,15 @@ class LearnMachine {
        一律不能作为完成证据 —— 这正是 3.3↔3.4 空转的根因。
        CDP 侧拿不到元素引用，改用 currentSrc 指纹代替。 */
     this._startedVideoSrcs = new Set();
+    /* ★ 2026-11-18（D-039）：按 **objectid** 记账的本节视频账本。
+       为什么不用 src：src 是播放器实现细节，MSE/blob 时为空 → 全塌缩成一个键；
+       而 objectid 是任务点身份，判定层本来就有，必须贯穿到动作/记账/验证三层。
+         · _attemptedVideoIds ：已「尝试起播」过的（在点击**之前**写入，与成功解耦）
+         · _startedVideoIds   ：已确认**真的起播**的（currentTime 前进 / paused=false）
+         · _unstartableVideoIds：试过 N 次仍起不来的（Map<objectid, 次数>） */
+    this._attemptedVideoIds = new Set();
+    this._startedVideoIds = new Set();
+    this._unstartableVideoIds = new Map();
     /* ★ 2026-11-15（GitHub Issue #1）：本节「各 frame 里的 <video> 清单」，
        由 gatherState 每次扫描填充（带 frameId / frameUrl / objectid）。
        一节课可能有多个视频任务点、每个任务点一个独立播放器 iframe，
@@ -553,17 +562,38 @@ class LearnMachine {
             });
             const r = await this.playSectionVideo(st, nextVid);
             if (r.ok) return { progress: true, outcome: 'NEXT_VIDEO' };
-            /* ★ 定位不到/点不开播放器 → 停，绝不拿「上一节/上一个视频」冒充，
-               也绝不静默切节（红线：宁可停，不假装）。 */
-            logger.warn('ADVANCE', '本节仍有未播完的视频任务点，但无法驱动下一个播放器，停止本轮', {
-              title: this._currentTitle, reason: r.reason, pendingVideos: pv.pending.length,
+            /* ★ D-039：起播失败**不再是致命错误**，也不再静默回循环头：
+               本次已把该候选写进 attempted，下一拍会自动换下一个候选；
+               只有「所有候选都试过/都起不来」时才收口（下面是那个分支）。 */
+            logger.warn('ADVANCE', '该候选视频起播失败，下一拍换下一个候选', {
+              title: this._currentTitle, reason: r.reason,
+              objectid: String((nextVid && nextVid.objectid) || '').slice(0, 12),
+              pendingVideos: pv.pending.length,
             });
+            return { progress: false, outcome: 'NEXT_VIDEO_UNSTARTABLE' };
+          }
+          /* 没有可挑的候选了。要区分两种截然不同的情形：
+             (a) 候选都**起播失败**过（unstartable>0）→ 独立终态：报错+快照+停机；
+             (b) 候选都只是**试过并在播**、等平台记账 → 和旧语义一致，继续等，不停机。 */
+          const stuck = [];
+          for (const t of pv.pending) {
+            const oid = String((t && t.objectid) || '');
+            if (!oid) continue;
+            const n = this._unstartableVideoIds.get(oid) || 0;
+            if (n > 0) stuck.push({ objectid: oid, attempts: n });
+          }
+          if (stuck.length) {
+            logger.warn('ADVANCE', '本节剩余视频任务点均无法起播，停止本轮（附快照）', {
+              title: this._currentTitle,
+              pendingVideos: pv.pending.length,
+              attempted: this._attemptedVideoIds.size,
+              unstartable: stuck,
+            });
+            try { this._dumpStuckVideos(st, pv, stuck); } catch (_) { /* ignore */ }
             this.stop('video_task_unreachable');
             return { progress: false, outcome: 'STOPPED' };
           }
-          /* 剩下的任务点都已被本次运行播过一轮，平台还没记账 →
-             不切节，走下面的「未确认」路径（拍快照 + 累积 streak），这一拍只等。 */
-          logger.warn('ADVANCE', '本节仍有未确认的视频任务点（已各播过一轮），等待平台记账，本轮不切节', {
+          logger.warn('ADVANCE', '本节剩余视频任务点均已尝试过，等待平台记账，本轮不切节', {
             title: this._currentTitle, pendingVideos: pv.pending.length, totalVideos: pv.total,
           });
         }
@@ -2147,14 +2177,60 @@ class LearnMachine {
       for (const t of pv.pending) {
         const oid = String((t && t.objectid) || '');
         if (!oid) continue;
+        /* ★ D-039：按 objectid 记账，且「尝试」与「成功」都排除；
+           单个候选连续起播失败 ≥3 次也排除，避免死循环。 */
+        if (this._startedVideoIds.has(oid)) continue;
+        if (this._attemptedVideoIds.has(oid)) continue;
+        if ((this._unstartableVideoIds.get(oid) || 0) >= 3) continue;
         for (const v of vids) {
           if (String(v.objectid || '') !== oid) continue;
-          if (!this._isVideoStartedHere(v)) notStarted.push(v);
+          notStarted.push(v);
           break;
         }
       }
       return notStarted.length ? notStarted[0] : null;
     } catch (_) { return null; }
+  }
+
+  /**
+   * 把「剩余任务点都起播失败」的现场落到诊断快照（D-039）。
+   * 目的：失败必须**可见**，而不是像旧版那样静默空转 108 轮。
+   */
+  _dumpStuckVideos(st, pv, stuck) {
+    try {
+      const snap = {
+        at: new Date().toISOString(),
+        reason: 'video_task_unreachable',
+        section: this._currentTitle || '',
+        chapterId: String(this._currentChapterId() || ''),
+        pendingCount: (pv && pv.pending) ? pv.pending.length : 0,
+        totalVideos: pv ? pv.total : 0,
+        finishedVideos: pv ? pv.finished : 0,
+        stuck,
+        attemptedIds: Array.from(this._attemptedVideoIds || []),
+        startedIds: Array.from(this._startedVideoIds || []),
+        pending: ((pv && pv.pending) || []).map((t) => ({
+          objectid: String((t && t.objectid) || ''),
+          frameUrl: String((t && t.frameUrl) || '').slice(0, 200),
+        })),
+        videos: (Array.isArray(st && st.videos) ? st.videos : []).map((v) => ({
+          objectid: String(v.objectid || ''),
+          src: String(v.src || '').slice(0, 160),
+          duration: v.duration,
+          currentTime: v.currentTime,
+          paused: v.paused,
+        })),
+      };
+      const path = require('node:path');
+      const fs = require('node:fs');
+      const dir = path.join((this.cfg && this.cfg.stateDir) || process.env.CX_STATE_DIR || '.', 'diagnostics');
+      try { fs.mkdirSync(dir, { recursive: true }); } catch (_) { /* ignore */ }
+      const file = path.join(dir, new Date().toISOString().replace(/[:.]/g, '-') + '-video_unstartable.json');
+      fs.writeFileSync(file, JSON.stringify(snap, null, 2));
+      logger.warn('ADVANCE', '已写入起播失败快照', { file: String(file).slice(-64) });
+    } catch (e) {
+      logger.warn('ADVANCE', '写起播失败快照失败', { err: String((e && e.message) || e).slice(0, 100) });
+    }
   }
 
   /* ==========================================================================
@@ -2495,27 +2571,105 @@ class LearnMachine {
   }
 
   /** 驱动指定的那个播放器开始播放（只点它自己的 frame，不碰其它播放器） */
+  /**
+   * 起播本节指定的那个视频（D-039 重写）。
+   *
+   * 旧实现三处致命缺陷（Issue #1 复测：108 次空转、第 2 个视频始终没起播）：
+   *   1. 点击不带目标 → `videoToggle` 内部 querySelector('video') 永远点第一个；
+   *   2. 记「已启动」时用的是**重新探到的 video**（还是第一个），不是候选；
+   *   3. 点完 sleep 3s 直接 return {ok:true}，**从不校验 currentTime 是否前进**。
+   *
+   * 现在：目标带 objectid 下发 → 点击前先写 attempt → 点击后轮询验证是否真的起播。
+   * 起播判据（任一成立即算成功）：paused === false，或 currentTime 比点击前前进 > 0.5s。
+   */
   async playSectionVideo(st, video) {
     const frameId = video && video.frameId;
     if (!frameId) return { ok: false, reason: 'no-frame' };
+    const oid = String((video && video.objectid) || '');
+    /* ★ 尝试记录**在点击之前**写入 —— 与「成功」彻底解耦，
+       否则失败不记账 → 同一个候选被无限重试（自证失败）。 */
+    if (oid) this._attemptedVideoIds.add(oid);
+
+    /* 记点击前的进度基线，用于「有没有真的动起来」的判定 */
+    let beforeTime = -1;
     try {
-      const r = await this.clickFound(frameId, 'videoToggle');
-      if (!r || !r.ok) return { ok: false, reason: (r && r.reason) || 'toggle-failed' };
+      const base = Array.isArray(st && st.videos) ? st.videos : [];
+      for (const v of base) {
+        if (oid && String(v.objectid || '') === oid) { beforeTime = Number(v.currentTime || 0); break; }
+      }
+      if (beforeTime < 0 && st && st.video && typeof st.video.currentTime === 'number') {
+        beforeTime = Number(st.video.currentTime || 0);
+      }
+    } catch (_) { /* ignore */ }
+
+    try {
+      const r = await this.clickFound(frameId, 'videoToggle', oid ? { objectid: oid } : undefined);
+      if (!r || !r.ok) {
+        /* 点不到目标播放器：记一次失败，**不回退去点别的播放器** */
+        this._bumpUnstartable(oid);
+        return { ok: false, reason: (r && r.reason) || 'toggle-failed', objectid: oid };
+      }
       await this.muteIfPossible(frameId);
-      await sleep(3000);
-      /* 必须登记成「本次启动」，否则 ended/进度 判定永远不认它 */
-      let after = null;
-      try {
-        const st2 = await this.gatherState();
-        after = st2.video;
-      } catch (_) { /* ignore */ }
-      this._markVideoStarted(after && after.found ? after : video);
+      if (oid) {
+        const verified = await this._verifyVideoStarted(oid, beforeTime, 4000);
+        if (!verified.ok) {
+          this._bumpUnstartable(oid);
+          logger.warn('QUIZ', '点击后视频未起播（已记录失败，换下一个候选）', {
+            objectid: oid.slice(0, 12), note: verified.note, attempts: this._unstartableVideoIds.get(oid) || 1,
+          });
+          return { ok: false, reason: 'not-started', objectid: oid, note: verified.note };
+        }
+        this._startedVideoIds.add(oid);
+        this._unstartableVideoIds.delete(oid);
+        return { ok: true, objectid: oid, note: verified.note };
+      }
+      /* 没有 objectid 的老情形：保持旧语义（无法按身份验证） */
+      await sleep(1500);
+      this._markVideoStarted(video);
       this._stallTicks = 0;
       this._resumeAttempts = 0;
       return { ok: true };
     } catch (e) {
-      return { ok: false, reason: 'play-error: ' + String((e && e.message) || e).slice(0, 80) };
+      this._bumpUnstartable(oid);
+      return { ok: false, reason: 'play-error: ' + String((e && e.message) || e).slice(0, 80), objectid: oid };
     }
+  }
+
+  _bumpUnstartable(oid) {
+    if (!oid) return;
+    const n = (this._unstartableVideoIds.get(oid) || 0) + 1;
+    this._unstartableVideoIds.set(oid, n);
+  }
+
+  /**
+   * 点完之后验证「真的起播了」—— 这是旧实现最缺的一环（失败不可见）。
+   * 轮询最多 maxMs；命中 paused===false 或 currentTime 前进 > 0.5s 即成功。
+   */
+  async _verifyVideoStarted(oid, beforeTime, maxMs) {
+    const deadline = Date.now() + (Number(maxMs) > 0 ? Number(maxMs) : 4000);
+    let last = null;
+    while (Date.now() < deadline) {
+      await sleep(700);
+      let st2 = null;
+      try { st2 = await this.gatherState(); } catch (_) { st2 = null; }
+      if (!st2) continue;
+      const vids = Array.isArray(st2.videos) ? st2.videos : [];
+      let hit = null;
+      for (const v of vids) {
+        if (String(v.objectid || '') === oid) { hit = v; break; }
+      }
+      if (!hit) continue;
+      last = hit;
+      const cur = Number(hit.currentTime || 0);
+      if (hit.paused === false) {
+        if (cur > 0 || (beforeTime >= 0 && cur - beforeTime > 0.5)) {
+          return { ok: true, note: 'playing' };
+        }
+        /* 已 paused=false 但 currentTime 还 0（HLS 起步慢）→ 继续等 */
+      }
+      if (beforeTime >= 0 && cur - beforeTime > 0.5) return { ok: true, note: 'time-advanced' };
+    }
+    return { ok: false, note: last ? ('stuck paused=' + last.paused + ' t=' + Number(last.currentTime || 0)) : 'video-not-found' };
   }
 
   /**
@@ -2717,6 +2871,11 @@ class LearnMachine {
     this._currentChapterIdValue = target.chapterId || '';
     this._videoSeenThisSection = false;
     this._waitTicks = 0;
+    /* ★ D-039：换节了，本节的多视频账本必须清零，否则上一节的 objectid 会
+       让新节的候选被误判成「已经尝试过/已经播过」。 */
+    this._attemptedVideoIds = new Set();
+    this._startedVideoIds = new Set();
+    this._unstartableVideoIds = new Map();
     /* ★ 2026-10-31 真机（FNOS 3.4）：点了 3.4，但 knowledge/cards 播放器
        还是 3.3 那一份（772.2s），引擎只看到「有视频 + 有 duration」就当成就绪，
        于是把 3.3 当 3.4 看，最后 3.4 永远不记账，还来回重进。

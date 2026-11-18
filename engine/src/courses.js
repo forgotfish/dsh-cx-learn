@@ -608,38 +608,43 @@ async function openCourseByClick(adapter, courseText, opts) {
   }
   await sleep(2000);
 
-  /* ★ 兜底：CDP 鼠标点击有时打不开（坐标落在文字 span 上、或被浮层挡住）。
-     若还没出现课程页，就在页面内对该链接派发一次真实 click()。
-     这仍是「点击」而非直接导航，不会触发 URL 直达风控。 */
+  /* ★★ 2026-11-18（D-042，主人指令）：**删掉 element.click() 兜底**。
+     规则：所有点击一律走模拟鼠标（CDP 真实输入事件），点不中就**快照 + 报错**，
+     绝不偷偷换成 JS 的 element.click()。
+
+     为什么必须删：实测 `hit.click()` 打开的是 <a target="_blank"> 的默认链路，
+     落地页与真实鼠标点击**不一样**（拿到的是没有有效 enc 的旧域页面），
+     于是「点成功」但进的是「温馨提示」错误页 —— 这类假成功比失败更难查。
+     旧实现见 git 历史 courses.js:617-643。 */
   const quick = await listTargets(cfg);
   const hasCoursePage = quick.some((t) => t.type === 'page' &&
-    /mooc2-ans\.chaoxing\.com\/mooc2-ans\/mycourse\/stu|mycourse\/studentstudy|mooc-ans\/visit/i.test(t.url || ''));
+    /mooc2-ans\.chaoxing\.com\/mooc2-ans\/mycourse\/stu/i.test(t.url || ''));
   if (!hasCoursePage) {
-    logger.log('PROBE', 'INFO', '鼠标点击未生效，改用链接 click() 兜底');
-    const clickJs = `(() => {
-      var want = ${JSON.stringify(String(courseText || ''))};
-      var cid = ${JSON.stringify(String(courseId || ''))};
-      var as = Array.prototype.slice.call(document.querySelectorAll('a[href]'));
-      var pool = as.filter(function (a) { return /courseid=\\d+/i.test(a.getAttribute('href') || ''); });
-      var hit = null;
-      if (cid) {
-        hit = pool.find(function (a) {
-          var m = /courseid=(\\d+)/i.exec(a.getAttribute('href') || '');
-          return m && m[1] === cid;
-        }) || null;
-      }
-      if (!hit && want) {
-        hit = pool.find(function (a) { return ((a.innerText || '').indexOf(want) >= 0); }) || null;
-      }
-      if (!hit) return 'not-found';
-      try { hit.click(); return 'clicked'; } catch (e) { return 'err:' + String(e.message || e).slice(0, 60); }
-    })()`;
+    logger.log('PROBE', 'WARN', '鼠标点击未打开课程页', {
+      hint: '按主人规则不再降级为 element.click()；下面留诊断快照',
+      clickPoint: { x: pt.x, y: pt.y, w: pt.w, h: pt.h },
+      hitText: (hit && hit.text) || '', hitHref: String((hit && hit.href) || '').slice(0, 120),
+      hasCoursePage, topIsHit: true,
+      pagesSeen: (quick || []).filter((t) => t.type === 'page').map((t) => String(t.url).slice(0, 90)).slice(0, 8),
+    });
+    /* 快照存证：把「点了哪里、页面上那一点是什么元素」记下来，便于事后对比 */
     try {
-      const r = await adapter.evalInFrame(top.frameId, clickJs);
-      logger.log('PROBE', 'INFO', '链接 click() 结果', { result: String(r).slice(0, 40) });
+      const snap = await adapter.evalInFrame(top.frameId, `(() => {
+        var cx = ${JSON.stringify(Number(pt.x || 0))}, cy = ${JSON.stringify(Number(pt.y || 0))};
+        var el = document.elementFromPoint(cx, cy);
+        return JSON.stringify({
+          at: new Date().toISOString(),
+          point: { x: cx, y: cy },
+          topEl: el ? { tag: el.tagName, cls: String(el.className || '').slice(0, 60), text: (el.innerText || '').replace(/\\s+/g,' ').trim().slice(0, 60) } : null,
+          scrollY: window.scrollY, viewport: { w: innerWidth, h: innerHeight },
+          url: location.href
+        });
+      })()`);
+      logger.log('PROBE', 'WARN', '鼠标点击失败快照', { snapshot: String(snap).slice(0, 400) });
     } catch (e) {
-      logger.log('PROBE', 'WARN', 'click() 兜底失败', { err: String((e && e.message) || e).slice(0, 80) });
+      logger.log('PROBE', 'WARN', '快照失败', { err: String((e && e.message) || e).slice(0, 80) });
     }
+    return { ok: false, reason: '鼠标点击未打开课程页（已按规则停止，不再用 JS click 兜底）' };
   }
 
   /* ★ 实测（2026-10-27）：点课程卡片会在**新标签页**打开课程，
@@ -657,15 +662,35 @@ async function openCourseByClick(adapter, courseText, opts) {
     /* ★ 实测：点课程卡片可能复用已有标签、也可能新开一个。
        所以不区分新旧，只要池子里存在课程页就附着过去；
        优先选「刚才没在的前台页」，否则取最后一个课程页。 */
+    /* ★★ 2026-11-18（D-041，真机实证）：**只认新点开的课程入口页**。
+       旧实现的正则同时匹配 `mycourse/studentstudy`，且 fresh 为空时 fallback 到
+       `coursePages[last]` —— 实测池子里残留着两个旧的 mooc1/studentstudy 标签
+       （chapterId=643076150 / 643076170），于是「进入课程」拿到了**旧标签页**：
+       那个 URL 没有有效 enc → 落到「温馨提示」错误页 → 只有 1 个 frame、
+       tocFound=false → 最终 UNRECOGNIZED_PAGE。
+
+       实证（真实鼠标点击 740,401 点课程卡片）新 target 是：
+         mooc2-ans.chaoxing.com/mooc2-ans/mycourse/stu?...&enc=<新生成>&t=<时间戳>
+       ⇒ 只认这个形态，且必须是**点击后新出现的**（不在 before 里）。
+         找不到就明确失败并留诊断，绝不 fallback 到残留页。 */
     const coursePages = pages.filter((t) =>
-      /mooc2-ans\.chaoxing\.com\/mooc2-ans\/mycourse\/stu|mycourse\/studentstudy/i.test(t.url || '')
+      /mooc2-ans\.chaoxing\.com\/mooc2-ans\/mycourse\/stu\b/i.test(t.url || '')
     );
     if (coursePages.length) {
       const fresh = coursePages.filter((t) => !before.has(t.id));
-      const target = fresh.length ? fresh[fresh.length - 1] : coursePages[coursePages.length - 1];
+      if (!fresh.length) {
+        /* 全是点击前就存在的页 —— 说明我们的点击没打开新的课程页。
+           宁可报错，也不许把残留旧页当成「进入成功」（D-041 的核心）。 */
+        logger.log('PROBE', 'WARN', '点击后只看到点击前已存在的课程页，判为未打开', {
+          coursePages: coursePages.map((t) => String(t.url).slice(0, 90)),
+          pagesSeen: lastSeen.slice(0, 300),
+        });
+        return { ok: false, reason: '点击后未出现新的课程页（只有点击前已存在的残留页）' };
+      }
+      const target = fresh[fresh.length - 1];
       await sleep(4000);
       logger.log('PROBE', 'INFO', '已进入课程页（模拟点击）', {
-        url: String(target.url).slice(0, 110), isNew: !before.has(target.id),
+        url: String(target.url).slice(0, 110), isNew: true,
       });
       try { await adapter.attachTarget(target.id); } catch (e) {
         logger.log('PROBE', 'WARN', 'attachTarget 失败', { err: String((e && e.message) || e).slice(0, 90) });

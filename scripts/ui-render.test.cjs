@@ -539,6 +539,29 @@ console.log('== 11. 选课圆点：未登录不绿、登录且有课程才绿 ==
   ok(cNoUrl === '#9ca3af', '★ 登录成功但课程地址为空 → 灰（实际 ' + cNoUrl + '）');
 }
 
+/* ---- 12. ★ D-040：答题圆点必须「AI 启用 + 章节测验非 skip」才绿 ---- */
+console.log('== 12. 答题圆点：chapterQuiz=skip 时不许绿（假绿灯）==');
+{
+  const dotOf = (page, tab) => {
+    let color = null;
+    walk(page, (el) => {
+      if (el.type === 'button' && el.props && el.props['data-cx-tab-id'] === tab) {
+        walk(el, (c) => { if (c.props && 'data-cx-tabdot' in c.props) color = c.props.style && c.props.style.background; });
+      }
+    });
+    return color;
+  };
+  /* 复现现场：aiEnabled=true 但 chapterQuiz='skip' → 必须灰 */
+  const cSkip = dotOf(loadPanel({ 0: stFull, 19: true, 24: 'skip' }), '答题');
+  ok(cSkip === '#9ca3af', '★ AI 开着但 chapterQuiz=skip → 灰（实际 ' + cSkip + '）');
+  const cOff = dotOf(loadPanel({ 0: stFull, 19: false, 24: 'save' }), '答题');
+  ok(cOff === '#9ca3af', '★ AI 关闭 → 灰（实际 ' + cOff + '）');
+  const cSave = dotOf(loadPanel({ 0: stFull, 19: true, 24: 'save' }), '答题');
+  ok(cSave === '#16a34a', '★ AI 开 + save → 绿（实际 ' + cSave + '）');
+  const cSub = dotOf(loadPanel({ 0: stFull, 19: true, 24: 'submit' }), '答题');
+  ok(cSub === '#16a34a', '★ AI 开 + submit → 绿（实际 ' + cSub + '）');
+}
+
 finish();
 
 function finish() {
