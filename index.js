@@ -158,8 +158,12 @@ let _askToken = ''
    _qaSession  : { sessionId, createdAt, workspacePath }；null = 尚未创建/已重置
    _qaLastSeq  : 上一次 wait 读到的最大 event.seq，下次 wait 用 afterSeq 续读 */
 let _qaSession = null
+/* 并发创建去重（D-036）：in-flight 的创建 promise，避免同时开出多个会话窗口 */
+let _qaCreating = null
 let _qaLastSeq = 0
 const QA_SESSION_FILE = join(STATE, 'ai-session.json')
+/* 答题会话复用 TTL（D-034）：TTL 内盲复用，不调 sc.state() 探活（那个调用会崩 host）。 */
+const QA_SESSION_TTL_MS = 30 * 60 * 1000
 /* ★ 2026-10-31：登录进程单独留个引用。
    原来 loginState() 用 `running()`（任何任务在跑）判断「是不是在等扫码」，
    于是看课跑到一半时 /login-state 仍返回 waiting，GUI 显示「等待扫码…」
@@ -524,6 +528,7 @@ function llmErrCode(e) {
 /** 重置会话：清内存状态 + 删落盘文件（失败忽略）。start() 每轮开跑成功时调用。 */
 export function resetQaSession() {
   _qaSession = null
+  _qaCreating = null
   _qaLastSeq = 0
   try { rmSync(QA_SESSION_FILE, { force: true }) } catch { /* 文件不存在/被占用都忽略 */ }
 }
@@ -550,27 +555,58 @@ export async function ensureQaSession(ctx, cfg) {
   if (!sc) {
     const e = new Error('sessionController 不可用'); e.code = 'SESSION_UNAVAILABLE'; throw e
   }
-  if (_qaSession) {
-    let alive = false
-    try { sc.state({ sessionId: _qaSession.sessionId }); alive = true } catch { alive = false }
-    if (alive) return _qaSession
+  /* ★★ 2026-11-18（D-034，实炸一次）：**绝不能用 sc.state() 探活**。
+     实测 DSH 0.2.2-rc.3：给它一个不存在/已失效的 sessionId 时，
+     StateController.readState 抛 `TypeError: Cannot read properties of undefined
+     (reading 'throwIfAborted')`；而 state() 返回的是 Promise，这个异常以
+     **unhandled rejection** 形式逃出插件 → `dsh: fatal load failure` →
+     整个 DSH 桌面端重启（16:14 真炸，用户界面被弹重启）。
+
+     为什么以前没炸：旧版 rc.1 大概不抛；而 askViaSession 内部会二次调用本函数，
+     真实答题时**每一题**都会走一次探活 → 第二题必崩。
+
+     改为「按 TTL 盲复用 + 出错重建」：
+       · 会话创建后 TTL 内直接复用，完全不碰 sc.state()
+       · 过期/失效由 prompt/wait 抛错暴露，askViaSession 里 reset 后重建一次 */
+  if (_qaSession && (Date.now() - Number(_qaSession.createdAt || 0)) < QA_SESSION_TTL_MS) {
+    return _qaSession
   }
-  const ai = (cfg && cfg.ai) || {}
-  const dir = ai.workspaceDir || join(STATE, 'ai-workspace')
-  try { mkdirSync(dir, { recursive: true }) } catch { /* ignore */ }
-  /* 建项目失败不阻断 —— 退化为不建项目，直接 create({cwd}) */
-  const wr = getOptionalService(ctx, 'workspaceRegistry')
-  if (wr && typeof wr.create === 'function') {
-    try { await wr.create(dir, 'CX 答题') } catch { /* ignore */ }
+  if (_qaSession) resetQaSession()   /* 过期就丢弃，下面重建 */
+  /* ★★ 2026-11-18（D-036，破坏测试发现）：**并发去重**。
+     两路同时进来时 _qaSession 都还是 null，会各自 create → 真的开出两个会话窗口。
+     用一个 in-flight promise 收敛成一次创建。 */
+  if (_qaCreating) return await _qaCreating
+  _qaCreating = (async () => {
+    const ai = (cfg && cfg.ai) || {}
+    const dir = ai.workspaceDir || join(STATE, 'ai-workspace')
+    try { mkdirSync(dir, { recursive: true }) } catch { /* ignore */ }
+    /* 建项目失败不阻断 —— 退化为不建项目，直接 create({cwd}) */
+    const wr = getOptionalService(ctx, 'workspaceRegistry')
+    if (wr && typeof wr.create === 'function') {
+      try { await wr.create(dir, 'CX 答题') } catch { /* ignore */ }
+    }
+    const r = await sc.create({ cwd: dir, agentPreset: undefined })
+    /* ★★ 2026-11-18（D-036，破坏测试发现）：create() 可能返回空对象/缺 sessionId。
+       以前不校验，会把 sessionId=undefined 缓存下来，后面 prompt 往一个不存在的
+       会话发请求（错误信息极难懂）。这里显式拒绝。 */
+    if (!r || !r.sessionId) {
+      const e = new Error('创建答题会话失败：sessionController.create() 未返回 sessionId')
+      e.code = 'SESSION_UNAVAILABLE'
+      throw e
+    }
+    _qaSession = { sessionId: r.sessionId, createdAt: Date.now(), workspacePath: dir }
+    /* ★ 2026-11-15 修 BUG：会话重建（旧的死了）后必须归零 _qaLastSeq，
+       否则 askViaSession 会用**旧会话**的 maxSeq 去 wait 新会话的 afterSeq，
+       新会话 seq 起点更低 → wait 空返回 → 误报 LLM_EMPTY、答案丢失。 */
+    _qaLastSeq = 0
+    try { writeJson(QA_SESSION_FILE, _qaSession) } catch { /* ignore */ }
+    return _qaSession
+  })()
+  try {
+    return await _qaCreating
+  } finally {
+    _qaCreating = null
   }
-  const r = await sc.create({ cwd: dir, agentPreset: undefined })
-  _qaSession = { sessionId: r.sessionId, createdAt: Date.now(), workspacePath: dir }
-  /* ★ 2026-11-15 修 BUG：会话重建（旧的死了）后必须归零 _qaLastSeq，
-     否则 askViaSession 会用**旧会话**的 maxSeq 去 wait 新会话的 afterSeq，
-     新会话 seq 起点更低 → wait 空返回 → 误报 LLM_EMPTY、答案丢失。 */
-  _qaLastSeq = 0
-  try { writeJson(QA_SESSION_FILE, _qaSession) } catch { /* ignore */ }
-  return _qaSession
 }
 
 /**
@@ -611,22 +647,45 @@ export async function askViaSession(ctx, cfg, { prompt, image, provider, model, 
   if (image) {
     content.push({ type: 'image', mediaType: 'image/png', data: String(image).replace(/^data:[^,]+,/, '') })
   }
-  await sc.prompt({
-    requestId: 'cx-' + Date.now().toString(16) + '-' + Math.random().toString(16).slice(2, 8),
-    sessionId: s.sessionId,
-    mode: 'queue',
-    content,
-  })
-  const w = await sc.wait({ sessionId: s.sessionId, timeoutMs, afterSeq: _qaLastSeq })
-  if (w && w.reason === 'timeout') {
-    const e = new Error('会话应答超时'); e.code = 'LLM_TIMEOUT'; throw e
+  /* ★★ 2026-11-18（D-035，实测 DSH 0.2.2-rc.3 源码）：
+     sessionController 的 prompt/wait/state 都是 `(request, signal)` 两个参数，
+     且第一行就是 `signal.throwIfAborted()`。**signal 必传**，不传就是
+     `Cannot read properties of undefined (reading 'throwIfAborted')`
+     （实测：会话能创建成功，但一 prompt 就 503）。
+     这里用 AbortController 提供 signal，并把同一个 timeoutMs 也作为超时兜底。 */
+  const ac = new AbortController()
+  const timer = setTimeout(() => { try { ac.abort() } catch { /* ignore */ } }, Math.max(1000, Number(timeoutMs) || 120000))
+  try {
+    await sc.prompt({
+      requestId: 'cx-' + Date.now().toString(16) + '-' + Math.random().toString(16).slice(2, 8),
+      sessionId: s.sessionId,
+      mode: 'queue',
+      content,
+    }, ac.signal)
+    const w = await sc.wait({ sessionId: s.sessionId, timeoutMs, afterSeq: _qaLastSeq }, ac.signal)
+    if (w && w.reason === 'timeout') {
+      const e = new Error('会话应答超时'); e.code = 'LLM_TIMEOUT'; throw e
+    }
+    const { text, maxSeq } = extractAssistantText((w && w.output && w.output.records) || [])
+    if (maxSeq) _qaLastSeq = maxSeq
+    if (!text) {
+      const e = new Error('会话无文本回复'); e.code = 'LLM_EMPTY'; throw e
+    }
+    return { text, model: model || '', sessionId: s.sessionId }
+  } catch (e) {
+    /* 我们自己 abort 导致的取消，统一归成超时，避免引擎把它当未知错误 */
+    const aborted = (e && (e.name === 'AbortError' || e.code === 'ABORT_ERR'))
+    if (aborted && !(e && e.code === 'LLM_TIMEOUT')) {
+      const t = new Error('会话应答超时（已 abort）'); t.code = 'LLM_TIMEOUT'; throw t
+    }
+    /* LLM_TIMEOUT / LLM_EMPTY 是「模型没答」，会话本身可能还活着 —— 不重置；
+       其余（prompt/wait 抛错，通常是会话被关掉/失效）→ 重置，下次重建。 */
+    const code = (e && e.code) || ''
+    if (code !== 'LLM_TIMEOUT' && code !== 'LLM_EMPTY') resetQaSession()
+    throw e
+  } finally {
+    clearTimeout(timer)
   }
-  const { text, maxSeq } = extractAssistantText((w && w.output && w.output.records) || [])
-  if (maxSeq) _qaLastSeq = maxSeq
-  if (!text) {
-    const e = new Error('会话无文本回复'); e.code = 'LLM_EMPTY'; throw e
-  }
-  return { text, model: model || '', sessionId: s.sessionId }
 }
 
 /**
@@ -1984,6 +2043,68 @@ export function apply(ctx, config) {
             return sendJson(res, 200, { ok: true, text: r.text, model, ms: Date.now() - t0, visionUsed: r.visionUsed === true, channel: 'direct' })
           } catch (e) {
             return sendJson(res, 503, { ok: false, code: llmErrCode(e), error: String((e && e.message) || e).slice(0, 300) })
+          }
+        }
+        /* ★ 2026-11-18（D-033）：AI 会话通道自检 —— 本机验证「是否真的创建出一个
+           新的 DSH 会话窗口」。走的就是引擎那条 askViaSession 真路径，不做任何模拟。
+
+           为什么要这条路由：/llm-ask 需要本轮 spawn 的随机 token（只在插件内存和子进程
+           env 里），外部根本拿不到，所以没法从命令行验证会话通道。而 /ask 走的是
+           doStream（直连 llm 服务），不经过会话窗口。
+
+           安全闸门（两道）：
+             1. 仅回环地址（127.0.0.1 / ::1）；未知来源（测试桩）不拦。
+             2. 必须 ai.enabled === true —— AI 没开就不许触发，避免白烧额度。 */
+        if (path === '/ai-selftest' && req.method === 'POST') {
+          const ra = String((req.socket && req.socket.remoteAddress) || '')
+          const loopback = !ra || ra === '127.0.0.1' || ra === '::1' || ra === '::ffff:127.0.0.1'
+          if (!loopback) return sendJson(res, 403, { ok: false, error: '仅允许回环地址调用' })
+          const aiCfg = (getCfg().ai) || {}
+          if (aiCfg.enabled !== true) {
+            return sendJson(res, 403, { ok: false, code: 'AI_ANSWER_DISABLED', error: '需先启用 AI（ai.enabled=true）' })
+          }
+          const prompt = String(body?.prompt || '请只回复两个字：收到')
+          const steps = []
+          const t0 = Date.now()
+          try {
+            const scProbe = getOptionalService(_ctxRef, 'sessionController')
+            const wrProbe = getOptionalService(_ctxRef, 'workspaceRegistry')
+            steps.push({
+              step: 'services',
+              sessionController: !!scProbe,
+              workspaceRegistry: !!wrProbe,
+              ms: Date.now() - t0,
+            })
+            if (!scProbe) {
+              return sendJson(res, 503, { ok: false, code: 'SESSION_UNAVAILABLE', error: 'sessionController 不可用', steps })
+            }
+            const s = await ensureQaSession(_ctxRef, getCfg())
+            steps.push({ step: 'session', sessionId: s.sessionId, workspacePath: s.workspacePath, ms: Date.now() - t0 })
+            const r = await askViaSession(_ctxRef, getCfg(), {
+              prompt,
+              provider: String(aiCfg.provider || '').trim(),
+              model: String(aiCfg.model || '').trim(),
+              timeoutMs: numOr(aiCfg.timeoutMs, 120000),
+            })
+            steps.push({ step: 'reply', chars: String(r.text || '').length, ms: Date.now() - t0 })
+            return sendJson(res, 200, {
+              ok: true,
+              channel: 'session',
+              sessionId: r.sessionId,
+              text: String(r.text || '').slice(0, 400),
+              prompt,
+              totalMs: Date.now() - t0,
+              steps,
+            })
+          } catch (e) {
+            steps.push({ step: 'error', code: (e && e.code) || 'LLM_ERROR', ms: Date.now() - t0 })
+            return sendJson(res, 503, {
+              ok: false,
+              code: llmErrCode(e),
+              error: String((e && e.message) || e).slice(0, 300),
+              totalMs: Date.now() - t0,
+              steps,
+            })
           }
         }
         if (path === '/ask' && req.method === 'POST') {

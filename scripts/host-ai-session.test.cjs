@@ -163,6 +163,76 @@ const rec = (type, seq, content) => ({ event: { type, seq, data: { message: { co
     ok(creates === 2, '★ reset 后再次 create，计数 +1（实际 ' + creates + '）');
   }
 
+  /* ---- 9. ★ D-034：绝不许调 sc.state()（DSH 0.2.2-rc.3 下会崩 host） ---- */
+  console.log('== 10. D-034 会话探活不得调用 sc.state()（它会让 DSH host 崩）==');
+  {
+    resetQaSession();
+    let stateCalls = 0;
+    let creates = 0;
+    let promptCalls = 0;
+    const signals = [];
+    const ctx = {
+      sessionController: {
+        /* 真实 DSH 0.2.2-rc.3 里，state() 对不存在的 sessionId 会抛
+           TypeError（readState 读 undefined.throwIfAborted），且以 unhandled
+           rejection 逃逸 → host fatal。这里让它「一被调用就计数」，只要计数>0 就说明
+           代码又去探活了。 */
+        state: () => { stateCalls++; throw new TypeError("Cannot read properties of undefined (reading 'throwIfAborted')"); },
+        create: async () => { creates++; return { sessionId: 'sess-safe' }; },
+        /* ★ D-035：真实 API 是 prompt(request, signal)，第一行 signal.throwIfAborted()。
+           这里把第二个参数记下来并断言它确实传了。 */
+        prompt: async (req, signal) => {
+          promptCalls++;
+          signals.push(signal);
+          if (!signal || typeof signal.throwIfAborted !== 'function') {
+            throw new TypeError("Cannot read properties of undefined (reading 'throwIfAborted')");
+          }
+          signal.throwIfAborted();
+        },
+        wait: async (req, signal) => {
+          signals.push(signal);
+          if (!signal || typeof signal.throwIfAborted !== 'function') {
+            throw new TypeError("Cannot read properties of undefined (reading 'throwIfAborted')");
+          }
+          return { reason: 'done', output: { records: [rec('assistant/message', 1, [{ type: 'text', text: '好' }])] } };
+        },
+      },
+    };
+    const r1 = await askViaSession(ctx, { ai: {} }, { prompt: 'q1', timeoutMs: 1000 });
+    ok(r1.text === '好', '第一次正常拿到文本（实际 "' + r1.text + '"）');
+    const r2 = await askViaSession(ctx, { ai: {} }, { prompt: 'q2', timeoutMs: 1000 });
+    ok(r2.text === '好', '第二次正常拿到文本（实际 "' + r2.text + '"）');
+    ok(stateCalls === 0, '★ 全程一次都没调 sc.state()（实际 ' + stateCalls + ' 次）');
+    ok(creates === 1, '★ 两次提问只 create 一次（TTL 内复用，实际 ' + creates + '）');
+    ok(promptCalls === 2, '两次 prompt 都发出（实际 ' + promptCalls + '）');
+    ok(signals.length === 4, '★ prompt+wait 共 4 次调用都传了第二参数 signal（实际 ' + signals.length + '）');
+    ok(signals.every((s) => s && typeof s.throwIfAborted === 'function'),
+      '★ 每个 signal 都是可用的 AbortSignal（有 throwIfAborted）');
+  }
+
+  /* ---- 10. ★ D-034：prompt 抛错 → 重置会话，下一题重建 ---- */
+  console.log('== 11. D-034 prompt 失败后重建会话 ==');
+  {
+    resetQaSession();
+    let creates = 0;
+    let fail = true;
+    const ctx = {
+      sessionController: {
+        state: () => { throw new Error('不该被调用'); },
+        create: async () => { creates++; return { sessionId: 'sess-' + creates }; },
+        prompt: async () => { if (fail) throw new Error('会话已关闭'); },
+        wait: async () => ({ reason: 'done', output: { records: [rec('assistant/message', 1, [{ type: 'text', text: '重建后' }])] } }),
+      },
+    };
+    let code = '';
+    try { await askViaSession(ctx, { ai: {} }, { prompt: 'x', timeoutMs: 100 }); } catch (e) { code = (e && e.code) || (e && e.message); }
+    ok(!!code, '★ prompt 抛错会向上抛（code/message: ' + code + '）');
+    fail = false;
+    const r = await askViaSession(ctx, { ai: {} }, { prompt: 'y', timeoutMs: 1000 });
+    ok(r.text === '重建后', '★ 失败后下一次会重建会话并成功（实际 "' + r.text + '"）');
+    ok(creates === 2, '★ create 了两次（失败后重置，实际 ' + creates + '）');
+  }
+
   try { fs.rmSync(TMP, { recursive: true, force: true }); } catch (_) {}
 
   console.log('');

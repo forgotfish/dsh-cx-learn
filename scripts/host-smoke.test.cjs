@@ -319,6 +319,29 @@ async function main() {
   }
 
 
+  /* ---- 3h. ★ D-033：AI 会话通道自检端点 ---- */
+  console.log('== 3h. D-033 /ai-selftest 闸门与真路径 ==');
+  {
+    /* ① AI 未启用 → 必须 403，不许触发任何模型调用 */
+    const off = await callRoute(H, 'POST', '/api/cx-learn/ai-selftest', {});
+    ok(off.code === 403, '★ ai.enabled=false → 403（实际 ' + off.code + '）');
+    ok(off.json && off.json.code === 'AI_ANSWER_DISABLED', '  ↳ 返回 AI_ANSWER_DISABLED');
+
+    /* ② 启用 AI 后，本假宿主没有 sessionController → 503 + steps 报出缺哪个服务
+          （证明它真的走了 ensureQaSession 真路径，不是空壳） */
+    await callRoute(H, 'POST', '/api/cx-learn/config', { ai: { enabled: true } });
+    const on = await callRoute(H, 'POST', '/api/cx-learn/ai-selftest', { prompt: 'ping' });
+    ok(on.code === 503, '★ 缺 sessionController → 503（实际 ' + on.code + '）');
+    ok(on.json && on.json.code === 'SESSION_UNAVAILABLE', '  ↳ code=SESSION_UNAVAILABLE（实际 ' + (on.json && on.json.code) + '）');
+    ok(on.json && Array.isArray(on.json.steps) && on.json.steps.length >= 1, '  ↳ 带 steps 便于排障');
+    ok(on.json && on.json.steps && on.json.steps[0] && on.json.steps[0].sessionController === false,
+      '  ↳ steps[0].sessionController=false（确认探到服务缺失）');
+
+    /* ③ 复原 */
+    await callRoute(H, 'POST', '/api/cx-learn/config', { ai: { enabled: false } });
+  }
+
+
   const cfg = await callRoute(H, 'GET', '/api/cx-learn/config');
   ok(cfg.code === 200 && cfg.json && cfg.json.config, '/config GET 返回 config');
   ok(cfg.json.config.courseUrl !== undefined, 'config 有 courseUrl');

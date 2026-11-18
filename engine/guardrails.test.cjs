@@ -261,8 +261,10 @@ function state(over) {
     }
   }
 
-  /* 【24b】2026-11-15 主人指令：默认 = 作答后只点「保存」，绝不点「提交」 */
+  /* 【24b】2026-11-15 主人指令：默认 = 作答后只点「保存」，绝不点「提交」
+     ★ D-038：必须给一个 AI 通道，否则「没配 AI = 直接不答」，测不到保存逻辑。 */
   {
+    process.env.CX_LLM_ASK_URL = 'http://127.0.0.1:1/x';
     const a = fakeAdapter();
     const m = new E.LearnMachine(a, cfg);   // 默认配置：answerChapterQuiz=true, submitMode='save'
     m.gatherState = async () => state({});
@@ -286,8 +288,9 @@ function state(over) {
     ok(advanced === 1, '只推进一次（advanced=' + advanced + '）');
   }
 
-  /* 【24c】submitMode='none' → 只填选项，不点任何按钮 */
+  /* 【24c】submitMode='none' → 只填选项，不点任何按钮（★ D-038：需要 AI 通道） */
   {
+    process.env.CX_LLM_ASK_URL = 'http://127.0.0.1:1/x';
     const a = fakeAdapter();
     const cfgNone = E.mergeConfig(cfg, { safety: { chapterQuizSubmitMode: 'none' } });
     const m = new E.LearnMachine(a, cfgNone);
@@ -307,8 +310,9 @@ function state(over) {
     ok(r && r.outcome === 'QUIZ_FILLED_ONLY', 'outcome=QUIZ_FILLED_ONLY（实际 ' + (r && r.outcome) + '）');
   }
 
-  /* 【24d】submitMode='submit' → 才允许真交卷（必须显式开启） */
+  /* 【24d】submitMode='submit' → 才允许真交卷（必须显式开启；★ D-038：需要 AI 通道） */
   {
+    process.env.CX_LLM_ASK_URL = 'http://127.0.0.1:1/x';
     const a = fakeAdapter();
     const cfgSub = E.mergeConfig(cfg, { safety: { chapterQuizSubmitMode: 'submit' } });
     const m = new E.LearnMachine(a, cfgSub);

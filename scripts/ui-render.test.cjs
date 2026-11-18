@@ -294,6 +294,9 @@ const noUiNeeded = new Map([
   ['/health', '监测用'], ['/status', 'UI 已用'], ['/config', 'UI 已用'], ['/log', 'UI 已用'],
   ['/questions', 'UI 已用'], ['/ask', '预留接口，不给 UI'], ['/browsers', '并进 /status'],
   ['/start', 'UI 走 /start-precheck'], ['/check-login', 'UI 走 /start-precheck'],
+  /* D-033：/ai-selftest 是本机排障用的自检端点（仅回环 + 需 ai.enabled），
+     不是给设置页用的，故意不给 UI 入口。 */
+  ['/ai-selftest', '本机排障自检，不给 UI'],
   /* D-019：/llm-ask 是**引擎专用**内部端点，不是给设置页用的。
      调用方是子进程引擎（读 CX_LLM_ASK_URL 发起），带本轮 spawn 的 x-cx-token 鉴权；
      前端永远不该调它。给它配 UI 入口反而是安全倒退。 */

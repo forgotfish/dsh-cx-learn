@@ -1399,7 +1399,19 @@ class LearnMachine {
          非作业页（页面里的泛化弹层）**没有「保存」可点**，只能沿用旧语义：
          CX_QUIZ_MODE=ai 时才作答并提交，否则一律忽略（不点任何东西）。 */
       const legacyAi = String(process.env.CX_QUIZ_MODE || '') === 'ai';
-      const quizMode = isWorkPage ? this._chapterQuizMode() : (legacyAi ? 'submit' : 'skip');
+      let quizMode = isWorkPage ? this._chapterQuizMode() : (legacyAi ? 'submit' : 'skip');
+      /* ★★★ 2026-11-18 主人指令（D-038）：**没有 AI 通道 = 直接不答**。
+         主人原话：「没配 AI 通道时，就是 ai 按钮是关的，直接不答，同理 ai 失效时
+         就是 == 没开 ai」。所以「没配 AI」与「AI 挂了」走同一条路：不点任何选项，
+         按 skip 语义记录题目并继续下一节，把题留给人工。
+         （以前没配 AI 会按首个选项填草稿 —— 那也是猜，记分的题上等于扣分。） */
+      const aiAvail = !!(process.env.CX_LLM_ASK_URL || process.env.CX_LLM_MODEL);
+      if (isWorkPage && quizMode !== 'skip' && !aiAvail) {
+        logger.warn('QUIZ', '没有 AI 通道，章节测验直接不答（按 skip 处理，留空给人工）', {
+          quizMode, note: '启用 AI（ai.enabled=true）后才会自动作答',
+        });
+        quizMode = 'skip';
+      }
       if (quizMode === 'skip' || quizMode === 'manual') {
         const eventIds = this.emitDetectedQuestions(q, {
           kind: q.kind || 'popup_quiz',
@@ -1521,11 +1533,17 @@ class LearnMachine {
       const targets = isWorkPage ? blocks : [{ i: 0, question: q.question, options: q.options, kind: 'single' }];
 
       /* —— 逐题作答 —— */
+      /* ★★★ 2026-11-18 主人指令（D-037）：**记分的题绝不许猜**。
+         以前 AI 失败会「回退首选项」盲点第一个 —— 这在章节测验/作业里会实打实
+         扣分。新规则：拿不到 AI 答案就**不点任何选项、留空**，把题留给人工。
+         （视频随堂题不受影响：它不记分，且不答会卡住播放，仍按 A→B→C 盲试，
+           见上面 1308 附近的独立路径。） */
       let answered = 0;
+      let skippedNoAi = 0;
       for (const blk of targets) {
         await humanize.quizThink(); // 2–5s 思考延迟，不秒选
-        let pickIdx = 0;
-        let pickBy = 'first';
+        let pickIdx = -1;          /* -1 = 还没有可信答案，不许点 */
+        let pickBy = '';
         let imgB64 = '';
 
         /* 批量答案优先。探针里 blocks 的 i 就是数组下标（`i: blocks.length`），
@@ -1555,8 +1573,27 @@ class LearnMachine {
             if (ai >= 0) { pickIdx = ai; pickBy = imgB64 ? 'ai-vision' : 'ai'; }
             logger.info('QUIZ', 'AI 作答结果', { block: blk.i, idx: pickIdx, by: pickBy, model: process.env.CX_LLM_MODEL, hasImage: !!imgB64 });
           } catch (e) {
-            logger.warn('QUIZ', 'AI 答题失败，回退首选项', { block: blk.i, err: String((e && e.message) || e) });
+            /* ★ D-037：不再「回退首选项」。拿不到答案就留空，下面统一跳过。 */
+            logger.warn('QUIZ', 'AI 答题失败，本题留空不猜（避免扣分）', { block: blk.i, err: String((e && e.message) || e) });
           }
+        }
+
+        /* ★ D-037/D-038：没有可信答案 → **一个选项都不点**，留空给人工。
+           · 作业页（isWorkPage：章节测验/作业，**记分**）→ 严格留空，绝不猜。
+           · 非作业页的泛化弹层（不记分，且只在 CX_QUIZ_MODE=ai 时才走到这里）
+             → 保持老语义（首个选项），否则弹层永远关不掉、流程卡死。 */
+        if (pickIdx < 0) {
+          if (isWorkPage) {
+            skippedNoAi += 1;
+            this.counters.quizzesSkippedAi = (this.counters.quizzesSkippedAi || 0) + 1;
+            logger.warn('QUIZ', '本题无 AI 答案，按主人要求留空（不点任何选项）', {
+              block: blk.i, hasBatch, options: (blk.options || []).map((o) => o.letter).join(''),
+            });
+            continue;
+          }
+          pickIdx = 0;
+          pickBy = 'first';
+          logger.warn('QUIZ', '弹层题无 AI 答案，按首个选项关闭弹层（不记分，旧语义）', { block: blk.i });
         }
 
         const pick = isWorkPage
@@ -1569,6 +1606,27 @@ class LearnMachine {
         }
         answered += 1;
         logger.info('QUIZ', '已选择选项', { block: blk.i, by: pickBy, note: pick.note, options: (blk.options || []).map((o) => o.letter) });
+      }
+
+      /* ★ D-037：有题没答成时，绝不能「空着交卷」——那同样扣分。 */
+      if (quizMode === 'submit' && skippedNoAi > 0) {
+        logger.warn('QUIZ', '有题目没有可信答案，放弃本次交卷（宁可留空给人工）', {
+          answered, skipped: skippedNoAi, blocks: blocks.length,
+          note: '要强制交卷请把 chapterQuiz 设为 save（只存草稿）或人工处理',
+        });
+        this._quizFilledFor = this.currentChapterTitle(st);
+        this.failures = 0;
+        return { progress: true, outcome: 'QUIZ_SUBMIT_SKIPPED_INCOMPLETE' };
+      }
+      /* 一题都没答成 → 连「保存」也不点，避免无意义的页面操作，直接切下一节
+         （与 skip 策略一致：不碰页面，把题留给人工） */
+      if (answered === 0 && skippedNoAi > 0) {
+        logger.warn('QUIZ', '本节测验无任何可信答案，整体留空并继续下一节（未点任何按钮）', {
+          blocks: blocks.length, skipped: skippedNoAi,
+        });
+        this._videoSeenThisSection = true;
+        this.failures = 0;
+        return this.advanceSection(st);
       }
 
       /* —— 收尾：保存草稿 / 交卷 / 只填不点 —— */

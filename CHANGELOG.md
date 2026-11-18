@@ -2,6 +2,37 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.2.2] — 2026-11-18
+
+> 承接 v0.2.1 之后的一轮真机排障：AI 会话通道（v2）在 DSH 0.2.2-rc.3 上连炸三处，
+> 并确定「记分的题绝不猜」这条硬规则。
+
+### 修复
+
+- **AI 会话通道三处崩溃/失败**（D-034/035/036，实测本机 DSH 0.2.2-rc.3）：
+  - `sc.state()` 探活会把 DSH host 打崩（异常以 unhandled rejection 逃逸 →
+    `fatal load failure` → 桌面端重启）→ 改「TTL 30 分钟盲复用 + 出错重建」；
+  - `prompt/wait` 未传 `AbortSignal`（该版本 API 签名是 `(request, signal)`，
+    首行 `signal.throwIfAborted()`）→ 503 `LLM_ERROR` → 改传 `AbortController.signal`，
+    abort 归一成 `LLM_TIMEOUT`；
+  - `create()` 未校验 `sessionId`（会把 `undefined` 缓存下来）；并发两路会**开出两个会话窗口**
+    → 补校验 + in-flight promise 去重。
+- **记分的题不再盲猜**（D-037/D-038，主人指令）：章节测验/作业在三种情况下
+  （没开 AI / AI 挂了 / 超时或空回复）**一个选项都不点**，留空给人工；
+  只要有一题没答成，`submit` 档也**不交卷**（空着交卷同样扣分）。
+  以前会「回退首选项」盲点第一个 —— 记分题上等于直接扣分。
+  唯一例外：视频随堂题（不记分、不答会卡住播放）仍按 A→B→C 盲试。
+
+### 新增
+
+- `POST /api/cx-learn/ai-selftest`（D-033）：本机验证「AI 会话窗口通道」是否真的能创建会话并拿到回复。
+  仅回环地址调用，且需 `ai.enabled=true`；返回 `steps[]` 逐步耗时便于排障。
+- 破坏性测试：`scripts/ai-session-chaos.test.cjs`（15 项，把 sessionController 当不可信第三方砸）、
+  `engine/ai-transport.test.cjs`（13 项，起真 HTTP server 验 503/非 JSON/连接拒绝等降级）、
+  `engine/quiz-no-guess.test.cjs`（14 项，验「AI 不可用时零点击」）。
+
+---
+
 ## [0.2.1] — 2026-11-18
 
 ### 新增
