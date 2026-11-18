@@ -2,9 +2,48 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [Unreleased]
+## [0.2.1] — 2026-11-18
 
 ### 新增
+
+- **直播回放任务点**（D-026/D-027）：识别 `modules/live` 任务点，在新标签页驱动超星播放器；
+  完成度只认服务端 `percentValue ≥ 90%`（播放器自己 30s 一次的心跳按墙钟累计），
+  不看本地 `currentTime`（headless 下 HLS/MSE 不解码，本地进度恒 0）。
+  播放器标签页**复用同一个 target**，轮询期间不再来回切 target（D-027 实测：会堆出 8+ 个
+  播放器、单渲染进程 793MB、`Runtime.evaluate` 集体超时）。
+- **AI 作答 v2**（D-019/D-021）：模型跑在可见的 DSH 会话窗口里（`channel=session`），
+  engine 拼批量 JSON → 宿主 `/llm-ask` → `sessionController.create/prompt/wait`；
+  `batchSize` 默认 10，每次运行新建会话。**视频随堂题永不使用 AI**（`AI_SCOPE.videoQuiz=false`）。
+- **设置页 5 个标签**（D-022）：内核 → 登录 → 选课 → 答题 → 开始，胶囊标签带状态圆点。
+- **章节测验四档**（D-020）：`skip` / `none` / `save`（默认，只存草稿）/ `submit`。
+- **多视频任务点连播**：`pendingSectionVideos()` 给出本节未完成的 video/audio，
+  `multiVideo && pending>0` 时禁止切节，改为继续播下一个。
+- **破坏性测试工具** `scripts/chaos-api.mjs`（31 项，自动备份/还原状态目录）。
+
+### 变更
+
+- **章节测验语义放开**（D-020）：从「只识别、连标签都不点」改为「可作答，默认只保存草稿、
+  绝不交卷」。交卷必须显式把 `chapterQuiz` 设为 `submit`。
+- `quizMode=skip` 被 `chapterQuiz` 四档取代；`skipChapterQuiz` 旧字段仅作兼容。
+- 设置页「内核」圆点语义修正（D-025）：文件缺失才红，内核在跑才绿，只是没启动为灰
+  （以前 `alive:false` 一律报红）。
+
+### 修复
+
+- **「开始」标签在登录阶段就变绿**（D-024 根治）：`spawnEngine` 原来对所有 spawn
+  （登录/预检/读课程/自测）都登记 `child`，于是登录被算成「看课任务在跑」。
+  改为只有 `isWatchRun(args)` 才登记，并给 `login()` / `start()` / `stop()` 补对等守卫。
+- **「选课」圆点在未登录时也绿**（D-029）：原来只看配置里有没有课程 URL。
+- `state.json` 内容为 `null` 时 `/status` 直接 500（D-030）：`readJson` 只接受对象。
+- **残留 pid 误判「正在运行」**（D-031）：pid 活着不算数，还要求 `browser.json.ownerPid`
+  与之一致且心跳在 3 分钟内；否则按未在跑处理并写日志。
+- 会话闲置超时结束后谎报「上次扫码流程被中断」（D-032）：改为按 `session.json.reason` 给真实文案。
+- 切节后 `knowledge/cards` iframe 未就绪被误判 `UNRECOGNIZED_PAGE`（D-028）：
+  `WAIT_LOAD` 中途主动重载当前节；「有意的等待」不再计入无进展。
+- 真机首跑三处入口失败（D-027）：页签文案是「目录」不是「章节」；目录可能是旧版内联
+  `.posCatalog_select`（无 `mooc2-ans` iframe）；URL 已带 `chapterId` 时跳过点小节。
+
+### 新增（历史未发布项）
 
 - 选择器注册表收口（D-017）：探针里不再有裸选择器，新增 `scripts/check-selectors.cjs` 静态闸门。
 - `POST /api/cx-learn/ask`：AI 答题的**占位接口**（D-015）。契约已固定，

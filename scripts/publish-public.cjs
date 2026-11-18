@@ -31,7 +31,12 @@ const msgArg = args.find((a) => a.startsWith('--message='));
 const MESSAGE = msgArg ? msgArg.slice('--message='.length) : 'chore: sync public release';
 
 /* 直接覆盖到公开仓的文件 */
-const COPY_FILES = ['index.js', 'client.js', 'cordis.patch.yml'];
+/* 直接覆盖到公开仓的文件
+   ★ 2026-11-18：README.md / CHANGELOG.md 也纳入白名单。
+   以前它们不在名单里，公开仓的 README 长期没跟着代码走，甚至出现了「章节测验绝不触碰」
+   这种与代码相反的**错误安全声明**（D-020 已放开为「可作答、默认只存草稿」）。
+   注意：assets/ 下的截图仍在公开仓维护，这里不动。 */
+const COPY_FILES = ['index.js', 'client.js', 'cordis.patch.yml', 'README.md', 'CHANGELOG.md'];
 /* 整目录覆盖（公开仓里这些目录会被清空后重建） */
 const COPY_DIRS = ['engine', 'scripts'];
 /* 不进入公开仓的路径 */
