@@ -2,6 +2,77 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.2.4] — 2026-11-21
+
+### 修复
+
+- **多视频节第 2 个视频「点了不起播」的真因（D-055，真机端到端复跑发现）**：
+  D-054 的反查补齐已能定位第 2 个视频的子 iframe，但真机仍 `video_task_unreachable`。三层原因：
+  - **跨帧滚动**：第 2 个视频在 `cards → video` 双层 iframe 且位于视口下方，`el.scrollIntoView()`
+    只滚自己那层、滚不动父 frame → 命中测试失败。新增 `scrollChainIntoView`：沿 frame 链
+    把每层 iframe 在父 frame 里滚进可视区后再取坐标。
+  - **点错元素**：按 objectid 命中的是 `<video>`，但未起播时最上层是 `.vjs-big-play-button`
+    → 改用 video 做命中测试必失败。改为：目标未起播且本播放器有可见大播放按钮时，点那个按钮。
+  - **偷偷降级**：`clickFound` 在 `hit-test-blocked` 时降级 `el.click()`（违反红线且对 `<video>`
+    无效）→ 现在对 `videoToggle` 一律不降级，点不中即失败透出。
+  - 探针 `version` 7 → 8（强制页面重装新探针）。
+  - 真机 A/B 验证：修复前 `paused=true t=0` 失败；修复后真鼠标点 → `dur=2764, rs=4, paused=false` 起播。
+    附带：第 2 个视频真实时长 2764s（≈46 分钟）。
+
+- **课程入口点击彻底打通（D-045~D-052，真机实测驱动，共 8 次提交）**：
+  入口从「点卡片没反应 / 反复失败」修到「第 2 次点中」，最终定位到确定性根因：
+  - **D-045 布局漂移**：图片卡片懒加载导致 `boundingRect` 在加载中漂移。改为点前等布局稳定
+    （连续两次坐标一致）+ 点后最多 3 次真实鼠标重试。
+  - **D-046 点错 `<a>`**：同一 courseid 有多个 `<a>`（侧栏缩略图 x=180 vs 主卡片 x=740），
+    旧实现只取第一个。改为收集全部候选 + `elementFromPoint` 命中测试 + 优先面积大的。
+  - **D-047 懒加载不可点**：元素在 DOM ≠ 可点（骨架屏）。改为定位前轮询等「至少一个候选可点」，最多 25s。
+  - **D-048 滚动异步**：`scrollIntoView` 后立刻取 rect 拿到视口外坐标（y=1171 vs 视口 803）。
+    改为滚动后等 450ms + 校验 `inViewport`。
+  - **D-049 target 未激活 / 同标签跳转未识别**：新增 `bringToFront()`；同标签跳转必须比较
+    点击前后 URL 差异（只看「像不像课程页」会误判，`regression-chaos` 抓到）。
+  - **D-050 attach 后 target hidden**：`visibilityState=hidden` 会丢合成鼠标事件 →
+    `Page.bringToFront` + `Emulation.setFocusEmulationEnabled` + 可见性日志。
+  - **D-051 页面内点击探针 `__cxClickProbe`（长期保留）**：记录 mousedown/up/click 次数、
+    实际 `clientX/Y`、命中元素、是否在 `<a>` 内、`visualViewport`/scroll/zoom。
+    第一次把问题从「点了没反应」定位到「坐标错位」。配套自适应校正（D-052 后降为兜底）。
+  - **D-052 真根因：双重取中心**：`locateCourseLink` 返回中心点，`cdp.js` 的 `click()` 内部
+    又加一次 `w/2,h/2` → 中心被加两次，实际点 = 元素**右下角**（偏移恒为 `(w/2,h/2)`，
+    与机器/分辨率无关）。修：`locateCourseLink` 额外返回 `left/top`，点击传左上角。
+- **登录成功后反被判 stale（D-053）**：`spawnEngine` 的 exit 处理器对所有进程都墓碑化
+  `browser.json`，而登录进程是短命进程、退出即 pid 死 → 每次登录成功都自毁。
+  改为只有看课任务（`isWatchRun`）退出才墓碑化，登录/预检/自测一律不动 `browser.json`。
+  ⚠️ `index.js` 属后端，需重启 DSH 生效。
+- **多视频节第 2 个视频起播失败（D-054）**：真机 dump 证实每个视频在独立
+  `ananas/modules/video` 子 iframe 里，`cards` frame 自身 `querySelectorAll('video')=0`，
+  常规探针汇总得到空 `videos` → 挑不出候选。修：`_enrichVideosFromFrames` 按 pending 的
+  objectid 逐个 video 子 iframe 读 `currentSrc` 抽 32-hex 比对补齐；进度基线与起播验证
+  优先在该候选自己的 frame 内进行，读不到再回退全局汇总；验证窗口 4000→6000ms。
+- **多视频节第 2 个视频「点了不起播」的真因（D-055）**：D-054 补齐后仍失败，三层原因：
+  ① 第 2 个视频在 `cards→video` 双层 iframe 且位于视口下方，`el.scrollIntoView` 只滚自己那层、
+  滚不动父 frame → 命中失败（新增 `scrollChainIntoView` 沿 frame 链滚进视口）；
+  ② 按 objectid 命中 `<video>` 但未起播时最上层是 `.vjs-big-play-button` → 改点该按钮；
+  ③ `clickFound` 在命中失败时降级 `el.click()`（违反红线且对 video 无效）→ videoToggle 不再降级。
+  探针 version 7→8。真机 A/B：修复后真鼠标点 → `dur=2764 rs=4 paused=false` 起播。
+- **多视频节「已起播、等平台记账」被误判为「无进展」而停机（D-056）**：第 2 个视频真起播后、
+  服务端未记账时返回 `WAIT_VIDEO_CONFIRM`（progress:false），但 `run.js` 无进展判停只豁免
+  `WAIT_LOAD`/`TASKPOINT_WAIT` → 9 轮后误报 `UNRECOGNIZED_PAGE`。修：当作有意等待（重置计数）+
+  专用上限 `safety.maxVideoConfirmTicks`（默认 1200），超限以 `video_confirm_timeout` 停。
+  真机：修复后 `running=True` 持续等待、不再误停。
+
+### 新增
+
+- `engine/multi-video-iframe.test.cjs`（28 项）：用真机 frame 结构复刻，锁定 D-054 反查补齐；
+  §6/§7 锁 D-055（videoToggle 命中失败不调 jsClick、scrollChainIntoView、big-button 目标）；
+  §8 锁 D-056（WAIT_VIDEO_CONFIRM 豁免 + maxVideoConfirmTicks）。
+- `engine/regression-chaos.test.cjs`（35 项）：覆盖 D-039 三本账清零、`_verifyVideoStarted`
+  传不存在 objectid、`_pickUnplayedVideo` 退化输入、`/json` 返回空、enc 分级源码断言等边角。
+
+### 说明
+
+- 全量 33 个 `*.test.cjs` 全绿，`--self-test` 通过。
+- **待真机端到端**：D-054 的第 2 个视频真的起播（需等 834s 的第 1 个播完，~14 min）。
+- **已知未修**：`/stop` 之后会话变 stale（D-053 只覆盖「登录进程退出」这条路径）。
+
 ## [0.2.3] — 2026-11-18
 
 ### 修复

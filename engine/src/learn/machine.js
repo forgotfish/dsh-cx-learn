@@ -312,6 +312,13 @@ class LearnMachine {
       return { ok: false, reason: 'find-eval-error: ' + String((e && e.message) || e).slice(0, 80) };
     }
     if (!found || !found.ok) {
+      /* ★ D-055：videoToggle 绝不降级 el.click()。
+         红线：所有点击一律真鼠标，点不中就快照+报错。且对 <video> 来说
+         el.click() 根本不会触发起播（vjs 播放要真实指针事件），降级=掩盖失败。
+         多视频第 2 个视频起不来那次真机事故就是这里偷偷降级造成的。 */
+      if (kind === 'videoToggle') {
+        return { ok: false, reason: (found && found.reason) || 'find-null' };
+      }
       if (found && found.jsFallback) {
         logger.warn('CLICK', 'WARN 跨域 frame 无法计算全局坐标，降级为页内 JS click', { kind, layer: 3 });
         return this.jsClickFound(frameId, kind, arg);
@@ -331,6 +338,9 @@ class LearnMachine {
       logger.log('CLICK', 'INFO', '点击完成（真实输入事件）', { kind, layer: found.layer, note: found.note, text: found.text, mode: r.mode });
       return { ok: true, layer: found.layer, note: found.note, text: found.text };
     } catch (e) {
+      if (kind === 'videoToggle') {
+        return { ok: false, reason: 'click-error: ' + String((e && e.message) || e).slice(0, 80) };
+      }
       logger.warn('CLICK', 'WARN 输入事件点击失败，降级为页内 JS click', { kind, err: String((e && e.message) || e).slice(0, 80) });
       return this.jsClickFound(frameId, kind, arg);
     }
@@ -550,6 +560,14 @@ class LearnMachine {
         const multiVideo = !!(pv.ok && pv.total > 1);
         const blockAdvance = multiVideo && pv.pending.length > 0;
         if (blockAdvance) {
+          /* ★★ 2026-11-20（D-054，真机实证）：**多视频节的每个视频在独立子 iframe 里**。
+             实测 2.2（2 个视频）frame 树：
+                studentstudy → knowledge/cards → ananas/modules/video/index.html × 2
+             而 cards frame 里 `document.querySelectorAll('video')` = 0 ——
+             video 在下钻一层的 video 子 iframe 里。所以汇总出的 videos 为空，
+             `_pickUnplayedVideo` 挑不出候选 → 直接收口 video_task_unreachable。
+             修法：按 pending 的 objectid **反查 video 子 iframe** 补齐候选。 */
+          await this._enrichVideosFromFrames(pv);
           const nextVid = this._pickUnplayedVideo(st, pv);
           if (nextVid) {
             logger.info('ADVANCE', '本节还有未播的视频任务点，继续播下一个（不切节）', {
@@ -2169,6 +2187,66 @@ class LearnMachine {
    * 全部未完成任务点都已播过一次（平台还没记账）时也返回 null，
    * 交给后面的「未确认」逻辑（拍快照 / 累积 streak / 停止）。
    */
+  /**
+   * 按 objectid 反查 video 子 iframe，补齐 `_lastVideos`（D-054）。
+   *
+   * 为什么需要：超星「一节多视频」时，每个视频各自在一个
+   * `ananas/modules/video/index.html` 子 iframe 里（frame 树形如
+   * studentstudy → knowledge/cards → video/index.html × N）。
+   * cards frame 自身没有 <video>，靠常规探针汇总会得到空列表，
+   * 于是「还有没播的视频」却挑不出可点的播放器。
+   *
+   * 做法：只对「pending 里还没在 _lastVideos 出现过」的 objectid，
+   * 逐个 video 子 iframe 读它的 <video>.currentSrc 抽 32-hex 比对。
+   * 命中就补一条 { frameId, frameUrl, objectid, src, currentTime, paused }。
+   */
+  async _enrichVideosFromFrames(pv) {
+    try {
+      const pending = (pv && Array.isArray(pv.pending)) ? pv.pending : [];
+      if (!pending.length) return;
+      const known = new Set((Array.isArray(this._lastVideos) ? this._lastVideos : [])
+        .map((v) => String((v && v.objectid) || '')).filter(Boolean));
+      const missing = pending.map((t) => String((t && t.objectid) || '')).filter((o) => o && !known.has(o));
+      if (!missing.length) return;
+
+      const frames = await this.adapter.getFrameDocuments().catch(() => []);
+      const vidFrames = (frames || []).filter((f) => /ananas\/modules\/video|modules\/video\/index\.html/i.test(f.url || ''));
+      if (!vidFrames.length) return;
+
+      const probeExpr = `(() => {
+        const v = document.querySelector('video');
+        if (!v) return '';
+        const s = String(v.currentSrc || v.getAttribute('src') || '');
+        const m = /[0-9a-fA-F]{32}/.exec(s);
+        return m ? m[0] : '';
+      })()`;
+
+      const added = [];
+      for (const f of vidFrames) {
+        let oid = '';
+        try { oid = String(await this.adapter.evalInFrame(f.frameId, probeExpr) || ''); } catch (_) { oid = ''; }
+        if (!oid || !missing.includes(oid)) continue;
+        if (known.has(oid)) continue;
+        this._lastVideos = (Array.isArray(this._lastVideos) ? this._lastVideos : []).concat([{
+          frameId: f.frameId,
+          frameUrl: String(f.url || ''),
+          objectid: oid,
+          src: '',
+          duration: null,
+          currentTime: 0,
+          paused: true,
+        }]);
+        known.add(oid);
+        added.push({ objectid: oid.slice(0, 12), frameId: String(f.frameId).slice(0, 10) });
+      }
+      if (added.length) {
+        logger.info('ADVANCE', '已从 video 子 iframe 补齐播放器候选', { added, totalVideos: this._lastVideos.length });
+      }
+    } catch (e) {
+      logger.warn('ADVANCE', '反查 video 子 iframe 失败', { err: String((e && e.message) || e).slice(0, 100) });
+    }
+  }
+
   _pickUnplayedVideo(st, pv) {
     try {
       if (!pv || !pv.ok || !Array.isArray(pv.pending) || !pv.pending.length) return null;
@@ -2592,15 +2670,23 @@ class LearnMachine {
 
     /* 记点击前的进度基线，用于「有没有真的动起来」的判定 */
     let beforeTime = -1;
+    /* ★ D-054：优先在该候选自己的 frame 里读基线（多视频节 st.videos 可能是空的） */
     try {
-      const base = Array.isArray(st && st.videos) ? st.videos : [];
-      for (const v of base) {
-        if (oid && String(v.objectid || '') === oid) { beforeTime = Number(v.currentTime || 0); break; }
-      }
-      if (beforeTime < 0 && st && st.video && typeof st.video.currentTime === 'number') {
-        beforeTime = Number(st.video.currentTime || 0);
-      }
+      const raw = await this.adapter.evalInFrame(frameId, `(() => { const v = document.querySelector('video'); return v ? String(v.currentTime) : ''; })()`);
+      const t = Number(raw);
+      if (Number.isFinite(t)) beforeTime = t;
     } catch (_) { /* ignore */ }
+    if (beforeTime < 0) {
+      try {
+        const base = Array.isArray(st && st.videos) ? st.videos : [];
+        for (const v of base) {
+          if (oid && String(v.objectid || '') === oid) { beforeTime = Number(v.currentTime || 0); break; }
+        }
+        if (beforeTime < 0 && st && st.video && typeof st.video.currentTime === 'number') {
+          beforeTime = Number(st.video.currentTime || 0);
+        }
+      } catch (_) { /* ignore */ }
+    }
 
     try {
       const r = await this.clickFound(frameId, 'videoToggle', oid ? { objectid: oid } : undefined);
@@ -2611,7 +2697,7 @@ class LearnMachine {
       }
       await this.muteIfPossible(frameId);
       if (oid) {
-        const verified = await this._verifyVideoStarted(oid, beforeTime, 4000);
+        const verified = await this._verifyVideoStarted(oid, beforeTime, 6000, frameId);
         if (!verified.ok) {
           this._bumpUnstartable(oid);
           logger.warn('QUIZ', '点击后视频未起播（已记录失败，换下一个候选）', {
@@ -2645,11 +2731,32 @@ class LearnMachine {
    * 点完之后验证「真的起播了」—— 这是旧实现最缺的一环（失败不可见）。
    * 轮询最多 maxMs；命中 paused===false 或 currentTime 前进 > 0.5s 即成功。
    */
-  async _verifyVideoStarted(oid, beforeTime, maxMs) {
+  async _verifyVideoStarted(oid, beforeTime, maxMs, frameId) {
     const deadline = Date.now() + (Number(maxMs) > 0 ? Number(maxMs) : 4000);
     let last = null;
     while (Date.now() < deadline) {
       await sleep(700);
+      /* ★ D-054：多视频节的 video 在子 iframe 里，st2.videos 可能是空的。
+         所以有 frameId 时**先在该 frame 内读**；读不到再回退全局汇总（两条路都试）。 */
+      let frameHit = null;
+      if (frameId) {
+        try {
+          const raw = await this.adapter.evalInFrame(frameId, `(() => {
+            const v = document.querySelector('video');
+            if (!v) return '';
+            return JSON.stringify({ t: v.currentTime, dur: v.duration, paused: v.paused, rs: v.readyState });
+          })()`);
+          try { frameHit = JSON.parse(raw); } catch (_) { frameHit = null; }
+        } catch (_) { frameHit = null; }
+      }
+      if (frameHit) {
+        last = frameHit;
+        const cur = Number(frameHit.t || 0);
+        if (frameHit.paused === false && (cur > 0 || (beforeTime >= 0 && cur - beforeTime > 0.5))) {
+          return { ok: true, note: 'playing(frame)' };
+        }
+        if (beforeTime >= 0 && cur - beforeTime > 0.5) return { ok: true, note: 'time-advanced(frame)' };
+      }
       let st2 = null;
       try { st2 = await this.gatherState(); } catch (_) { st2 = null; }
       if (!st2) continue;
@@ -2669,7 +2776,7 @@ class LearnMachine {
       }
       if (beforeTime >= 0 && cur - beforeTime > 0.5) return { ok: true, note: 'time-advanced' };
     }
-    return { ok: false, note: last ? ('stuck paused=' + last.paused + ' t=' + Number(last.currentTime || 0)) : 'video-not-found' };
+    return { ok: false, note: last ? ('stuck paused=' + last.paused + ' t=' + Number(last.currentTime || last.t || 0)) : 'video-not-found' };
   }
 
   /**

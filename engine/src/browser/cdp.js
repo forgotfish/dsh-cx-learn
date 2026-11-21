@@ -614,6 +614,17 @@ function createCdpAdapter(cfg) {
       await conn.send('Page.enable');
       await conn.send('Runtime.enable');
       await this._applyExtraHeaders(conn);
+      /* ★★ D-050：启动时首次 attach 同样要强制前台 + 焦点仿真，否则全是 hidden */
+      try { await conn.send('Page.bringToFront'); } catch (_) { /* ignore */ }
+      try { await conn.send('Emulation.setFocusEmulationEnabled', { enabled: true }); } catch (_) { /* ignore */ }
+      try {
+        const vv = await conn.send('Runtime.evaluate', {
+          expression: 'JSON.stringify({vis: document.visibilityState, focus: document.hasFocus()})',
+          returnByValue: true,
+        });
+        const sv = JSON.parse((vv && vv.result && vv.result.value) || '{}');
+        logger.info('PRECHECK', 'target 可见性', { targetId: String(targetId).slice(0, 12), vis: sv.vis, focus: sv.focus });
+      } catch (_) { /* ignore */ }
       try {
         const t = await conn.send('Page.getFrameTree');
         conn.topFrameId = t.frameTree && t.frameTree.frame && t.frameTree.frame.id;
@@ -1016,6 +1027,30 @@ function createCdpAdapter(cfg) {
       conn.sessionId = attached.sessionId;
       await conn.send('Page.enable');
       await conn.send('Runtime.enable');
+      /* ★★ 2026-11-20（D-050，真机实证，「点了没反应」的真根因）：
+         CDP 新建/切换的 target 可能停在**后台隐藏态**（document.visibilityState=hidden），
+         而 Chrome 对 hidden 标签会**丢弃合成鼠标事件**，表现为
+         「坐标对、命中测试通过、点了却没反应」。实测对照：同坐标 (180,401)
+         在 visible 标签上 3 次成功、在 hidden 标签上全部失败。
+         修法：attach 后 bringToFront + 焦点仿真，并**验证** visibilityState。 */
+      try { await conn.send('Page.bringToFront'); } catch (_) { /* ignore */ }
+      try { await conn.send('Emulation.setFocusEmulationEnabled', { enabled: true }); } catch (_) { /* ignore */ }
+      try {
+        const v = await conn.send('Runtime.evaluate', {
+          expression: 'JSON.stringify({vis: document.visibilityState, focus: document.hasFocus()})',
+          returnByValue: true,
+        });
+        const st = JSON.parse((v && v.result && v.result.value) || '{}');
+        logger.info('PRECHECK', 'target 可见性', { targetId: String(targetId).slice(0, 12), vis: st.vis, focus: st.focus });
+        if (st.vis === 'hidden') {
+          try { await conn.send('Page.bringToFront'); } catch (_) { /* ignore */ }
+          await sleep(300);
+          const v2 = await conn.send('Runtime.evaluate', { expression: 'document.visibilityState', returnByValue: true });
+          logger.warn('PRECHECK', 'target 仍隐藏（合成鼠标事件可能被丢弃）', {
+            vis: String((v2 && v2.result && v2.result.value) || ''), targetId: String(targetId).slice(0, 12),
+          });
+        }
+      } catch (_) { /* ignore */ }
       try {
         const tree = await conn.send('Page.getFrameTree');
         conn.topFrameId = tree.frameTree && tree.frameTree.frame && tree.frameTree.frame.id;
@@ -1239,6 +1274,23 @@ function createCdpAdapter(cfg) {
     async closeTarget(targetId) {
       if (!targetId) return false;
       try { await cdpHttp('/json/close/' + targetId); return true; } catch (_) { return false; }
+    },
+
+    /**
+     * 把当前 target 激活到前台（D-049）。
+     * ★ 2026-11-20 真机：同样的坐标、同样的 Input.dispatchMouseEvent，
+     *   「新建 target」点击能打开课程页，「attach 到已有 target」却点了没反应。
+     *   已知原因之一是 target 未激活时 headless 会丢弃合成鼠标事件，
+     *   所以点击前先 bringToFront（失败不抛，仅记录）。
+     */
+    async bringToFront() {
+      try {
+        const conn = requireConn();
+        await conn.send('Page.bringToFront');
+        return { ok: true };
+      } catch (e) {
+        return { ok: false, reason: String((e && e.message) || e).slice(0, 80) };
+      }
     },
 
     async getCurrentUrl() {

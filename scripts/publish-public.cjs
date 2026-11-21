@@ -90,6 +90,23 @@ function sanitize(file) {
   if (changed) fs.writeFileSync(file, s);
 }
 
+/* 同步公开仓 package.json 的 version 与 description（★ 2026-11-21）。
+ * 为什么不直接 copy 本地 package.json：本地 homepage/repository 指向 forgotfish/cx-learn，
+ * 公开仓指向 forgotfish/dsh-cx-learn，URL 不同。所以只补两个字段，其余（含 URL）保留公开仓原值。
+ * 以前公开仓 description 停在「章节测验只识别不触碰」，与 D-020（可作答、默认只存草稿）
+ * 及后续能力相反，属于**错误的安全声明**，必须随发版纠正。 */
+function syncPackageMeta(tmp) {
+  const localPath = path.join(ROOT, 'package.json');
+  const pubPath = path.join(tmp, 'package.json');
+  if (!fs.existsSync(pubPath)) return;
+  const local = JSON.parse(fs.readFileSync(localPath, 'utf8'));
+  const pub = JSON.parse(fs.readFileSync(pubPath, 'utf8'));
+  let changed = false;
+  if (local.version && pub.version !== local.version) { pub.version = local.version; changed = true; }
+  if (local.description && pub.description !== local.description) { pub.description = local.description; changed = true; }
+  if (changed) fs.writeFileSync(pubPath, JSON.stringify(pub, null, 2) + '\n');
+}
+
 /* ---------------------------------------------------------------- main */
 console.log('== 1. 准备临时目录');
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'cx-learn-pub-'));
@@ -115,6 +132,7 @@ for (const d of COPY_DIRS) {
   fs.rmSync(path.join(tmp, d), { recursive: true, force: true });
   copyTree(src, path.join(tmp, d));
 }
+syncPackageMeta(tmp);
 
 console.log('== 4. 严格审计（在临时目录内，按公开仓 tracked 文件扫）');
 run('git', ['add', '-A'], tmp, { quiet: true });

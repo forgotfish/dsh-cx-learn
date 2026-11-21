@@ -293,6 +293,9 @@ async function run(overrides, options) {
 
     /* —— 主循环 —— */
     let consecutiveNonProgress = 0;
+    /* ★ D-056：多视频节「已起播、等平台记账」是有意等待，不能被当成无进展误杀；
+       但也要有上限，防止服务端永不记账时无限空等。 */
+    let consecutiveWaitConfirm = 0;
     while (!machine.stopReason) {
       if (Date.now() - started > cfg.safety.maxRuntimeMs) { machine.stop('max_runtime_exceeded'); break; }
       await humanize.maybeLongPause();
@@ -308,6 +311,7 @@ async function run(overrides, options) {
       if (step.progress) {
         machine.failures = 0;
         consecutiveNonProgress = 0;
+        consecutiveWaitConfirm = 0;
       } else {
         /* ★ 2026-11-17（D-028）：「等待加载 / 任务点等待」是有意的等待，不是「页面无法识别」。
            真机 16.2 就是纯等被算成无进展，9 轮后误判 UNRECOGNIZED_PAGE 停掉。
@@ -317,6 +321,21 @@ async function run(overrides, options) {
           await humanize.pollDelay();
           continue;
         }
+        /* ★ D-056：多视频节第 2 个视频已起播、只是等超星记账（WAIT_VIDEO_CONFIRM），
+           也是有意等待 → 不算无进展。给一个足够大的专用上限，防服务端永不记账时无限空等。
+           （上限用 tick 数；pollDelay 4–9s，默认 1200 tick ≈ 1.5–3h，足够覆盖一个 46min 视频。）*/
+        if (step.outcome === 'WAIT_VIDEO_CONFIRM') {
+          consecutiveNonProgress = 0;
+          consecutiveWaitConfirm += 1;
+          const capV = Number(cfg.safety.maxVideoConfirmTicks) || 1200;
+          if (consecutiveWaitConfirm >= capV) {
+            machine.stop('video_confirm_timeout');
+            break;
+          }
+          await humanize.pollDelay();
+          continue;
+        }
+        consecutiveWaitConfirm = 0;
         consecutiveNonProgress += 1;
         if (machine.failures >= cfg.safety.maxConsecutiveFailures) {
           machine.fatalStop('UNRECOGNIZED_PAGE', '连续 ' + machine.failures + ' 次关键操作失败/页面无法识别，停止并输出诊断');

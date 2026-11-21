@@ -492,29 +492,89 @@ async function locateCourseLink(adapter, courseText, courseId) {
       var h = a.getAttribute('href') || '';
       return /courseid=\\d+/i.test(h);
     });
-    var hit = null;
+    /* ★★ 2026-11-19（D-046，真机实证）：**同一 courseid 可能有多个 <a>**。
+       实测失败的点击点 x=180（页面左侧「最近学习」缩略图），成功的是 x=740（课程网格里的大卡片）。
+       点缩略图不跳转 → 三次重试都失败。所以这里收集**全部**候选，
+       并用命中测试（elementFromPoint 是否落在该 <a> 内部）筛出真正可点的那个，
+       多个可点时优先面积大的（主网格卡片）。 */
+    var cands = [];
     if (cid) {
-      hit = pool.find(function (a) {
+      cands = pool.filter(function (a) {
         var m = /courseid=(\\d+)/i.exec(a.getAttribute('href') || '');
         return m && m[1] === cid;
-      }) || null;
+      });
     }
-    if (!hit && want) {
-      hit = pool.find(function (a) {
+    if (!cands.length && want) {
+      cands = pool.filter(function (a) {
         var t = (a.innerText || a.textContent || '').replace(/\\s+/g, ' ').trim();
         return t.indexOf(want) >= 0;
-      }) || null;
+      });
     }
-    if (!hit) hit = pool[0] || null;
-    if (!hit) return JSON.stringify({ ok: false, reason: 'no-course-link', pool: pool.length });
-    var t = (hit.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 50);
-    var h = (hit.getAttribute('href') || '').slice(0, 200);
-    var r = hit.getBoundingClientRect();
+    if (!cands.length) cands = pool.slice(0, 1);
+    if (!cands.length) return JSON.stringify({ ok: false, reason: 'no-course-link', pool: pool.length });
+
+    function insideLink(a, x, y) {
+      try {
+        var el = document.elementFromPoint(x, y);
+        if (!el) return false;
+        return el === a || (a.contains && a.contains(el));
+      } catch (e) { return false; }
+    }
+    /* ★ D-048：坐标必须落在视口内（否则合成鼠标事件点不到） */
+    function inViewport(x, y) {
+      return x >= 0 && y >= 0 && x <= (window.innerWidth - 1) && y <= (window.innerHeight - 1);
+    }
+    /* 在一个矩形里找一个「命中点确实落在该 a 内」的坐标：先中心，再 3x3 网格 */
+    function pickPoint(a) {
+      var r = a.getBoundingClientRect();
+      if (!(r.width > 0 && r.height > 0)) return null;
+      var cand = [[0.5, 0.5], [0.5, 0.25], [0.5, 0.75], [0.25, 0.5], [0.75, 0.5], [0.35, 0.35], [0.65, 0.65]];
+      for (var i = 0; i < cand.length; i++) {
+        var x = Math.round(r.x + r.width * cand[i][0]);
+        var y = Math.round(r.y + r.height * cand[i][1]);
+        if (!inViewport(x, y) || y < 2) continue;
+        if (insideLink(a, x, y)) {
+          return { x: x, y: y, w: Math.round(r.width), h: Math.round(r.height), r: r };
+        }
+      }
+      return null;
+    }
+    var chosen = null, chosenA = null;
+    var report = [];
+    for (var k = 0; k < cands.length; k++) {
+      var a2 = cands[k];
+      var rr = a2.getBoundingClientRect();
+      var p = pickPoint(a2);
+      report.push({
+        i: k, w: Math.round(rr.width), h: Math.round(rr.height),
+        x: Math.round(rr.x), y: Math.round(rr.y),
+        clickable: !!p, area: Math.round(rr.width * rr.height),
+        visible: !!(rr.width > 0 && rr.height > 0),
+      });
+      if (p && (!chosen || (rr.width * rr.height) > chosen.area)) {
+        chosen = {
+          x: p.x, y: p.y, w: p.w, h: p.h,
+          /* ★★ D-052：同时返回元素**左上角**。adapter.click 内部会自己加 w/2、h/2
+             取中心，所以传给它的必须是左上角；而 x/y（中心）留给日志/判断用。 */
+          left: Math.round(rr.x), top: Math.round(rr.y),
+          area: Math.round(rr.width * rr.height),
+        };
+        chosenA = a2;
+      }
+    }
+    if (!chosen) {
+      return JSON.stringify({
+        ok: false, reason: 'no-clickable-point',
+        cands: report, hitHref: (cands[0].getAttribute('href') || '').slice(0, 160)
+      });
+    }
+    var t = (chosenA.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 50);
+    var h = (chosenA.getAttribute('href') || '').slice(0, 200);
     return JSON.stringify({
       ok: true, text: t, href: h,
-      x: Math.round(r.x + r.width / 2),
-      y: Math.round(r.y + r.height / 2),
-      w: Math.round(r.width), h: Math.round(r.height)
+      x: chosen.x, y: chosen.y, w: chosen.w, h: chosen.h,
+      left: chosen.left, top: chosen.top,
+      inViewport: true, candCount: cands.length, cands: report,
     });
   })()`;
 
@@ -566,7 +626,56 @@ async function openCourseByClick(adapter, courseText, opts) {
   } catch (_) { /* ignore */ }
   logger.log('PROBE', 'INFO', '点击前 target 数', { count: before.size });
 
-  const hit = await locateCourseLink(adapter, courseText, courseId);
+  /* ★★ 2026-11-19（D-047，真机实证）：**课程列表是懒加载的，元素在 ≠ 可点**。
+     实测：回到 /visit/interaction 后仅 7 秒就定位，结果 no-clickable-point
+     （<a> 已在 DOM 里，但还没渲染/在视口外/被骨架屏盖着）。
+     ⇒ 定位前先轮询等「至少有一个候选通过命中测试」，最多等 25 秒；
+       等不到再走原有失败路径（保留诊断）。 */
+  const waitClickable = async (maxMs) => {
+    const deadline = Date.now() + (maxMs || 25000);
+    let last = null;
+    let tries = 0;
+    while (Date.now() < deadline) {
+      tries += 1;
+      const t = await adapter.getFrameDocuments().catch(() => []);
+      const tp = (t || []).find((f) => f.isTop);
+      if (tp) {
+        /* ★★ 2026-11-19（D-048，真机实证）：**滚动是异步的，滚完必须重新取坐标**。
+           实测：scrollIntoView 之后立刻取 rect，拿到的 y=1171（视口只有 803），
+           点在视口外 → 永远点不中。而我手动实验里「滚动 → 等一会 → 重取」就成功。
+           所以这里：滚动 → 等 350ms → 再取；并要求坐标落在视口内、命中测试通过。 */
+        try {
+          await adapter.evalInFrame(tp.frameId, `(() => {
+            var cid = ${JSON.stringify(String(courseId || ''))};
+            var cands = Array.prototype.slice.call(document.querySelectorAll('a[href]')).filter(function (x) {
+              var m = /courseid=(\\d+)/i.exec(x.getAttribute('href') || ''); return m && m[1] === cid;
+            });
+            var a = cands.sort(function (p, q) {
+              var rp = p.getBoundingClientRect(), rq = q.getBoundingClientRect();
+              return rq.width * rq.height - rp.width * rp.height;
+            })[0];
+            if (a) { try { a.scrollIntoView({ block: 'center', behavior: 'instant' }); } catch (e) { try { a.scrollIntoView(); } catch (e2) {} } }
+            return !!a;
+          })()`);
+        } catch (_) { /* ignore */ }
+        await sleep(450);   /* 等滚动生效 */
+      }
+      last = await locateCourseLink(adapter, courseText, courseId);
+      if (last && last.ok && last.inViewport !== false) {
+        logger.log('PROBE', 'INFO', '课程卡片已可点', {
+          tries, x: last.x, y: last.y, candCount: last.candCount || 0,
+        });
+        return last;
+      }
+      await sleep(800);
+    }
+    logger.log('PROBE', 'WARN', '等待课程卡片可点超时', {
+      tries, reason: last && last.reason, cands: last && last.cands ? last.cands.slice(0, 6) : undefined,
+    });
+    return last;
+  };
+
+  const hit = await waitClickable(25000);
   if (!hit || !hit.ok) {
     return { ok: false, reason: '未找到课程链接: ' + ((hit && hit.reason) || 'unknown') };
   }
@@ -599,32 +708,184 @@ async function openCourseByClick(adapter, courseText, opts) {
 
   // 重新取一次坐标（滚动后位置变了）
   const hit2 = await locateCourseLink(adapter, courseText, courseId);
-  const pt = (hit2 && hit2.ok) ? hit2 : hit;
 
-  try {
-    await adapter.click(top.frameId, { x: pt.x, y: pt.y, w: pt.w, h: pt.h });
-  } catch (e) {
-    return { ok: false, reason: 'click: ' + String((e && e.message) || e).slice(0, 90) };
+  /* ★★ 2026-11-19（D-045，真机复现）：**点一次就放弃太脆**。
+     真机实测：回到课程列表 7s 后点卡片（坐标 740,401，elementFromPoint 命中 IMG）
+     却没打开课程页；而同一坐标在「多等几秒 + 确认布局不再漂移」后点就成功。
+     ⇒ 图片卡片懒加载会让 boundingRect 在加载过程中漂移，点到的位置可能已经不是卡片。
+     修法（仍然只用真实鼠标事件，绝不退化成 element.click）：
+       1) 点前等布局稳定：连续两次采样坐标一致才点
+       2) 点后没开新页 → 重新定位（含 scrollIntoView）+ 再点，最多 3 次
+       3) 3 次都失败才报错，并保留诊断快照 */
+  let pt = (hit2 && hit2.ok) ? hit2 : hit;
+  let lastQuick = null;
+  let clicked = 0;
+  /* ★★ D-052 已修根因（双重取中心），原来的 coordFix 自适应校正改为**仅兜底**：
+     只有当实测偏差**不等于 (w/2,h/2)** 时才启用（说明另有未知偏移），
+     正常情况下一律走「传左上角」的正确路径。 */
+  let coordFix = { dx: 0, dy: 0 };
+  /* ★ D-049：记住点击前的 URL，用于「同标签跳转」判定（必须看差异，不能只看像不像） */
+  let beforeUrl = '';
+  try { beforeUrl = String(await adapter.getCurrentUrl() || ''); } catch (_) { beforeUrl = ''; }
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    /* 1) 等布局稳定：坐标连续两次一致 */
+    let stable = null;
+    for (let s = 0; s < 6; s++) {
+      const a = await locateCourseLink(adapter, courseText, courseId);
+      if (!a || !a.ok) break;
+      await sleep(400);
+      const b = await locateCourseLink(adapter, courseText, courseId);
+      if (b && b.ok && b.x === a.x && b.y === a.y) { stable = b; break; }
+      stable = b && b.ok ? b : a;
+    }
+    pt = stable || pt;
+    /* ★ D-052 兜底：应用兜底校正量（正常为 0，因为根因已由「传左上角」修掉） */
+    if (coordFix.dx || coordFix.dy) {
+      if (pt.left != null && pt.top != null) {
+        pt = Object.assign({}, pt, { left: Math.max(0, Math.round(pt.left) - coordFix.dx), top: Math.max(0, Math.round(pt.top) - coordFix.dy) });
+      } else {
+        pt = Object.assign({}, pt, { x: Math.max(1, Math.round(pt.x) - coordFix.dx), y: Math.max(1, Math.round(pt.y) - coordFix.dy) });
+      }
+    }
+    try {
+      /* ★ D-049：点击前先激活 target。真机实证：同样坐标/同样事件序列，
+         「新建 target」能打开课程页，而「attach 到已有 target」点了没反应。 */
+      if (typeof adapter.bringToFront === 'function') {
+        const bf = await adapter.bringToFront().catch(() => null);
+        if (bf && bf.ok === false) logger.log('PROBE', 'WARN', 'bringToFront 失败', { reason: bf.reason });
+      }
+      /* ★★ D-051（诊断用，长期保留）：点击前在页面挂一次性点击探针，
+         点完读取「页面到底有没有收到 click」。这是区分
+         「CDP 事件没送达」与「页面收到但没跳转」的唯一可靠证据。 */
+      try {
+        await adapter.evalInFrame(top.frameId, `(() => {
+          try {
+            window.__cxClickProbe = { down: 0, up: 0, click: 0, linkClick: 0, at: Date.now(), ev: null };
+            if (!window.__cxProbeBound) {
+              window.__cxProbeBound = true;
+              document.addEventListener('mousedown', function () { if (window.__cxClickProbe) window.__cxClickProbe.down++; }, true);
+              document.addEventListener('mouseup', function () { if (window.__cxClickProbe) window.__cxClickProbe.up++; }, true);
+              document.addEventListener('click', function (ev) {
+                if (!window.__cxClickProbe) return;
+                window.__cxClickProbe.click++;
+                var n = ev.target;
+                var inA = false;
+                for (var i = 0; i < 6 && n; i++) { if (n.tagName === 'A') { inA = true; break; } n = n.parentElement; }
+                if (inA) window.__cxClickProbe.linkClick++;
+                /* ★ D-051：记录事件实际坐标与命中元素 —— 与「我们发出去的坐标」对比，
+                   就能判断是不是坐标系错位（CSS zoom / 缩放 / 视口偏移）。 */
+                window.__cxClickProbe.ev = {
+                  cx: ev.clientX, cy: ev.clientY,
+                  tgt: ev.target ? (ev.target.tagName + '.' + String(ev.target.className || '').split(' ')[0]) : null,
+                  inA: inA,
+                  dpr: window.devicePixelRatio,
+                  vw: window.innerWidth, vh: window.innerHeight,
+                  zoom: (function () { try { return getComputedStyle(document.body).zoom; } catch (e) { return null; } })(),
+                  scrollX: window.scrollX, scrollY: window.scrollY,
+                  vv: (window.visualViewport ? {
+                    ox: Math.round(window.visualViewport.offsetLeft), oy: Math.round(window.visualViewport.offsetTop),
+                    px: Math.round(window.visualViewport.pageLeft), py: Math.round(window.visualViewport.pageTop),
+                    sx: Math.round(window.visualViewport.scale * 100) / 100,
+                    w: Math.round(window.visualViewport.width), h: Math.round(window.visualViewport.height)
+                  } : null),
+                  screenX: window.screenX, screenY: window.screenY,
+                  outerW: window.outerWidth, outerH: window.outerHeight
+                };
+              }, true);
+            }
+          } catch (e) {}
+          return true;
+        })()`);
+      } catch (_) { /* ignore */ }
+
+      /* ★★ D-052（根因修复）：adapter.click 内部会做 `x = rect.x + rect.w/2`，
+         所以这里必须传**左上角** (left/top)，不能传中心 x/y —— 传中心会导致
+         「再取一次中心」，偏移恰好等于 (w/2, h/2)。
+         实测：卡片 240×130 → 发 180,401 实际点到 300,466，正是这个原因。 */
+      const clickRect = (pt.left != null && pt.top != null)
+        ? { x: pt.left, y: pt.top, w: pt.w, h: pt.h }
+        : { x: pt.x, y: pt.y, w: pt.w, h: pt.h };   /* 兼容老调用（无 left/top） */
+      await adapter.click(top.frameId, clickRect);
+      logger.log('PROBE', 'INFO', '已用真实鼠标点击课程卡片', {
+        attempt, x: pt.x, y: pt.y, w: pt.w, h: pt.h,
+        candCount: pt.candCount || 0, cands: (pt.cands || []).slice(0, 4),
+      });
+    } catch (e) {
+      logger.log('PROBE', 'WARN', '鼠标点击抛错', { attempt, err: String((e && e.message) || e).slice(0, 80) });
+    }
+    /* 2) 等新页出现（每轮最多 ~6s） */
+    for (let w = 0; w < 5; w++) {
+      await sleep(1200);
+      const quickNow = await listTargets(cfg).catch(() => []);
+      const hitNow = (quickNow || []).some((t) => t.type === 'page' &&
+        /mooc2-ans\.chaoxing\.com\/mooc2-ans\/mycourse\/stu/i.test(t.url || '') && !before.has(t.id));
+      if (hitNow) { lastQuick = quickNow; break; }
+      lastQuick = quickNow;
+    }
+    /* ★ D-051：把点击探针结果打出来（判断事件是否送达页面） */
+    let probe = null;
+    try {
+      const pr = await adapter.evalInFrame(top.frameId, '(() => JSON.stringify(window.__cxClickProbe || null))()');
+      try { probe = JSON.parse(pr); } catch (_) { probe = null; }
+      logger.log('PROBE', 'INFO', '点击探针结果', { attempt, probe });
+      /* 清掉，避免下一轮累加 */
+      await adapter.evalInFrame(top.frameId, '(() => { window.__cxClickProbe = null; return true; })()');
+    } catch (_) { /* ignore */ }
+    /* ★ D-052 兜底：只有实测偏差**不是** (w/2,h/2) 时才用自适应校正
+       （(w/2,h/2) 已由「传左上角」根治；若还偏，说明另有未知偏移源）。 */
+    if (probe && probe.ev && typeof probe.ev.cx === 'number') {
+      const sentCx = (pt.left != null) ? Math.round(pt.left + pt.w / 2) : Math.round(pt.x);
+      const sentCy = (pt.top != null) ? Math.round(pt.top + pt.h / 2) : Math.round(pt.y);
+      const dx = probe.ev.cx - sentCx;
+      const dy = probe.ev.cy - sentCy;
+      if (Math.abs(dx) > 2 || Math.abs(dy) > 2) {
+        coordFix = { dx: coordFix.dx + dx, dy: coordFix.dy + dy };
+        logger.log('PROBE', 'WARN', '点击坐标仍有额外偏移（非 w/2,h/2），已记录兜底校正', {
+          attempt, sentCenter: { x: sentCx, y: sentCy }, received: { x: probe.ev.cx, y: probe.ev.cy },
+          dx, dy, coordFix,
+        });
+      }
+    }
+    const opened = (lastQuick || []).some((t) => t.type === 'page' &&
+      /mooc2-ans\.chaoxing\.com\/mooc2-ans\/mycourse\/stu/i.test(t.url || '') && !before.has(t.id));
+    if (opened) break;
+    /* ★ D-049：也可能「同标签跳转」而不开新页 —— 直接看当前页 URL 是否已变成课程页。
+       ★★ 注意（测试抓到的坑）：**必须比较点击前后的差异**。
+          只看「当前 URL 像不像课程页」会误判 —— 页面本来就停在课程列表/学习页时
+          也会命中，于是把「没点开」当成「点开了」（假成功，比失败更难查）。 */
+    try {
+      const curUrl = String(await adapter.getCurrentUrl() || '');
+      const changed = curUrl && curUrl !== beforeUrl;
+      if (changed && /mooc2-ans\.chaoxing\.com\/mooc2-ans\/mycourse\/stu|mycourse\/studentstudy/i.test(curUrl)) {
+        logger.log('PROBE', 'INFO', '点击后本页已跳转到课程页（同标签）', { url: curUrl.slice(0, 110) });
+        return { ok: true, text: hit && hit.text, url: curUrl, targetId: adapter.getTargetId ? adapter.getTargetId() : null, sameTab: true };
+      }
+    } catch (_) { /* ignore */ }
+    if (attempt < 3) {
+      logger.log('PROBE', 'WARN', '点击未打开课程页，重新定位后再试', { attempt });
+      /* 重新滚到卡片，准备下一轮 */
+      try {
+        await adapter.evalInFrame(top.frameId, `(() => {
+          var cid = ${JSON.stringify(String(courseId || ''))};
+          var a = Array.prototype.slice.call(document.querySelectorAll('a[href]'))
+            .find(function (x) { var m = /courseid=(\\d+)/i.exec(x.getAttribute('href') || ''); return m && m[1] === cid; });
+          if (a) { try { a.scrollIntoView({ block: 'center' }); } catch (e) {} }
+          return !!a;
+        })()`);
+      } catch (_) { /* ignore */ }
+      await sleep(1200);
+    }
   }
-  await sleep(2000);
-
-  /* ★★ 2026-11-18（D-042，主人指令）：**删掉 element.click() 兜底**。
-     规则：所有点击一律走模拟鼠标（CDP 真实输入事件），点不中就**快照 + 报错**，
-     绝不偷偷换成 JS 的 element.click()。
-
-     为什么必须删：实测 `hit.click()` 打开的是 <a target="_blank"> 的默认链路，
-     落地页与真实鼠标点击**不一样**（拿到的是没有有效 enc 的旧域页面），
-     于是「点成功」但进的是「温馨提示」错误页 —— 这类假成功比失败更难查。
-     旧实现见 git 历史 courses.js:617-643。 */
-  const quick = await listTargets(cfg);
-  const hasCoursePage = quick.some((t) => t.type === 'page' &&
-    /mooc2-ans\.chaoxing\.com\/mooc2-ans\/mycourse\/stu/i.test(t.url || ''));
+  const quick = lastQuick || await listTargets(cfg);
+  const hasCoursePage = (quick || []).some((t) => t.type === 'page' &&
+    /mooc2-ans\.chaoxing\.com\/mooc2-ans\/mycourse\/stu/i.test(t.url || '') && !before.has(t.id));
   if (!hasCoursePage) {
     logger.log('PROBE', 'WARN', '鼠标点击未打开课程页', {
-      hint: '按主人规则不再降级为 element.click()；下面留诊断快照',
+      hint: '按主人规则不降级为 element.click()；已重试 ' + clicked + ' 次，下面留诊断快照',
       clickPoint: { x: pt.x, y: pt.y, w: pt.w, h: pt.h },
+      candCount: pt.candCount || 0, cands: (pt.cands || []).slice(0, 6),
       hitText: (hit && hit.text) || '', hitHref: String((hit && hit.href) || '').slice(0, 120),
-      hasCoursePage, topIsHit: true,
+      hasCoursePage, attempts: clicked,
       pagesSeen: (quick || []).filter((t) => t.type === 'page').map((t) => String(t.url).slice(0, 90)).slice(0, 8),
     });
     /* 快照存证：把「点了哪里、页面上那一点是什么元素」记下来，便于事后对比 */

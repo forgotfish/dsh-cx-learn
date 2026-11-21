@@ -18,7 +18,7 @@
  * 解析元素（避免矩形过期）。iframe 递归遍历由 CDP frame 树 + 逐帧求值完成。
  * ==========================================================================*/
 const SELECTORS = {
-  version: 7,
+  version: 8,
   /* 目录节点候选（第二层结构特征）
      ★★★ 2026-10-30 实测：**同一个课程存在两套目录页**，两套都要能读：
        A) mooc2-ans/mycourse/studentcourse  → 新版 **.chapter_item**（85 个）
@@ -277,6 +277,29 @@ const PAGE_PROBE_SRC = `(function () {
     } catch (e) {
       return null;
     }
+  }
+
+  /* 把元素滚进**顶层视口**：先滚元素自身，再沿 frameElement 链把每一层 iframe
+   * 在它的父 frame 里滚进可视区（D-055）。
+   *
+   * 为什么需要：一节多视频时，第 2 个视频各自在 cards → video/index.html 双层
+   * iframe 里；el.scrollIntoView() 只滚元素自己所在文档，滚不动父 frame。
+   * 于是元素在顶层视口里仍可能落在视野外 → 命中测试失败 → 无法真实鼠标点击。
+   * 同源时 frameElement 可跨层级取，逐层 scrollIntoView 即可把整条链路滚进视口。 */
+  function scrollChainIntoView(el) {
+    try { el.scrollIntoView({ block: 'center', inline: 'nearest' }); }
+    catch (e) { try { el.scrollIntoView(); } catch (e2) {} }
+    try {
+      var win = window;
+      var guard = 0;
+      while (win && win !== win.top && guard++ < 6) {
+        var fe = win.frameElement;
+        if (!fe) break;
+        try { fe.scrollIntoView({ block: 'center', inline: 'nearest' }); }
+        catch (e3) { try { fe.scrollIntoView(); } catch (e4) {} }
+        win = win.parent;
+      }
+    } catch (e5) { /* 跨域：只滚得了自己那层，交给上层判定 */ }
   }
 
   /* ---- 坐标系说明（引擎侧实现，页面探针不做换算）----
@@ -883,7 +906,20 @@ const PAGE_PROBE_SRC = `(function () {
         } else if (wantIdx < all.length) {
           target = all[wantIdx];
         }
-        if (target) return { el: target, layer: 2, note: 'video-element(targeted)' };
+        if (target) {
+          /* ★ D-055：按 objectid 命中的是 <video> 元素，但视频未起播时最上层是
+             .vjs-big-play-button（不是 video 的子节点）→ 用 video 做命中测试必然失败、
+             真鼠标点 video 中心也点不到大按钮。多视频节第 2 个视频就卡在这。
+             所以：目标未起播且本播放器有大播放按钮时，返回那个按钮来点。 */
+          var big2 = null;
+          try { big2 = document.querySelector(S.playBigSel); } catch (e4) { big2 = null; }
+          var notStarted = false;
+          try { notStarted = target.paused || !(target.readyState >= 2); } catch (e5) { notStarted = true; }
+          if (big2 && notStarted && visible(big2)) {
+            return { el: big2, layer: 1, note: 'vjs-big-play-button(targeted)' };
+          }
+          return { el: target, layer: 2, note: 'video-element(targeted)' };
+        }
         /* 目标没找到：不要回退去点别的播放器（那正是死循环的成因），直接报告失败 */
         return null;
       }
@@ -1229,14 +1265,17 @@ const PAGE_PROBE_SRC = `(function () {
         } catch (e4) { return true; }
       }
       var scrolled = false;
+      /* ★ D-055：多视频节第 2 个视频在 cards→video 双层 iframe 里，
+         el.scrollIntoView 只滚得动自己那层，滚不动父 frame → 顶层视口里仍在视野外。
+         所以用 scrollChainIntoView 把整条 frame 链滚进视口，再重新取坐标。 */
       if (outside(rect)) {
-        try { r.el.scrollIntoView({ block: 'center', inline: 'nearest' }); } catch (e2) { try { r.el.scrollIntoView(); } catch (e3) {} }
+        scrollChainIntoView(r.el);
         rect = rectOf(r.el);
         scrolled = true;
       }
       var hit = hitOk();
       if (!hit) {
-        try { r.el.scrollIntoView({ block: 'center', inline: 'nearest' }); } catch (e5) {}
+        scrollChainIntoView(r.el);
         rect = rectOf(r.el);
         scrolled = true;
         hit = hitOk();

@@ -1074,9 +1074,22 @@ function spawnEngine(args) {
        但没有任何一方把 alive 改成 false —— 心跳停在 29 小时前，
        /health 却还报 alive:true，与 session.json 的 kernel_dead 互相矛盾。
        这里按「内核 pid 是否还活着」决定：死了就写墓碑，活着（keep-alive）就不动。 */
+    /* ★★ 2026-11-20（D-053，真机实证）：**登录进程退出时绝不给 browser.json 立墓碑**。
+       实测现场：
+         · 扫码登录 result.json = {ok:true, verified:true}（登录其实成功了）
+         · 但 browser.json 变成 {alive:false, port:null, pid:null, lastErrorKind:'ENGINE_EXIT'}
+         · session.json 里 active=true / loginVerified=true，但 port=null / kernelPid=null
+         · session watcher 每 5s 刷「会话端口未知，跳过存活判定（等 browser.json）」
+         · 最终 /login-state = stale「会话已中断（内核不再响应）」
+       根因：登录进程是**短命进程**，跑完就退出；它上报的 pid 当然已死，
+       于是下面这段「pid 死了就写墓碑并把 port 置 null」每次都命中 ——
+       而补端口/判活恰恰依赖 browser.json 的 port，形成自毁。
+       修法：只有**看课任务**（真正 spawn 并拥有内核的那种）退出才做墓碑收尾；
+       登录/预检/读课程等短命进程一律不动 browser.json。 */
+    const ownsBrowser = isWatchRun(args)
     try {
       const b = readBrowserState()
-      if (b && b.alive === true) {
+      if (b && b.alive === true && ownsBrowser) {
         const pidAlive = Number(b.pid) > 0 && isPidAlive(Number(b.pid))
         if (!pidAlive) {
           const p = join(PLUGIN_DIR, 'engine', '.state', 'browser.json')

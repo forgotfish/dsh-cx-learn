@@ -99,6 +99,7 @@ const CONFIG = {
   /* 安全停止 */
   safety: {
     maxConsecutiveFailures: 3,        // 连续 N 次无法识别/关键失败 → 停止并输出诊断
+    maxVideoConfirmTicks: 1200,       // 多视频节「已起播、等平台记账」的等待上限（D-056，防无限空等）
     maxLoadRetries: 6,                // 切节后等待新页面加载的探测次数
     maxNoVideoWaitTicks: 4,           // 新节迟迟无视频的等待轮数，超过按非视频任务点跳过
     maxRuntimeMs: 12 * 60 * 60 * 1000, // 单次运行时长兜底（12 小时，覆盖看完一整门课）
