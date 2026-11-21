@@ -243,6 +243,10 @@ class LearnMachine {
       }
       this._lastInventory = { tasks: allTasks, at: Date.now() };
       this._lastVideos = allVideos;
+      /* ★ 2026-11-21（真探针契约）：把汇总结果也挂到 state 上。
+         过去只赋 _lastVideos，从没赋 st.videos —— 而验证兜底 / 诊断快照都在读
+         st.videos / st2.videos，于是永远读到 undefined（诊断里 videos 恒为 []）。 */
+      st.videos = allVideos;
     }
     for (const f of probes) {
       for (const d of f.probe.dialogs || []) {
@@ -2744,18 +2748,30 @@ class LearnMachine {
           const raw = await this.adapter.evalInFrame(frameId, `(() => {
             const v = document.querySelector('video');
             if (!v) return '';
-            return JSON.stringify({ t: v.currentTime, dur: v.duration, paused: v.paused, rs: v.readyState });
+            const s = String(v.currentSrc || v.src || '');
+            const m = /[0-9a-fA-F]{32}/.exec(s);
+            return JSON.stringify({ t: v.currentTime, dur: v.duration, paused: v.paused, rs: v.readyState, oid: m ? m[0] : '' });
           })()`);
           try { frameHit = JSON.parse(raw); } catch (_) { frameHit = null; }
         } catch (_) { frameHit = null; }
       }
       if (frameHit) {
         last = frameHit;
-        const cur = Number(frameHit.t || 0);
-        if (frameHit.paused === false && (cur > 0 || (beforeTime >= 0 && cur - beforeTime > 0.5))) {
-          return { ok: true, note: 'playing(frame)' };
+        /* ★ 2026-11-21（堵「静默播错」盲区）：起播验证必须核对身份。
+           旧逻辑只要「这个 frame 里有东西在动」就判成功 —— 点了相邻/错的 iframe
+           也会「通过」。现在要求 frameHit 的 objectid 与目标一致（空 src 的视频除外）。 */
+        const hitOid = String(frameHit.oid || '').toLowerCase();
+        const wantOid = String(oid || '').toLowerCase();
+        const oidOk = !hitOid || !wantOid || hitOid === wantOid;
+        if (!oidOk) {
+          last = { paused: frameHit.paused, currentTime: frameHit.t, wrongOid: hitOid.slice(0, 12) };
+        } else {
+          const cur = Number(frameHit.t || 0);
+          if (frameHit.paused === false && (cur > 0 || (beforeTime >= 0 && cur - beforeTime > 0.5))) {
+            return { ok: true, note: 'playing(frame)' };
+          }
+          if (beforeTime >= 0 && cur - beforeTime > 0.5) return { ok: true, note: 'time-advanced(frame)' };
         }
-        if (beforeTime >= 0 && cur - beforeTime > 0.5) return { ok: true, note: 'time-advanced(frame)' };
       }
       let st2 = null;
       try { st2 = await this.gatherState(); } catch (_) { st2 = null; }
@@ -2776,7 +2792,9 @@ class LearnMachine {
       }
       if (beforeTime >= 0 && cur - beforeTime > 0.5) return { ok: true, note: 'time-advanced' };
     }
-    return { ok: false, note: last ? ('stuck paused=' + last.paused + ' t=' + Number(last.currentTime || last.t || 0)) : 'video-not-found' };
+    if (!last) return { ok: false, note: 'video-not-found' };
+    if (last.wrongOid) return { ok: false, note: 'wrong-video oid=' + last.wrongOid };
+    return { ok: false, note: 'stuck paused=' + last.paused + ' t=' + Number(last.currentTime || last.t || 0) };
   }
 
   /**

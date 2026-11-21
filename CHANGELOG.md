@@ -2,6 +2,38 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.2.5] — 2026-11-21
+
+### 修复
+
+- **视频身份层根因（真探针契约测试暴露）**：
+  - `videoState()` 从不返回 `objectid` → `_videoMatchesPending()` 永远匹配失败 →
+    多视频节 `st.video` 恒选 progress 最大的（即已播完的 video1），走不到「点第 2 个」。
+    修：`videoState()` 从 `currentSrc/src` 抽 32-hex 补 `objectid`。
+  - `gatherState()` 从不赋值 `st.videos` → `_verifyVideoStarted` 兜底与 `_dumpStuckVideos`
+    诊断读到的都是 `undefined`/`[]`。修：补 `st.videos = allVideos`。
+- **起播验证核对 objectid（堵「播错视频静默通过」）**：`_verifyVideoStarted` 旧逻辑只要
+  「该帧里有视频在动」就判成功，点了相邻/错的 iframe 也会通过。修：读该帧视频 objectid，
+  与目标不符判 `wrong-video` 失败（空 src 的仍放行）。
+- **内核崩溃恢复路径 ReferenceError**：`onUnexpectedClose` 里写成裸调用
+  `.then(() => _onCdpLost(kind))`，而它是 adapter 方法 → 触发即
+  `ReferenceError: _onCdpLost is not defined`，崩溃恢复完全失效。修：`this._onCdpLost(kind)`。
+
+### 新增
+
+- `engine/probe-contract.test.cjs`：在 vm 沙箱里执行**真实的** `PAGE_PROBE_SRC`/`videoState()`、
+  走**真实的** `gatherState()`，断言真探针字段契约（objectid / st.videos / st.video 归属），
+  并锁 `_verifyVideoStarted` 的 objectid 校验。
+- `engine/cdp-recovery.test.cjs`：锁崩溃恢复路径不再裸调用 `_onCdpLost`。
+- `scripts/release-guard.cjs` + `release-guard.test.cjs`：发布前校验
+  `package.json.version == CHANGELOG 顶部`，堵元数据静默漂移（曾出现 0.2.0/v0.2.3/0.2.4 三处不一致）。
+- `publish-public.cjs` 发布前先跑版本一致性守卫。
+
+### 说明
+
+- 全量 36 个 `*.test.cjs` 全绿，`--self-test` 通过。
+- 真机已验证（2.2）：两个视频均真实起播；本版进一步修正「谁才是当前视频」的身份判定。
+
 ## [0.2.4] — 2026-11-21
 
 ### 修复

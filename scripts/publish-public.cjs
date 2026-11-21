@@ -108,6 +108,17 @@ function syncPackageMeta(tmp) {
 }
 
 /* ---------------------------------------------------------------- main */
+/* ★ 2026-11-21：发布前先做版本一致性守卫（package.json vs CHANGELOG 顶部）。
+   防止「代码已发、元数据停在旧版本」的静默漂移（真实发生过 0.2.0/0.2.3/0.2.4 三处不一致）。 */
+{
+  let guard = null;
+  try { guard = require('./release-guard.cjs'); } catch (_) { guard = null; }
+  if (guard && typeof guard.checkRelease === 'function') {
+    const chk = guard.checkRelease(ROOT);
+    if (!chk.ok) die('发布前版本一致性校验失败：\n  - ' + chk.problems.join('\n  - '));
+    console.log('== 0. 版本一致性 OK v' + chk.version);
+  }
+}
 console.log('== 1. 准备临时目录');
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'cx-learn-pub-'));
 console.log('  ' + tmp);

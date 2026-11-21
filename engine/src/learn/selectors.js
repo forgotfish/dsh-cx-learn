@@ -381,6 +381,13 @@ const PAGE_PROBE_SRC = `(function () {
     } catch (e3) { /* ignore */ }
     var vErr = null;
     try { if (best.error) vErr = (best.error.code || '?') + ':' + (best.error.message || ''); } catch (e4) { /* ignore */ }
+    /* ★ 2026-11-21（真探针契约）：videoState() 必须带出 objectid。
+       _videoMatchesPending() 靠 video.objectid 把「当前视频」对齐到「未完成任务点」，
+       过去这里不返回 objectid → 恒匹配失败 → 多视频节 st.video 永远选 progress 最大的
+       那个（即已播完的 video1），永远走不到「点第 2 个」。 */
+    var vStateSrc = String(best.currentSrc || best.src || '');
+    var vStateM = /[0-9a-fA-F]{32}/.exec(vStateSrc);
+    var vStateOid = vStateM ? vStateM[0] : '';
     return {
       /* ended 必须同时满足 duration>0：duration=0 时浏览器给的 ended=true 是假的
          （元数据没加载，0>=0 恒成立）。见上方 prog 计算的说明。 */
@@ -389,6 +396,7 @@ const PAGE_PROBE_SRC = `(function () {
       progress: Math.round(prog * 10) / 10, muted: !!best.muted,
       readyState: best.readyState, networkState: best.networkState,
       buffered: buf, bufferedEnd: Math.round(bufEnd), error: vErr,
+      objectid: vStateOid,
       src: String(best.currentSrc || best.src || '').slice(0, 200)
     };
   }

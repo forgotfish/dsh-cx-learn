@@ -1,6 +1,6 @@
 {
   "name": "dsh-cx-learn",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "description": "DSH 插件：超星学习通自动看课 —— CDP 驱动真实 Chromium，支持扫码登录、断点续播、题目识别后暂停、章节连播",
   "keywords": [
     "dsh",

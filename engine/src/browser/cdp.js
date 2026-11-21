@@ -670,7 +670,7 @@ function createCdpAdapter(cfg) {
            uncaughtException 把进程打挂。这里把失败折叠成 fatalStop 语义 ——
            通过 _connLostError 交给下一次 send() 抛出，业务层的 try/catch 接得住。 */
         Promise.resolve()
-          .then(() => _onCdpLost(kind))
+          .then(() => this._onCdpLost(kind))
           .catch((e) => {
             _connLostError = e
             logger.error('PRECHECK', '内核恢复失败，已终止本次连接', {
