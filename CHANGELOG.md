@@ -2,6 +2,32 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.2.7] — 2026-11-22
+
+### 修复
+
+- **D-061 补强：滚动落位是异步的，`behavior:'instant'` + 引擎侧 450ms 重查（D-063）**
+  - 0.2.6 的 `scrollChainIntoView` 在 `scrollBy` 之后**立刻** `rectOf` 复测。若页面带
+    `scroll-behavior:smooth`，滚动是**动画**，两次 pass 都在落位前量 → 仍会恒定
+    `still-outside-viewport`。**这正是 D-048 记过的同一类病**（滚动异步，滚完不能立刻量），
+    0.2.6 复发了。
+  - 修①：页面侧改为 `topWin.scrollBy({left, top, behavior:'instant'})`（老内核回退数字形式）。
+  - 修②：引擎侧 `clickFound` 在拿到 `hit-test-blocked` / `still-outside-viewport` 后
+    **等 450ms 重查一次**再判失败/降级（只重查一次，不循环）——把 D-048 的「等一拍」放到
+    真正能 `await` 的层。
+
+### 新增
+
+- `engine/scroll-chaos.test.cjs`（20 项**破坏性**测试）：smooth 动画未完成 / 顶层 scrollBy 抛错 /
+  跨域取不到坐标 / 视口 0×0 / 容器滚不动 / 已居中 / 异步落位重查 / 持续出界有界失败。
+  其中 smooth 场景若不用 `instant` 必红——这条当场抓出了 0.2.6 的缺陷。
+
+### 说明
+
+- 全量 **37 个 `*.test.cjs` 全绿**，`--self-test` 通过。
+- 破坏测试同时抓到一处回归：改为对象形式 `scrollBy` 后旧 `probe-contract §4` 的 fake 只接数字参数，
+  已同步修正（这正是破坏测试的价值）。
+- **仍需复测者在真实环境确认**（本地账号无「长 iframe + 可滚动 PDF 前置」章节）。
 ## [0.2.6] — 2026-11-22
 
 ### 修复
@@ -311,4 +337,5 @@
 - 结构化日志、优雅停止、拟人化延迟。
 - 零 npm 依赖的 MCP stdio server（`cx_learn` / `cx_login`）。
 - DSH 插件形态：设置页 UI、进程生命周期管理、HTTP 接口。
+
 

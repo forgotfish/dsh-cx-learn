@@ -184,7 +184,7 @@ function fakeVideo(over) {
     const topWin = {
       innerHeight: 802, innerWidth: 1344,
       get top() { return topWin; }, get parent() { return topWin; },
-      scrollBy(dx, dy) { state.scrollByCalls += 1; state.scroll += dy; },
+      scrollBy(a, b) { state.scrollByCalls += 1; state.scroll += (typeof a === 'object' && a) ? (a.top || 0) : (b || 0); },
     };
     const cardsWin = {
       innerHeight: 3302, innerWidth: 1344, frameElement: cardsFrameEl,
@@ -218,4 +218,5 @@ function fakeVideo(over) {
   }
   console.log('== 全部通过（' + pass + ' 项）==');
 })().catch((e) => { console.error('FATAL', e && e.stack || e); process.exit(2); });
+
 

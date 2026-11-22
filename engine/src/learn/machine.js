@@ -309,11 +309,31 @@ class LearnMachine {
 
   /** 点击前实时解析元素 + 拟人化延迟 + 真实输入事件；失败降级 JS click（WARN） */
   async clickFound(frameId, kind, arg) {
+    const evalFind = () => this.adapter.evalInFrame(
+      frameId, '__cx.find(' + JSON.stringify(kind) + ',' + JSON.stringify(arg === undefined ? null : arg) + ')'
+    );
     let found;
     try {
-      found = await this.adapter.evalInFrame(frameId, '__cx.find(' + JSON.stringify(kind) + ',' + JSON.stringify(arg === undefined ? null : arg) + ')');
+      found = await evalFind();
     } catch (e) {
       return { ok: false, reason: 'find-eval-error: ' + String((e && e.message) || e).slice(0, 80) };
+    }
+    /* ★ 2026-11-22（D-048 教训复用）：滚动是**异步**的。页面探针里滚完只能立刻量一次，
+       真实的滚动落位（尤其 smooth / 布局重排）常常晚一拍。这里在页面侧滚过之后，
+       等 450ms 再查一次；仍失败才判失败/降级。只重查一次，不循环。 */
+    if (found && !found.ok && /^(hit-test-blocked|still-outside-viewport)$/.test(String(found.reason || ''))) {
+      await sleep(450);
+      try {
+        const again = await evalFind();
+        if (again && again.ok) {
+          logger.info('CLICK', '滚动后重查命中（异步滚动已落位）', {
+            kind, firstReason: found.reason, note: again.note || null,
+          });
+          found = again;
+        } else if (again) {
+          found = again;
+        }
+      } catch (_) { /* 重查失败保持原结果 */ }
     }
     if (!found || !found.ok) {
       /* ★ D-055：videoToggle 绝不降级 el.click()。

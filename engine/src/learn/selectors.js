@@ -320,8 +320,14 @@ const PAGE_PROBE_SRC = `(function () {
         var dy = (r.y + r.h / 2) - vh / 2;
         var dx = (r.x + r.w / 2) - vw / 2;
         if (Math.abs(dy) < 2 && Math.abs(dx) < 2) break;
-        try { topWin.scrollBy(dx, dy); }
-        catch (e6) { try { window.scrollBy(dx, dy); } catch (e7) {} break; }
+        /* ★ 必须 behavior:'instant' —— 页面可能带 scroll-behavior:smooth，
+           平滑滚动是**动画**，紧接着 rectOf 读到的还是旧位置，2 次 pass 都收不住。
+           （同 D-048 教训：滚动是异步的，不能滚完立刻量。） */
+        try { topWin.scrollBy({ left: dx, top: dy, behavior: 'instant' }); }
+        catch (e6a) {
+          try { topWin.scrollBy(dx, dy); }            /* 老内核不支持对象形式 */
+          catch (e6) { try { window.scrollBy(dx, dy); } catch (e7) {} break; }
+        }
       }
     } catch (e8) { /* ignore */ }
   }
