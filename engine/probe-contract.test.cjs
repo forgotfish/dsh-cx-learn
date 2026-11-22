@@ -168,6 +168,48 @@ function fakeVideo(over) {
     ok(rGood.ok === true, '★ 目标视频在动 → 成功（实际 ' + JSON.stringify(rGood) + '）');
   }
 
+  /* ---------- 4. scrollChainIntoView：iframe 比视口高时，按绝对坐标滚最外层文档 ---------- */
+  /* 真机量（复测者）：视口 802；knowledge/cards iframe 高 3302（> 视口，自身不滚）；
+     视频元素在 cards 内 top≈1409，cards 顶边在 -1250 → 绝对 y≈159~1401。
+     「滚 iframe 元素本身进视口」无法保证 iframe **内部**目标可见 ⇒ 必须按绝对坐标滚 top。 */
+  console.log('== 4. scrollChainIntoView：绝对坐标滚最外层（iframe 高于视口）==');
+  {
+    const state = { scroll: 0, scrollByCalls: 0 };
+    const el = {
+      getBoundingClientRect() { return { x: 492, y: 0, width: 60, height: 60 }; },
+      scrollIntoView() { /* no-op */ },
+    };
+    const videoFrameEl = { getBoundingClientRect() { return { x: 0, y: 1250, width: 844, height: 3302 }; }, scrollIntoView() { } };
+    const cardsFrameEl = { getBoundingClientRect() { return { x: 0, y: 151 - state.scroll, width: 1344, height: 3302 }; }, scrollIntoView() { } };
+    const topWin = {
+      innerHeight: 802, innerWidth: 1344,
+      get top() { return topWin; }, get parent() { return topWin; },
+      scrollBy(dx, dy) { state.scrollByCalls += 1; state.scroll += dy; },
+    };
+    const cardsWin = {
+      innerHeight: 3302, innerWidth: 1344, frameElement: cardsFrameEl,
+      get top() { return topWin; }, get parent() { return topWin; }, scrollBy() { },
+    };
+    const videoWin = {
+      innerHeight: 474, innerWidth: 844, frameElement: videoFrameEl, document: { querySelectorAll() { return []; } },
+      get top() { return topWin; }, get parent() { return cardsWin; }, scrollBy() { },
+    };
+    // sandbox = videoWin 自身，且 window 自引用
+    videoWin.window = videoWin;
+    videoWin.__CX_SEL = sel.SELECTORS;
+    videoWin.__CX_KWS = []; videoWin.__CX_PATTERN = 'x';
+    const vm2 = require('node:vm');
+    vm2.createContext(videoWin);
+    vm2.runInContext(sel.PAGE_PROBE_SRC, videoWin, { filename: 'PAGE_PROBE_SRC.js' });
+    // 初始绝对 y = 0 + 1250 + 151 = 1401（远在 802 视口外）
+    videoWin.__cx._scrollChain(el);
+    // 目标：中心落到视口中心 401 → scroll ≈ 1401+30-401 = 1030
+    const absCenter = 0 + 1250 + (151 - state.scroll) + 30;
+    ok(state.scrollByCalls >= 1, '★ 触发了最外层 scrollBy（实际调用 ' + state.scrollByCalls + ' 次）');
+    ok(Math.abs(state.scroll - 1030) <= 5, '★ 滚动量≈1030（实际 ' + state.scroll + '）');
+    ok(Math.abs(absCenter - 401) <= 5, '★ 目标中心落到视口中心 401（实际 ' + absCenter + '）');
+  }
+
   console.log('');
   if (fails.length) {
     console.log('== 失败 ' + fails.length + ' 项（这些就是当前模式发现不了的契约缺陷）==');
@@ -176,3 +218,4 @@ function fakeVideo(over) {
   }
   console.log('== 全部通过（' + pass + ' 项）==');
 })().catch((e) => { console.error('FATAL', e && e.stack || e); process.exit(2); });
+

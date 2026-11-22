@@ -2,6 +2,31 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.2.6] — 2026-11-22
+
+### 修复
+
+- **「still-outside-viewport 恒失败」（D-061，复测反馈）**：当一节的靠前任务点是可滚动 PDF 阅读器时，
+  后面的视频被压在下方；`knowledge/cards` iframe 高 3302 > 浏览器视口 802，它自身不滚、
+  只能被外层 `studentstudy` 滚。旧实现只在元素自己那层文档 `scrollIntoView`（滚不动父级），
+  且「把整个 iframe 元素滚进视口」也不保证 iframe **内部**目标可见 → 恒定出界 → 3 次失败后
+  `UNRECOGNIZED_PAGE`。
+  修：`scrollChainIntoView` 增加「用绝对坐标直接滚最外层文档」——`rectOf` 已累加整条 frameElement 链
+  （含各层实时滚动），据此 `window.top.scrollBy` 把目标中心对到视口中心，迭代 2 次。
+  不用滚轮/拖拽（指针落在可滚动子容器上会被吃掉）。探针 version 8→9。
+- **失败日志吞掉 reason（D-062）**：`恢复播放失败（未找到播放控件）` 原来只打 `{layer: r.layer||0}`，
+  失败分支没有 layer 字段恒输出 0，真正的 reason 被吞，外部无法定位。现在打印 `reason/note/rect`；
+  同时 `clickFound` 对 `videoToggle` 失败会回传 `note`/`rect`。
+
+### 新增
+
+- `probe-contract.test.cjs` §4：滚动数学单测——模拟「iframe 高 3302 > 视口 802」，
+  断言 `scrollBy` 位移≈1030、目标中心落到视口中心 401。
+
+### 说明
+
+- 全量 36 个 `*.test.cjs` 全绿。
+- **尚未真机验证**：本次修复依据复测者的实测数据与原理解析，需对方在真实环境复测确认。
 ## [0.2.5] — 2026-11-21
 
 ### 修复
@@ -286,3 +311,4 @@
 - 结构化日志、优雅停止、拟人化延迟。
 - 零 npm 依赖的 MCP stdio server（`cx_learn` / `cx_login`）。
 - DSH 插件形态：设置页 UI、进程生命周期管理、HTTP 接口。
+

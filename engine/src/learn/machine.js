@@ -321,7 +321,12 @@ class LearnMachine {
          el.click() 根本不会触发起播（vjs 播放要真实指针事件），降级=掩盖失败。
          多视频第 2 个视频起不来那次真机事故就是这里偷偷降级造成的。 */
       if (kind === 'videoToggle') {
-        return { ok: false, reason: (found && found.reason) || 'find-null' };
+        return {
+          ok: false,
+          reason: (found && found.reason) || 'find-null',
+          note: (found && found.note) || null,
+          rect: (found && found.rect) || null,
+        };
       }
       if (found && found.jsFallback) {
         logger.warn('CLICK', 'WARN 跨域 frame 无法计算全局坐标，降级为页内 JS click', { kind, layer: 3 });
@@ -743,7 +748,15 @@ class LearnMachine {
           }
           return { progress: true, outcome: 'RESUME_PENDING' };
         }
-        logger.warn('PLAYING_CHECK', '恢复播放失败（未找到播放控件）', { layer: r.layer || 0 });
+        /* ★ 2026-11-22：失败分支原来只打 {layer: r.layer || 0}，把真正的 reason 吞了
+           （失败时 r 没有 layer 字段，恒定输出 0），外部无法定位是命中失败/视口外/跨域。
+           这里把 reason / note / rect 一并打出来。 */
+        logger.warn('PLAYING_CHECK', '恢复播放失败（未找到播放控件）', {
+          layer: r && r.layer != null ? r.layer : null,
+          reason: (r && r.reason) || null,
+          note: (r && r.note) || null,
+          rect: (r && r.rect) || null,
+        });
         this.failures += 1;
         return { progress: false, outcome: 'RESUME_FAIL' };
       }

@@ -18,7 +18,7 @@
  * 解析元素（避免矩形过期）。iframe 递归遍历由 CDP frame 树 + 逐帧求值完成。
  * ==========================================================================*/
 const SELECTORS = {
-  version: 8,
+  version: 9,
   /* 目录节点候选（第二层结构特征）
      ★★★ 2026-10-30 实测：**同一个课程存在两套目录页**，两套都要能读：
        A) mooc2-ans/mycourse/studentcourse  → 新版 **.chapter_item**（85 个）
@@ -287,8 +287,10 @@ const PAGE_PROBE_SRC = `(function () {
    * 于是元素在顶层视口里仍可能落在视野外 → 命中测试失败 → 无法真实鼠标点击。
    * 同源时 frameElement 可跨层级取，逐层 scrollIntoView 即可把整条链路滚进视口。 */
   function scrollChainIntoView(el) {
+    /* ① 元素自己那层文档（同文档小窗口）。 */
     try { el.scrollIntoView({ block: 'center', inline: 'nearest' }); }
     catch (e) { try { el.scrollIntoView(); } catch (e2) {} }
+    /* ② 沿 frame 链把每层 iframe 元素滚进它的父文档（处理中间层自身可滚的情况）。 */
     try {
       var win = window;
       var guard = 0;
@@ -300,6 +302,28 @@ const PAGE_PROBE_SRC = `(function () {
         win = win.parent;
       }
     } catch (e5) { /* 跨域：只滚得了自己那层，交给上层判定 */ }
+    /* ③ ★ 2026-11-22 修「still-outside-viewport 恒失败」：
+       实测量：knowledge/cards iframe 高 3302 > 浏览器视口 802。
+       ② 把「整个 iframe 元素」滚进视口，并不保证 iframe **内部**这个元素可见
+       （iframe 比视口高时浏览器只能对齐它的一条边，内部目标可能在 1400px 外）。
+       正解：用绝对坐标（rectOf 已把 frameElement 链的偏移全部累加，含各层实时滚动）
+       直接滚**最外层文档**，把目标中心对到视口中心。
+       也不能用滚轮/拖拽——指针落在阅读材料这类可滚动子容器上时滚动会被它吃掉。 */
+    try {
+      for (var pass = 0; pass < 2; pass++) {
+        var r = rectOf(el);
+        if (r.cross) break;                       /* 跨域拿不到绝对坐标，交给上层 */
+        var topWin = window.top;
+        var vh = topWin.innerHeight || 0;
+        var vw = topWin.innerWidth || 0;
+        if (!vh || !vw) break;
+        var dy = (r.y + r.h / 2) - vh / 2;
+        var dx = (r.x + r.w / 2) - vw / 2;
+        if (Math.abs(dy) < 2 && Math.abs(dx) < 2) break;
+        try { topWin.scrollBy(dx, dy); }
+        catch (e6) { try { window.scrollBy(dx, dy); } catch (e7) {} break; }
+      }
+    } catch (e8) { /* ignore */ }
   }
 
   /* ---- 坐标系说明（引擎侧实现，页面探针不做换算）----
@@ -1242,6 +1266,7 @@ const PAGE_PROBE_SRC = `(function () {
       };
     },
     videoState: videoState,
+    _scrollChain: scrollChainIntoView,   /* 仅测试用：暴露给单测，业务不依赖 */
     find: function (kind, arg) {
       var r = resolve(kind, arg);
       if (!r) return { ok: false, reason: 'not-found' };
@@ -1288,8 +1313,8 @@ const PAGE_PROBE_SRC = `(function () {
         scrolled = true;
         hit = hitOk();
       }
-      if (!hit) return { ok: false, reason: 'hit-test-blocked', note: r.note };
-      if (outside(rect)) return { ok: false, reason: 'still-outside-viewport', note: r.note };
+      if (!hit) return { ok: false, reason: 'hit-test-blocked', note: r.note, rect: rect };
+      if (outside(rect)) return { ok: false, reason: 'still-outside-viewport', note: r.note, rect: rect, vw: vw, vh: vh };
       return { ok: true, text: norm(r.el.innerText || r.el.value || '').slice(0, 60), rect: rect, layer: r.layer, note: r.note + (scrolled ? '+scrolled' : ''), scrolled: scrolled };
     },
     jsClick: function (kind, arg) {
@@ -1316,3 +1341,4 @@ module.exports = {
   PAGE_PROBE_SRC,
   installProbeExpression
 };
+
