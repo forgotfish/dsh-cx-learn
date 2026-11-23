@@ -82,9 +82,17 @@ const SELECTORS = {
      和课程目录是两套结构，不能混。实测旧版页面：
        <ul class="prev_ul"> <li title="视频" ...>1视频</li> <li title="章节测验">2章节测验</li>
      注意 title 是「章节测验」，li 的可见文本是「2章节测验」——两者都要能命中。 */
-  quizTabSel: '.prev_ul li',
-  quizTabText: ['章节测验', '章测', '单元测验', '章节练习', '随堂测'],
+  quizTabSel: '.prev_ul li',  quizTabText: ['章节测验', '章测', '单元测验', '章节练习', '随堂测'],
   videoTabText: ['视频', '视频课', '课程视频'],
+  /* ★ 2026-11-22（D-064）：一节多「知识卡片」的区域切换条。
+     ★ 与上面的 quizTabSel 同名 ul.prev_ul，但**是两个不同实例**（章内子任务 vs 知识卡片区），
+     所以不能只用 '.prev_ul li' —— 必须再按「onclick 含 changeDisplayContent」+「有 cardid」鉴别，
+     否则会误点「章节测验」。实测 DOM（复测者提供）：
+       <ul class="prev_ul clearfix"><li title="教学课件" cardid="1287449845"
+           onclick="changeDisplayContent(2,4,'1279561397','268926591','159071200','');" id="dct2">
+           <div class="prev_white"><span class="num">2</span><span class="spanText">教学课件</span></div></li></ul>
+     序号 1-based；num = seq-1；总数 = onclick 第 2 个参数（也等于 li 个数）。 */
+  cardsTabSel: '.prev_ul li',
   /* 旧版完成标记 */
   doneText: ['已完成', '已完成学习'],
   doneClass: ['icon_Completed', 'bntDone', 'done', 'finish', 'finished', 'complete'],
@@ -655,6 +663,42 @@ const PAGE_PROBE_SRC = `(function () {
     return q2;
   }
 
+  /* ---- 知识卡片区清单（D-064）----
+     只取「onclick 含 changeDisplayContent 且带 cardid」的 li（避开同名的章内子任务 ul.prev_ul）。
+     返回 {ok, total, cards:[{i, seq, num, total, cardid, title}]}：
+       i     = 过滤后的 0-based 下标（用于点击定位）
+       seq   = 1-based 序号（onclick 第 1 参数，或 id="dctN"）
+       num   = seq-1（超星 knowledge/cards 的 num 参数）
+       total = onclick 第 2 参数（卡片总数）
+     单卡片节（total==1）是**常态**（复测者实测 6 节里 4 节只有 1 张卡），不是异常。 */
+  function cardsInfo() {
+    var out = [];
+    try {
+      var lis = document.querySelectorAll(S.cardsTabSel);
+      for (var i = 0; i < lis.length; i++) {
+        var li = lis[i];
+        var oc = String((li.getAttribute && li.getAttribute('onclick')) || '');
+        if (oc.indexOf('changeDisplayContent') < 0) continue;
+        var cid = (li.getAttribute && li.getAttribute('cardid')) || '';
+        if (!cid) continue;
+        var m = /changeDisplayContent\\s*\\(\\s*(\\d+)\\s*,\\s*(\\d+)/.exec(oc);
+        var seq = m ? Number(m[1]) : out.length + 1;
+        var total = m ? Number(m[2]) : lis.length;
+        var tEl = null;
+        try { tEl = li.querySelector('.spanText'); } catch (e1) { tEl = null; }
+        out.push({
+          i: out.length,
+          seq: seq,
+          num: seq - 1,
+          total: total,
+          cardid: String(cid),
+          title: norm(tEl ? tEl.innerText : li.innerText).slice(0, 20),
+        });
+      }
+    } catch (e2) { /* ignore */ }
+    return { ok: true, total: out.length, cards: out };
+  }
+
   /* ---- 章内「章节测验」入口（学习通 .prev_ul li）----
      课程页里「1视频 / 2章节测验」是章内子任务标签，点「章节测验」才会把题目
      加载到 popFrameId iframe（平时是 about:blank 空页）。 */
@@ -914,6 +958,24 @@ const PAGE_PROBE_SRC = `(function () {
 
   /* ---- 统一解析：kind → 元素（find / jsClick 复用；点击前实时解析防矩形过期）---- */
   function resolve(kind, arg) {
+    /* ★ D-064：知识卡片区切换条目（与章内子任务同名 ul.prev_ul，靠 onclick/cardid 鉴别） */
+    if (kind === 'cardsTab') {
+      var wantIdx = (arg && typeof arg.index === 'number') ? arg.index : 0;
+      var pool = [];
+      try {
+        var lisC = document.querySelectorAll(S.cardsTabSel);
+        for (var ci = 0; ci < lisC.length; ci++) {
+          var liC = lisC[ci];
+          var ocC = String((liC.getAttribute && liC.getAttribute('onclick')) || '');
+          if (ocC.indexOf('changeDisplayContent') < 0) continue;
+          if (!((liC.getAttribute && liC.getAttribute('cardid')) || '')) continue;
+          if (!visible(liC)) continue;
+          pool.push(liC);
+        }
+      } catch (eC) { pool = []; }
+      if (wantIdx < 0 || wantIdx >= pool.length) return null;
+      return { el: pool[wantIdx], layer: 1, note: 'cardsTab#' + wantIdx };
+    }
     if (kind === 'videoToggle') {
       /* ★ 2026-11-18（D-039，Issue #1 复测）：必须能**按目标**点播放器。
          以前固定 querySelector('video') → 永远点第一个；
@@ -1272,6 +1334,7 @@ const PAGE_PROBE_SRC = `(function () {
       };
     },
     videoState: videoState,
+    cardsInfo: cardsInfo,   /* D-064：知识卡片区清单 */
     _scrollChain: scrollChainIntoView,   /* 仅测试用：暴露给单测，业务不依赖 */
     find: function (kind, arg) {
       var r = resolve(kind, arg);
@@ -1347,4 +1410,7 @@ module.exports = {
   PAGE_PROBE_SRC,
   installProbeExpression
 };
+
+
+
 

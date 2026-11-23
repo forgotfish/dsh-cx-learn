@@ -519,20 +519,40 @@ class LearnMachine {
        安全性：_videoTaskDone 只看 video/audio 任务点，绝不看章节测验，
        也绝不点任何选项。整节完成（含测验）走 _currentSectionDone 那条。 */
     if (!this._quizTabOpened) {
+      /* ★ D-064：先确保本节所有知识卡片都被扫描过（必要时切卡）。
+         切了卡 → 本拍直接返回 progress（新卡片的任务点/播放器要等下一拍重新 gatherState）。 */
+      try {
+        const cardStep = await this._ensureCardsScanned(st);
+        if (cardStep) return cardStep;
+      } catch (e) {
+        logger.warn('ADVANCE', '知识卡片扫描异常（不影响主流程）', { err: String((e && e.message) || e).slice(0, 120) });
+      }
       const doneNow = this._currentSectionDone(st)
         ? { ok: true, by: 'toc-section-done' }
         : this._videoTaskDone(st);
       if (doneNow.ok) {
-        logger.info('ADVANCE', '本节视频任务已完成（测验按策略跳过），直接切下一节', {
-          title: this._currentTitle,
-          progress: (st.video && st.video.progress) || 0,
-          by: doneNow.by,
-          unfinish: doneNow.unfinish,
-          total: doneNow.total,
-        });
-        this.counters.sectionsSkipped += 1;
-        this.failures = 0;
-        return this.advanceSection(st);
+        /* ★ D-064：本节可能是「多个知识卡片」。当前挂载那张卡片的 media 全绿
+           **不等于**本节读完 —— 其余卡片还没扫/还没播。这里用「卡片并集」拦截：
+             · 返回 false → 明确还有卡没播完：不许切节，继续走后面的卡片扫描/播放
+             · 返回 null  → 无法判定（老页面/单卡）→ 按旧逻辑切节 */
+        let unionDone = null;
+        try { unionDone = this._cardsUnionDone(st); } catch (_) { unionDone = null; }
+        if (unionDone === false) {
+          logger.info('ADVANCE', '当前卡片已播完，但本节还有其他知识卡片未完成，先不切节', {
+            title: this._currentTitle, cards: this._cardScan ? this._cardScan.size : 0,
+          });
+        } else {
+          logger.info('ADVANCE', '本节视频任务已完成（测验按策略跳过），直接切下一节', {
+            title: this._currentTitle,
+            progress: (st.video && st.video.progress) || 0,
+            by: doneNow.by,
+            unfinish: doneNow.unfinish,
+            total: doneNow.total,
+          });
+          this.counters.sectionsSkipped += 1;
+          this.failures = 0;
+          return this.advanceSection(st);
+        }
       }
     }
 
@@ -714,6 +734,16 @@ class LearnMachine {
         if (quizDone === 'pending') return { progress: true, outcome: 'CHAPTER_QUIZ_PENDING' };
         /* ★ 2026-11-15（Issue #1）：本节所有视频任务点都播过了，才真正算「完成一节」。
            计数挪到真切节之前（以前写在播完那一刻，任务点没播也 +1，上报虚高）。 */
+        /* ★ D-064：当前挂载卡片的视频播完 ≠ 本节读完。多卡片节用「并集」再拦一道：
+           还有卡片没播完 → 不切节，按「等平台记账」处理（run.js 已豁免，不会误判无进展）。 */
+        let unionDone2 = null;
+        try { unionDone2 = this._cardsUnionDone(st); } catch (_) { unionDone2 = null; }
+        if (unionDone2 === false) {
+          logger.info('ADVANCE', '本节仍有其他知识卡片未完成，暂不切节', {
+            title: this._currentTitle, cards: this._cardScan ? this._cardScan.size : 0,
+          });
+          return { progress: false, outcome: 'WAIT_VIDEO_CONFIRM' };
+        }
         this.counters.sectionsCompleted += 1;
         return this.advanceSection(st);
       }
@@ -2208,6 +2238,140 @@ class LearnMachine {
     } catch (_) { return EMPTY; }
   }
 
+  /* ==========================================================================
+   * D-064：一节多「知识卡片」（knowledge/cards?...&num=0/1/...）
+   *
+   * 真机事实（复测者实测，跨 6 节）：
+   *   · 切换条在最外层 studentstudy 文档：ul.prev_ul > li[cardid][onclick=changeDisplayContent(seq,total,...)]
+   *     —— 与「章内子任务」的 ul.prev_ul 同名不同实例，必须按 onclick+cardid 鉴别。
+   *   · 单卡节是**常态**（6 节里 4 节只有 1 张卡）；单卡 ≠ 单任务点（有节单卡 4 个任务点）。
+   *   · 切卡后 **cards frame id 不变**，只有它下面的**子 frame** 全死（一次 16 个 frameDetached）。
+   *     → 不能缓存子 frameId；gatherState 每 tick 重新枚举 frame 树，天然刷新，别自己缓存。
+   *   · 任务点可读时机：155ms 新 frame navigated、883ms 任务点可读（.ans-attach-ct 5→7）。
+   *     → 轮询「cards frame 里 .ans-attach-ct > 0」，上限 5s，不用固定 sleep。
+   * ========================================================================== */
+
+  /** 外层（studentstudy）frame id —— 卡片切换条在这里。 */
+  _topFrameId(st) {
+    const fr = (st && Array.isArray(st.frames)) ? st.frames : [];
+    const t = fr.find((f) => f && f.isTop) || fr[0];
+    return t ? t.frameId : null;
+  }
+
+  /** knowledge/cards frame id + 当前 num（从 URL 取）。 */
+  _cardsFrameInfo(st) {
+    const fr = (st && Array.isArray(st.frames)) ? st.frames : [];
+    for (const f of fr) {
+      const u = String((f && f.url) || '');
+      if (!/knowledge\/cards/i.test(u)) continue;
+      const m = /[?&]num=(\d+)/i.exec(u);
+      return { frameId: f.frameId, num: m ? Number(m[1]) : null, url: u };
+    }
+    return null;
+  }
+
+  /** 读卡片清单（外层文档）。 */
+  async _readCardsInfo(st) {
+    const fid = this._topFrameId(st);
+    if (!fid) return { ok: false, total: 0, cards: [] };
+    let r = null;
+    try { r = await this.adapter.evalInFrame(fid, '__cx && __cx.cardsInfo ? __cx.cardsInfo() : {ok:false}'); }
+    catch (_) { r = null; }
+    if (!r || !r.ok || !Array.isArray(r.cards)) return { ok: false, total: 0, cards: [] };
+    return r;
+  }
+
+  /** 轮询等「cards frame 里出现任务点」，返回是否就绪。 */
+  async _waitCardsTasksReady(cardsFrameId, maxMs) {
+    if (!cardsFrameId) return false;
+    const deadline = Date.now() + (Number(maxMs) > 0 ? Number(maxMs) : 5000);
+    while (Date.now() < deadline) {
+      let n = 0;
+      try {
+        n = Number(await this.adapter.evalInFrame(
+          cardsFrameId, 'document.querySelectorAll(".ans-attach-ct").length'
+        )) || 0;
+      } catch (_) { n = 0; }
+      if (n > 0) return true;
+      await sleep(250);
+    }
+    return false;
+  }
+
+  /**
+   * 逐卡扫描 + 必要时切卡。返回非 null 时表示「本拍做了切卡动作」，调用方直接返回该 step。
+   * 单卡节（total<=1）不切卡，只记录一次扫描结果后返回 null（优雅退化）。
+   */
+  async _ensureCardsScanned(st) {
+    const cur = this._currentTocItem(st);
+    const secKey = String((cur && cur.chapterId) || '');
+    if (!secKey) return null;
+
+    const info = await this._readCardsInfo(st);
+    if (!info.ok || !info.cards.length) return null;      // 页面没有卡片条（老页面）→ 不介入
+
+    const cf = this._cardsFrameInfo(st);
+    const curNum = cf && cf.num != null ? cf.num : null;
+
+    if (this._cardScanKey !== secKey) {
+      this._cardScanKey = secKey;
+      this._cardScan = new Map();       // cardid -> { media, finished }
+      this._cardSwitchCount = 0;
+    }
+    if (!(this._cardScan instanceof Map)) this._cardScan = new Map();
+
+    /* 记录「当前挂载那张卡」的 media 统计（任务点按 knowledgeid 无法区分卡片，只能按当前挂载算） */
+    const pvNow = this._sectionPendingVideos(st);
+    if (curNum != null) {
+      const curCard = info.cards.find((c) => Number(c.num) === Number(curNum));
+      if (curCard && pvNow && pvNow.ok) {
+        this._cardScan.set(String(curCard.cardid), { media: Number(pvNow.total) || 0, finished: Number(pvNow.finished) || 0 });
+      }
+    }
+
+    if (info.cards.length <= 1) return null;              // 单卡：退化，不切
+
+    /* 找一张还没扫过的卡（按 cardid 记账，比 num 稳） */
+    const next = info.cards.find((c) => !this._cardScan.has(String(c.cardid)));
+    if (!next) return null;
+
+    /* 播放中途不切卡（会打断正在播的视频）*/
+    if (st.video && st.video.found && !st.video.paused && !st.video.ended) return null;
+
+    const topId = this._topFrameId(st);
+    if (!topId) return null;
+    const r = await this.clickFound(topId, 'cardsTab', { index: next.i });
+    if (!r || !r.ok) {
+      logger.warn('ADVANCE', '切换知识卡片失败，跳过该卡', {
+        title: next.title, cardid: String(next.cardid).slice(0, 16), reason: (r && r.reason) || null,
+      });
+      /* 记成「未知」避免同一张卡反复重试死循环；media 记 0 视为无媒体 */
+      this._cardScan.set(String(next.cardid), { media: 0, finished: 0, failed: true });
+      return null;
+    }
+    this._cardSwitchCount = (this._cardSwitchCount || 0) + 1;
+    logger.info('ADVANCE', '已切换到知识卡片', {
+      title: next.title, num: next.num, total: info.cards.length, cardid: String(next.cardid).slice(0, 16),
+    });
+    await this._waitCardsTasksReady(cf && cf.frameId, 5000);
+    return { progress: true, outcome: 'CARD_SWITCHED' };
+  }
+
+  /**
+   * 本节「所有卡片的 media 任务点是否都完成」。
+   * 返回 null = 无法判定（老页面/单卡/未扫完），调用方按旧逻辑处理；
+   * 返回 false = 明确还有卡片没播完 → 不许切节。
+   */
+  _cardsUnionDone(st) {
+    const info = this._cardScan;
+    if (!(info instanceof Map) || !info.size) return null;
+    for (const v of info.values()) {
+      if (v && v.failed) continue;                        // 切不过去的卡不算「有未完成」
+      if ((Number(v.media) || 0) > (Number(v.finished) || 0)) return false;
+    }
+    return true;
+  }
+
   /** 这个播放器是否对应「某个未完成的 media 任务点」（按 objectid 对齐，对不上就 false） */
   _videoMatchesPending(video, pv) {
     try {
@@ -3178,3 +3342,6 @@ module.exports = {
   NORMAL_STOP,
   LearnMachine
 };
+
+
+

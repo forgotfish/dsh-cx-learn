@@ -2,6 +2,41 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.2.8] — 2026-11-23
+
+### 新增
+
+- **一节多「知识卡片」支持（D-064，`knowledge/cards?...&num=0/1/…`）**
+  复测者实测：一节可能有 1–4 张「知识卡片」（视频区/教学课件/教案/其他），
+  原先只读当前挂载那张，导致「当前卡播完就切节」，其余卡的视频从未播放。
+  - **探针**：新增 `cardsInfo()` 与 `resolve('cardsTab')`。切换条是外层 `studentstudy`
+    文档里的 `ul.prev_ul > li[cardid][onclick=changeDisplayContent(seq,total,…)]`；
+    它和「章内子任务」（1视频/2章节测验）**同名 ul.prev_ul 但不同实例**，
+    所以只认「`onclick` 含 `changeDisplayContent` 且带 `cardid`」的 li，避免误点章节测验。
+  - **引擎**：`_ensureCardsScanned` 逐卡激活（真鼠标点外层 li）→ 轮询「cards frame 里
+    `.ans-attach-ct > 0`」（实测 155ms 换 frame、883ms 任务点可读；上限 5s，不用固定 sleep）。
+    单卡节（`total<=1`，实测 6 节里 4 节）**优雅退化、不切卡**；播放中途不切卡；
+    切卡失败只试一次并记 `failed`（不循环重试）。
+  - **并集判定**：`_cardsUnionDone` —— 本节**所有卡片**的 media 任务点全部 finished 才允许切节；
+    两处切节闸门（「视频任务已完成→切节」与 playedEnough 末尾）都加了拦截，
+    还有卡未完成时按「等平台记账」处理（`WAIT_VIDEO_CONFIRM`，run.js 已豁免不会误判无进展）。
+  - 已知：切卡后 **cards frame id 不变**，只有其**子 frame** 全死；本实现不缓存子 frameId，
+    `gatherState` 每拍重新枚举 frame 树，天然规避。
+
+### 修复（开发中自暴露）
+
+- `PAGE_PROBE_SRC` 是模板字面量，其中**正则可写单反斜杠会被吃掉**（`\d`→`d`）导致探针语法错误。
+  新代码统一双写（`\\d` / `\\s`）。`node --check` 查不出这类问题，只有真跑测试才会暴露。
+
+### 新增测试
+
+- `engine/cards-switch.test.cjs`（27 项）：选择器鉴别（不误点章节测验）/ 定位与越界 /
+  单卡退化 / 双卡切到未扫卡 / 播放中不切 / 切卡失败只试一次不循环 / 并集判定 5 种情形。
+
+### 说明
+
+- 全量 **38 个 `*.test.cjs` 全绿**，`--self-test` 通过。
+- **尚未真机验证**：本地账号无「多卡片（num>0）」章节，需复测者按其实测几何与时机确认。
 ## [0.2.7] — 2026-11-22
 
 ### 修复
@@ -337,5 +372,6 @@
 - 结构化日志、优雅停止、拟人化延迟。
 - 零 npm 依赖的 MCP stdio server（`cx_learn` / `cx_login`）。
 - DSH 插件形态：设置页 UI、进程生命周期管理、HTTP 接口。
+
 
 
