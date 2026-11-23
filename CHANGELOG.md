@@ -2,6 +2,88 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.3.0] — 2026-11-23
+
+> **工程基线版（独立版本线）**：`main` 继续修 bug（0.2.x），本线专做工程化改造。
+> 起点对标四个参考库：ocsjs（发版流水线）、chaoxing/Samueli924（provider 插件化）、
+> cxmooc-tools（单点维护的宿命）、SuperAutoStudy（架构表演的反面）。
+
+### 修复
+
+- **CI 从不跑测试（最严重）**：`.github/workflows/ci.yml` 原先只做 `node --check` + JSON 校验
+  + `--self-test` + 密钥扫描，**38 个 `*.test.cjs` 一次都没在 CI 跑过**。等于测试只是本地习惯。
+  已把「全量测试」与「版本一致性守卫」加入 CI。
+
+### 新增
+
+- `scripts/run-all-tests.cjs`：全量测试统一入口（CI / pre-push / 本地共用同一命令）。
+  - 用**退出码**判定（不解析输出文本 —— 文本判定曾被「计失败」这类标签误伤）；
+  - 子进程 `stdio:'inherit'`（管道捕获在 Windows 受限环境下会 EPERM）；
+  - 失败也跑完全部再汇总。
+- `scripts/pre-push-check.cjs`：push 前门禁 —— 全量测试 + `--self-test` + 版本一致性，
+  任一失败拒绝 push（逃生口 `git push --no-verify`）。对标 ocsjs 的 `.husky/pre-push`。
+- `scripts/install-hooks.cjs`：把门禁装进 `.git/hooks/pre-push`。
+  **不引入 husky**——本项目「零 npm 依赖」是卖点，引 husky 会要求 contributors `npm install`。
+
+- **题库/AI「传输通道」provider 注册表化（D-065）**：`machine.js::_aiTransport` 原来是写死的两个
+  if 分支（宿主回调 / 直连 OpenAI 兼容），加供应商要改函数本体。现抽成
+  `engine/src/core/ai-providers.js`：
+  - `AnswerProvider` 基类（`available()` / `ask()` 必实现，`setFeedback()`/`close()` 可选空实现
+    —— 比纯抽象类更好扩展，照 chaoxing 的 `Tiku` 设计）；
+  - `PROVIDER_REGISTRY` 内置 `host`（宿主回调）/`direct`（直连），
+    `registerProvider(name, factory)` 可加新题库/新模型通道，**核心一行不动**；
+  - `createTransport()` 按 `cfg.ai.providers` → `cfg.ai.channel`（`session`=host 优先 /
+    `direct`=直连优先）决定顺序，**按序回退**：某通道抛错或返回空文本 → 自动试下一个；
+    全部失败才抛 `ALL_PROVIDERS_FAILED`（错误里带每个通道原因），无可用通道抛
+    `NO_AVAILABLE_PROVIDER`（**绝不静默假装答了题**）；
+  - 契约不变：`ai.js` 的 `decide/decideBatch` 完全不动，`(prompt,image) → {ok,text,model,by}`。
+- 新增 `engine/ai-providers.test.cjs`（22 项）：注册表/顺序/available 过滤/回退链/全失败/无通道
+  + 破坏场景（供应商构造抛错不影响其它、非字符串返回、`available=false` 不进链、图片 data URL 透传）。
+- **真鼠标点不动时，用「页内 JS play()」兜底 + 可配倍速（D-066）**
+  点播放按钮要过坐标/滚动/命中三道关（D-048~D-063 那一串）；而 play() 是方法调用，
+  完全不吃坐标。故设计成 **B 档：真鼠标优先 → 失败才 JS 兜底**。
+  - 新增探针 `__cx.playByObjectId(oid, rate)`：按 objectid 精确命中该 frame 内的 `<video>`，
+    静音 →（rate≠1 时）设 `playbackRate` → `play()`；`play()` 的同步抛与 rejected Promise
+    **都不向上放大**，真正是否起播仍由 `_verifyVideoStarted`（currentTime 前进）判定。
+  - `playSectionVideo`：点击失败 → `_playByObjectId` 兜底；兜底成功也只算「调用成功」，
+    仍要过验证；兜底也失败则 reason 标明 `+js-fallback-failed(...)`。
+    **不回退去点别的播放器**（只针对同一个 objectid）。
+  - 性质说明：这是属性/方法调用，与本仓库长期使用的 `muteIfPossible()`（`v.muted = true`）同性质，
+    **不是合成点击**，也不伪造任何进度上报。
+  - 倍速 `video.playbackRate`：**默认 1（不改页面）**；仅 ≠1 时写入，校验区间 0.25–4。
+    高倍速有被平台判异常的风险，由使用者自行按需开启。
+  - 前提：浏览器启动参数已含 `--autoplay-policy=no-user-gesture-required`（`args.js` 已在用），
+    否则无手势的 `play()` 会被拒。
+- 新增 `engine/playback-fallback.test.cjs`（29 项）：探针层（命中/无匹配/无 video/rate=1 不写/
+  rate=1.5 写入/play 同步抛/rejected Promise 不冒泡/非法倍速被吞）+ 机器层（点击成功不走兜底/
+  兜底成功需过验证/兜底失败带原因/调用成功≠真播/rate 传递/兜底返回非对象不崩）。
+- **破坏测试（第二批）查出两处真洞并修复（D-067）**
+  - **未加载视频时兜底失效**：`playByObjectId` 按 `currentSrc` 里的 32-hex 匹配 oid，
+    但未加载的视频 `currentSrc` 是空串（`preload=none`）→ 必然 `no-such-video`，
+    兜底在「最需要它的场景」反而不生效。修为：匹配失败且**该 frame 只有 1 个 `<video>`** 时认它。
+    安全边界保留：多播放器且都匹配不上 → 仍明确失败（带 `videoCount`），**宁可不播也不误播**。
+  - **卡片扫描未完成就放行切节**：`_cardsUnionDone` 只看已记录的卡；2 张卡只扫 1 张且已全绿时
+    返回 true → 跳过未扫卡片直接切节。修为：记录 `_cardScanTotal`，扫描未完成返回 **false**
+    （不是 null，否则被当作「无法判定→按旧逻辑切节」）；连续 >8 拍扫不到则记 failed 有界放弃，防卡死。
+  - 新增 `engine/playback-chaos2.test.cjs`（11 项）；变异测试扩到 **14 条**（M13/M14），
+    14/14 全部被捕获；探针 version 10 → 11。
+- **破坏测试（第三批）再查三处问题并修复（D-068）**
+  - **切节不清卡片账**：`_ensureCardsScanned` 里「无卡片条就 return」早于 secKey 判断，
+    导致新节沿用上一节的 `_cardScan`；上节若有未完成卡，新节会被 `_cardsUnionDone=false`
+    **永久卡住**。修为：secKey 判断前移，切节即清账。
+  - **倍速路径偷调 play()**：`_applyPlaybackRate` 复用 `playByObjectId`（会再 play 一次），
+    且多视频帧 oid 匹配不上时**静默丢倍速**。修为：探针拆出 `setRate()`（只设 `playbackRate`，
+    不 play），失败打 warn 并带 reason/videoCount。
+  - **同一张卡被连点**：卡片扫不到任务点时「每拍再点一次」，实测被连点 8 次（风控风险）。
+    修为：按 cardid 限次，>3 次记 failed 并继续（实测降到 3 次）。
+  - 新增 `engine/playback-chaos3.test.cjs`（19 项）；变异测试扩到 **17 条**，17/17 捕获
+    （M17 首次漏测 → 补「同一张卡最多点 3 次」断言后才抓到）；探针 version 11 → 12。
+### 说明
+
+- 本地实测：**38 个测试文件 / 0 失败 / 358s**。
+- 本线后续计划（未做）：发版一条命令（`scripts/release.cjs`）、题库/AI provider 注册表化、
+  瘦身 `chaoxing-autolearn.v1.js`（413KB）、docs 索引页。详见
+  `E:\01_Projects\_refs\_REPORT-dsh-cx-learn-vs-refs.md`。
 ## [0.2.8] — 2026-11-23
 
 ### 新增
@@ -372,6 +454,11 @@
 - 结构化日志、优雅停止、拟人化延迟。
 - 零 npm 依赖的 MCP stdio server（`cx_learn` / `cx_login`）。
 - DSH 插件形态：设置页 UI、进程生命周期管理、HTTP 接口。
+
+
+
+
+
 
 
 

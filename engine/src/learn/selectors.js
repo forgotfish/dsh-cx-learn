@@ -18,7 +18,7 @@
  * 解析元素（避免矩形过期）。iframe 递归遍历由 CDP frame 树 + 逐帧求值完成。
  * ==========================================================================*/
 const SELECTORS = {
-  version: 9,
+  version: 12,
   /* 目录节点候选（第二层结构特征）
      ★★★ 2026-10-30 实测：**同一个课程存在两套目录页**，两套都要能读：
        A) mooc2-ans/mycourse/studentcourse  → 新版 **.chapter_item**（85 个）
@@ -663,6 +663,99 @@ const PAGE_PROBE_SRC = `(function () {
     return q2;
   }
 
+  /* ---- 按 objectid 起播 + 设倍速（D-066）----
+     为什么不点鼠标也能播：这是**属性/方法调用**，与已长期使用的
+     muteIfPossible()（v.muted = true）同性质；不是合成点击。
+     适用场景：真鼠标点不动（视口外/命中失败/iframe 偏移）时的**兜底**。
+     前置条件（缺一不可，否则返回 ok:false 由上层回退真鼠标）：
+       1) 同源——调用方已把本探针注入该 frame；
+       2) 自动播放策略已放开——浏览器启动参数含
+          --autoplay-policy=no-user-gesture-required（args.js 已带）；
+       3) 目标 <video> 存在（按 currentSrc 里的 32-hex 与 oid 对齐）。
+     rate 只在 >0 且 !=1 时设置；非法值会被 try/catch 吞掉，不影响起播。 */
+  /* 按 oid 找目标 <video>：精确匹配优先；匹配不到但本帧只有一个 video 时认它（D-067）。
+     返回 {v, all, reason}；v 为 null 表示不可安全命中。 */
+  function matchVideo(oid) {
+    var want = String(oid || '').toLowerCase();
+    var all = [];
+    try { all = Array.prototype.slice.call(document.querySelectorAll('video')); } catch (e0) { all = []; }
+    if (!all.length) return { v: null, all: all, reason: 'no-video-element' };
+
+    var v = null;
+    if (want) {
+      for (var i = 0; i < all.length; i++) {
+        var s = '';
+        try { s = String(all[i].currentSrc || all[i].getAttribute('src') || ''); } catch (e1) { s = ''; }
+        var m = /[0-9a-fA-F]{32}/.exec(s);
+        if (m && m[0].toLowerCase() === want) { v = all[i]; break; }
+      }
+    }
+    /* ★ D-067（破坏测试 C1/C2/C3 发现的真洞）：
+       未加载的视频（preload=none）currentSrc 是空串 → 按 objectid 匹配必然失败，
+       于是兜底直接 no-such-video，等于这条兜底在「最需要它的场景」失效。
+       退路：调用方已经按 objectid 定位到这个 frame（视频子 iframe 内**只有一个** <video>），
+       所以「本 frame 只存在 1 个 video」时认它；多个时仍要求精确匹配（防误播，见 C3）。 */
+    if (!v && all.length === 1) { v = all[0]; }
+    else if (!v && !want) { v = all[0]; }
+    return { v: v, all: all, reason: v ? '' : 'no-such-video' };
+  }
+
+  /* ★ D-068：**只设倍速，不调 play()** —— 与起播解耦。
+     原实现复用 playByObjectId()，顺带又 play() 一次；且多视频帧里 oid 匹配不上时
+     会静默不设倍速。这里显式只设 rate，并把失败原因带回去（不静默）。 */
+  function setRate(oid, rate) {
+    var m = matchVideo(oid);
+    if (!m.v) return { ok: false, reason: m.reason, videoCount: m.all.length };
+    var r = Number(rate);
+    if (!Number.isFinite(r) || r <= 0) return { ok: false, reason: 'bad-rate' };
+    try { m.v.playbackRate = r; }
+    catch (e) { return { ok: false, reason: 'rate-threw:' + String((e && e.name) || e).slice(0, 30) }; }
+    return { ok: true, rate: m.v.playbackRate, videoCount: m.all.length };
+  }
+
+  /* 起播 + 静音（+ 可选倍速）。是否真的起播仍由上层 verify 判定。 */
+  function playByObjectId(oid, rate) {
+    var mm = matchVideo(oid);
+    var v = mm.v;
+    if (!v) return { ok: false, reason: mm.reason || 'no-such-video', videoCount: mm.all.length };
+
+    /* 静音（等价用户点静音，与 muteIfPossible 同语义） */
+    try { v.muted = true; } catch (e2) { /* ignore */ }
+
+    /* 倍速：默认 1 就不动它，避免无意义地改页面状态 */
+    var applied = null;
+    var r = Number(rate);
+    if (Number.isFinite(r) && r > 0 && r !== 1) {
+      try { v.playbackRate = r; applied = v.playbackRate; }
+      catch (e3) { applied = null; }
+    }
+
+    /* 起播。play() 可能同步抛（罕见）也可能返回 reject 的 Promise：
+       两者都不在这里放大 —— 由上层 _verifyVideoStarted 用「currentTime 前进」判定真实起播。
+       这样"调用成功"与"真的播了"依然分离，失败不会被掩盖。 */
+    var played = false, playErr = '';
+    try {
+      var p = v.play();
+      played = true;
+      if (p && typeof p.catch === 'function') {
+        p.catch(function (err) { /* 由 verify 判定，不在此处抛 */ void err; });
+      }
+    } catch (e4) {
+      played = false;
+      playErr = String((e4 && e4.name) || e4 || '').slice(0, 40);
+    }
+
+    return {
+      ok: played,
+      reason: played ? '' : ('play-threw:' + playErr),
+      rate: v.playbackRate,
+      rateApplied: applied,
+      muted: !!v.muted,
+      paused: !!v.paused,
+      readyState: v.readyState,
+      currentSrc: String(v.currentSrc || '').slice(0, 80),
+    };
+  }
   /* ---- 知识卡片区清单（D-064）----
      只取「onclick 含 changeDisplayContent 且带 cardid」的 li（避开同名的章内子任务 ul.prev_ul）。
      返回 {ok, total, cards:[{i, seq, num, total, cardid, title}]}：
@@ -1335,6 +1428,8 @@ const PAGE_PROBE_SRC = `(function () {
     },
     videoState: videoState,
     cardsInfo: cardsInfo,   /* D-064：知识卡片区清单 */
+    playByObjectId: playByObjectId,   /* D-066：按 objectid 起播+倍速（兜底用） */
+    setRate: setRate,                 /* D-068：只设倍速，不 play */
     _scrollChain: scrollChainIntoView,   /* 仅测试用：暴露给单测，业务不依赖 */
     find: function (kind, arg) {
       var r = resolve(kind, arg);
@@ -1410,6 +1505,11 @@ module.exports = {
   PAGE_PROBE_SRC,
   installProbeExpression
 };
+
+
+
+
+
 
 
 

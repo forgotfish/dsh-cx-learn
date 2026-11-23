@@ -66,7 +66,14 @@ const CONFIG = {
   },
 
   /* 视频判定：progress >= progressDoneRatio% 或 ended === true 视为自然结束 */
-  video: { progressDoneRatio: 98.5, mute: true },
+  video: {
+    progressDoneRatio: 98.5,
+    mute: true,
+    /* D-066：播放倍速。**默认 1（不改）** —— 高倍速有被平台判异常的风险，
+       由使用者自己按需调高（参考 ocsjs 的警告：过高可能导致学习记录清空/回退）。
+       仅当 !=1 时才会真正写 playbackRate。 */
+    playbackRate: 1,
+  },
 
   /* 直播回放（D-026）：超星直播不是 <video>，播放器在独立标签页
      （live.chaoxing.com/courseLive/pclive → 内嵌 zhibo.chaoxing.com）。
@@ -243,6 +250,7 @@ function validateConfig(cfg) {
     if (!Array.isArray(r) || r.length !== 2 || !(r[0] >= 0 && r[1] >= r[0])) errs.push('humanize.' + name + ' 必须是 [min,max] 且 min<=max');
   }
   if (!(cfg.video.progressDoneRatio >= 90 && cfg.video.progressDoneRatio <= 100)) errs.push('video.progressDoneRatio 应在 90-100 之间');
+  if (!(cfg.video.playbackRate >= 0.25 && cfg.video.playbackRate <= 4)) errs.push('video.playbackRate 应在 0.25-4 之间（默认 1）');
   if (errs.length) throw new FatalStop('CONFIG_INVALID', errs.join('; '));
 }
 
@@ -252,3 +260,4 @@ module.exports = {
   parseAnswerLetter,
   validateConfig
 };
+

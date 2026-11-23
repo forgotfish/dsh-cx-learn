@@ -11,6 +11,7 @@ const path = require('node:path');
 
 const { BUS, busEmit, sleep } = require('../core/base.js');
 const aiCore = require('../core/ai.js');
+const aiProviders = require('../core/ai-providers.js');
 const { humanize, logger } = require('../core/logging.js');
 const { emitQuestionEvent } = require('../core/questions.js');
 const { installProbeExpression } = require('./selectors.js');
@@ -396,6 +397,41 @@ class LearnMachine {
       await this.adapter.evalInFrame(frameId, 'Array.prototype.forEach.call(document.querySelectorAll("video"), function (v) { v.muted = true; }); true');
       logger.info('PLAYING_CHECK', '已将视频静音（等价用户点静音；NAS 环境防外放）');
     } catch (_) { /* 静音失败不阻塞 */ }
+  }
+
+  /**
+   * D-066：按 objectid 在该 frame 内**直接起播**（真鼠标点不动时的兜底）。
+   * 这是属性/方法调用，不是合成点击；与 muteIfPossible 同性质。
+   * ok=true 只代表 play() 调用成功，**是否真起播仍由 _verifyVideoStarted 判定**。
+   */
+  async _playByObjectId(frameId, oid) {
+    try {
+      const r = await this.adapter.evalInFrame(
+        frameId,
+        '__cx && __cx.playByObjectId ? __cx.playByObjectId(' + JSON.stringify(String(oid || '')) + ', 1) : {ok:false,reason:"probe-missing"}'
+      );
+      return (r && typeof r === 'object') ? r : { ok: false, reason: 'bad-probe-result' };
+    } catch (e) {
+      return { ok: false, reason: 'eval-error: ' + String((e && e.message) || e).slice(0, 60) };
+    }
+  }
+
+  /**
+   * D-066：应用播放倍速。**默认 1 → 直接跳过**（不改页面状态）。
+   */
+  async _applyPlaybackRate(frameId, oid) {
+    const rate = Number((this.cfg && this.cfg.video && this.cfg.video.playbackRate) || 1);
+    if (!(rate > 0) || rate === 1) return;
+    try {
+      /* ★ D-068：只设倍速（__cx.setRate），**不再复用 playByObjectId** ——
+         后者会顺带再 play() 一次，且多视频帧里 oid 匹配不上时静默不设倍速。 */
+      const r = await this.adapter.evalInFrame(
+        frameId,
+        '__cx && __cx.setRate ? __cx.setRate(' + JSON.stringify(String(oid || '')) + ', ' + JSON.stringify(rate) + ') : null'
+      );
+      if (r && r.ok) logger.info('PLAYING', '已应用播放倍速', { rate: r.rate });
+      else if (r) logger.warn('PLAYING', '倍速未能应用（不阻塞播放）', { reason: r.reason, videoCount: r.videoCount });
+    } catch (_) { /* 倍速失败不影响播放 */ }
   }
 
   /** 单步状态机。返回 { progress, outcome }；progress=true 时主循环重置失败计数。 */
@@ -954,66 +990,18 @@ class LearnMachine {
    * @param {number} [maxTokens] 直连通路的 max_tokens；缺省 16（逐题只回一个字母）
    */
   _aiTransport(timeoutMs, maxTokens) {
-    const askUrl = process.env.CX_LLM_ASK_URL || '';
-    const base = process.env.CX_LLM_BASE || '';
-    const key = process.env.CX_LLM_KEY || '';
-    const envModel = process.env.CX_LLM_MODEL || '';
+    /* ★ D-065：传输层改为「provider 注册表 + 回退链」（engine/src/core/ai-providers.js）。
+       原来这里是写死的两个 if 分支（宿主回调 / 直连），加供应商要改本函数本体；
+       现在只按配置挑通道，新增供应商用 aiProviders.registerProvider() 注册即可。
+       契约不变：({prompt,image}) → {ok,text,model,by}；全部通道失败才抛错。 */
     const cfgAi = (this.cfg && this.cfg.ai) || {};
-    const provider = process.env.CX_LLM_PROVIDER || cfgAi.provider || 'host';
-    const model = envModel || cfgAi.model || '';
-    const waitMs = Number(timeoutMs) > 0 ? Number(timeoutMs) : 20000;
-    const limit = Number(maxTokens) > 0 ? Number(maxTokens) : 16;
-
-    const fetchWithTimeout = async (url, init) => {
-      const ac = new AbortController();
-      const timer = setTimeout(() => ac.abort(), waitMs);
-      try { return await fetch(url, Object.assign({}, init, { signal: ac.signal })); }
-      finally { clearTimeout(timer); }
-    };
-
-    /* transport({prompt,image}) → {ok,text,model}；失败抛错，由 ai.decide 统一重试 */
-    return async ({ prompt, image }) => {
-      let text = '';
-      if (askUrl) {
-        /* 通路 1：回调宿主，由宿主用 ctx.llm 调用户配置的模型 */
-        const payload = { provider, model, prompt };
-        if (image) payload.image = 'data:image/png;base64,' + image;
-        const res = await fetchWithTimeout(askUrl, {
-          method: 'POST',
-          headers: {
-            'content-type': 'application/json',
-            'x-cx-token': process.env.CX_LLM_ASK_TOKEN || '',
-          },
-          body: JSON.stringify(payload),
-        });
-        if (!res.ok) throw new Error('HTTP ' + res.status + ' ' + (await res.text()).slice(0, 120));
-        const j = await res.json();
-        if (!j || j.ok !== true) throw new Error(String((j && j.error) || '宿主答题回调失败'));
-        text = String(j.text || '');
-      } else {
-        /* 通路 2：直连 OpenAI 兼容接口 */
-        const url = base.replace(/\/+$/, '') + '/chat/completions';
-        const msgContent = image
-          ? [{ type: 'text', text: prompt }, { type: 'image_url', image_url: { url: 'data:image/png;base64,' + image } }]
-          : prompt;
-        const res = await fetchWithTimeout(url, {
-          method: 'POST',
-          headers: { 'content-type': 'application/json', authorization: 'Bearer ' + key },
-          body: JSON.stringify({
-            model: model,
-            messages: [{ role: 'user', content: msgContent }],
-            temperature: 0,
-            max_tokens: limit,
-          }),
-        });
-        if (!res.ok) throw new Error('HTTP ' + res.status + ' ' + (await res.text()).slice(0, 120));
-        const j = await res.json();
-        text = String((j && j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content) || '');
-      }
-      return { ok: true, text, model };
-    };
+    return aiProviders.createTransport({
+      env: process.env,
+      cfgAi,
+      timeoutMs: Number(timeoutMs) > 0 ? Number(timeoutMs) : undefined,
+      maxTokens: Number(maxTokens) > 0 ? Number(maxTokens) : undefined,
+    });
   }
-
   /**
    * 批量作答：一次把一批题投给模型，拿回「每题选哪个下标」。
    *
@@ -2307,19 +2295,25 @@ class LearnMachine {
     const secKey = String((cur && cur.chapterId) || '');
     if (!secKey) return null;
 
+    /* ★ D-068：**切节必须清账**（放在读取卡片信息之前）。
+       原实现把 secKey 判断放在 `if (!info.cards.length) return null` 之后，
+       于是「新节没有卡片条」时不会重置 → 上一节的 _cardScan 残留，
+       若上节有未完成卡，新节会被 _cardsUnionDone=false 永久卡住。 */
+    if (this._cardScanKey !== secKey) {
+      this._cardScanKey = secKey;
+      this._cardScan = new Map();       // cardid -> { media, finished }
+      this._cardSwitchCount = 0;
+      this._cardScanTotal = 0;          // D-067：本节卡片总数（0=未知）
+      this._cardScanStallTicks = 0;     // D-067：连续「有卡片扫不到」的拍数
+      this._cardClickTries = new Map(); // D-068：cardid -> 已点击次数（防止反复点同一张卡）
+    }
+    if (!(this._cardScan instanceof Map)) this._cardScan = new Map();
+
     const info = await this._readCardsInfo(st);
     if (!info.ok || !info.cards.length) return null;      // 页面没有卡片条（老页面）→ 不介入
 
     const cf = this._cardsFrameInfo(st);
     const curNum = cf && cf.num != null ? cf.num : null;
-
-    if (this._cardScanKey !== secKey) {
-      this._cardScanKey = secKey;
-      this._cardScan = new Map();       // cardid -> { media, finished }
-      this._cardSwitchCount = 0;
-    }
-    if (!(this._cardScan instanceof Map)) this._cardScan = new Map();
-
     /* 记录「当前挂载那张卡」的 media 统计（任务点按 knowledgeid 无法区分卡片，只能按当前挂载算） */
     const pvNow = this._sectionPendingVideos(st);
     if (curNum != null) {
@@ -2329,17 +2323,49 @@ class LearnMachine {
       }
     }
 
+    /* ★ D-067（破坏测试 C6 发现的真洞）：记录本节卡片总数，供 _cardsUnionDone 判断
+       「是否所有卡片都已扫描」。否则只扫了 1 张就放行切节 = 跳过其余卡片。 */
+    this._cardScanTotal = info.cards.length;
+    const missing = info.cards.filter((c) => !this._cardScan.has(String(c.cardid)));
+    if (!missing.length) this._cardScanStallTicks = 0;
+
     if (info.cards.length <= 1) return null;              // 单卡：退化，不切
 
     /* 找一张还没扫过的卡（按 cardid 记账，比 num 稳） */
     const next = info.cards.find((c) => !this._cardScan.has(String(c.cardid)));
     if (!next) return null;
 
+    /* ★ D-067：若连续多拍都扫不到（元素被重绘/消失），有界放弃，
+       把剩下的卡记成 failed（视为「无媒体」），避免 done 闸门被永久卡住。 */
+    this._cardScanStallTicks = (this._cardScanStallTicks || 0) + 1;
+    if (this._cardScanStallTicks > 8) {
+      for (const c of missing) {
+        this._cardScan.set(String(c.cardid), { media: 0, finished: 0, failed: true });
+      }
+      logger.warn('ADVANCE', '多拍未能扫描到这些知识卡片，标记为 failed 并继续（避免卡死）', {
+        title: this._currentTitle, cards: missing.map((c) => c.title).slice(0, 4),
+      });
+      this._cardScanStallTicks = 0;
+      return null;
+    }
     /* 播放中途不切卡（会打断正在播的视频）*/
     if (st.video && st.video.found && !st.video.paused && !st.video.ended) return null;
 
     const topId = this._topFrameId(st);
     if (!topId) return null;
+    /* ★ D-068（E5 暴露）：原实现「扫不到就每拍再点一次」→ 同一张卡被连点 8 次，
+       真实环境连续快速点击有风控风险。这里按 cardid 限次，超了直接记 failed。 */
+    if (!(this._cardClickTries instanceof Map)) this._cardClickTries = new Map();
+    const nextKey = String(next.cardid);
+    const tries = (this._cardClickTries.get(nextKey) || 0) + 1;
+    this._cardClickTries.set(nextKey, tries);
+    if (tries > 3) {
+      for (const cm of missing) {
+        this._cardScan.set(String(cm.cardid), { media: 0, finished: 0, failed: true });
+      }
+      logger.warn('ADVANCE', '这张卡片点了多次仍扫不到任务点，标记 failed 并继续', { title: next.title, tries: tries - 1 });
+      return null;
+    }
     const r = await this.clickFound(topId, 'cardsTab', { index: next.i });
     if (!r || !r.ok) {
       logger.warn('ADVANCE', '切换知识卡片失败，跳过该卡', {
@@ -2365,6 +2391,10 @@ class LearnMachine {
   _cardsUnionDone(st) {
     const info = this._cardScan;
     if (!(info instanceof Map) || !info.size) return null;
+    /* ★ D-067：扫描未完成 → 明确「还不许切节」（返回 false，不是 null）。
+       返回 null 会被上层当成「无法判定 → 按旧逻辑切节」，那就跳过了未扫的卡片。 */
+    const total = Number(this._cardScanTotal) || 0;
+    if (total > 1 && info.size < total) return false;
     for (const v of info.values()) {
       if (v && v.failed) continue;                        // 切不过去的卡不算「有未完成」
       if ((Number(v.media) || 0) > (Number(v.finished) || 0)) return false;
@@ -2890,13 +2920,35 @@ class LearnMachine {
     }
 
     try {
+      let degraded = false;
       const r = await this.clickFound(frameId, 'videoToggle', oid ? { objectid: oid } : undefined);
       if (!r || !r.ok) {
-        /* 点不到目标播放器：记一次失败，**不回退去点别的播放器** */
-        this._bumpUnstartable(oid);
-        return { ok: false, reason: (r && r.reason) || 'toggle-failed', objectid: oid };
+        /* ★ D-066（B 档）：真鼠标点不动时的**兜底** —— 在该 frame 内直接调用
+           media.play()（属性/方法调用，不是合成点击；与 muteIfPossible 同性质）。
+           点不动通常是视口外/命中失败/多层 iframe 偏移（D-048~D-063 那一串），
+           而 play() 完全不吃坐标。
+           注意：仍然「不回退去点别的播放器」——兜底只针对**同一个 objectid**。 */
+        const fb = await this._playByObjectId(frameId, oid);
+        if (!fb.ok) {
+          logger.warn('CLICK', '真鼠标点不动，页内 JS play() 兜底也未成功', {
+            objectid: oid.slice(0, 12), clickReason: (r && r.reason) || 'toggle-failed', fbReason: fb.reason,
+          });
+          this._bumpUnstartable(oid);
+          return {
+            ok: false,
+            reason: ((r && r.reason) || 'toggle-failed') + '+js-fallback-failed(' + (fb.reason || '?') + ')',
+            objectid: oid,
+          };
+        }
+        degraded = true;
+        logger.warn('CLICK', '真鼠标点不动 → 已用页内 JS play() 兜底（降级，但起播仍要过验证）', {
+          objectid: oid.slice(0, 12), clickReason: (r && r.reason) || 'toggle-failed',
+          readyState: fb.readyState, rate: fb.rate,
+        });
       }
       await this.muteIfPossible(frameId);
+      /* D-066：倍速（默认 1 → 不写）。两条路径都应用，放在 mute 之后。 */
+      await this._applyPlaybackRate(frameId, oid);
       if (oid) {
         const verified = await this._verifyVideoStarted(oid, beforeTime, 6000, frameId);
         if (!verified.ok) {
@@ -3342,6 +3394,11 @@ module.exports = {
   NORMAL_STOP,
   LearnMachine
 };
+
+
+
+
+
 
 
 

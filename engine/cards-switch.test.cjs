@@ -211,6 +211,10 @@ const ONE_CARD = { ok: true, total: 1, cards: [{ i: 0, seq: 1, num: 0, total: 1,
     ok(m._cardsUnionDone({}) === false, '★ 有卡片未完成 → false（不许切节）');
     m._cardScan = new Map([['A', { media: 3, finished: 3 }], ['B', { media: 0, finished: 0, failed: true }]]);
     ok(m._cardsUnionDone({}) === true, '★ 切不过去的卡（failed）忽略 → true');
+    /* ★ 变异测试补强（M12）：failed 卡若 media>finished 也必须被忽略，
+       否则「切不过去」会被误判成「还有未完成」→ 永远不切节、空转到超时。 */
+    m._cardScan = new Map([['A', { media: 3, finished: 3 }], ['B', { media: 7, finished: 0, failed: true }]]);
+    ok(m._cardsUnionDone({}) === true, '★ failed 卡即使 media>finished 也忽略 → true');
     m._cardScan = new Map([['A', { media: 0, finished: 0 }]]);
     ok(m._cardsUnionDone({}) === true, '★ 纯文档卡（media=0）不算未完成 → true');
   }
@@ -219,4 +223,5 @@ const ONE_CARD = { ok: true, total: 1, cards: [{ i: 0, seq: 1, num: 0, total: 1,
   if (fails.length) { console.log('== 失败 ' + fails.length + ' 项 =='); fails.forEach((f) => console.log('  ✗ ' + f)); process.exit(1); }
   console.log('== 全部通过（' + pass + ' 项）==');
 })().catch((e) => { console.error('FATAL', e && e.stack || e); process.exit(2); });
+
 
