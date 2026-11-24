@@ -122,6 +122,8 @@ window.__ModuleLoader__.load({
       // 界面按草图改成 5 个标签页：内核 / 登录 / 选课 / 答题 / 开始（索引 28/29，别改顺序）
       const [tab, setTab] = React.useState('登录')                 // 28
       const [logOpen, setLogOpen] = React.useState(false)          // 29
+      // 播放倍速（D-066）：引擎 video.playbackRate，默认 1（不改页面）。高倍速有风险，由主人自己开。
+      const [videoRate, setVideoRate] = React.useState(1)          // 30
 
       const refresh = React.useCallback(async () => {
         try {
@@ -144,6 +146,7 @@ window.__ModuleLoader__.load({
             setChapterQuiz(typeof s.config.chapterQuiz === 'string' ? s.config.chapterQuiz : 'save')
             setAiChannel(ai.channel === 'direct' ? 'direct' : 'session')
             setAiBatch(Number(ai.batchSize) || 10)
+            setVideoRate(Number(s.config && s.config.video && s.config.video.playbackRate) || 1)
           }
         } catch (e) {
           setMsg({ kind: 'err', text: '读状态失败：' + e.message })
@@ -163,6 +166,8 @@ window.__ModuleLoader__.load({
         courseUrl: url.trim(), mode, maxSections: Number(maxSections) || 5,
         browserId, chromiumPath: chromiumPath.trim(),
         chapterQuiz: aiEnabled ? (chapterQuiz === 'submit' ? 'submit' : 'save') : 'skip',
+        /* D-066：只覆盖 playbackRate，其余 video 字段（progressDoneRatio/mute）原样保留 */
+        video: { ...((st && st.config && st.config.video) || {}), playbackRate: Number(videoRate) || 1 },
         ai: {
           ...((st && st.config && st.config.ai) || {}),
           enabled: aiEnabled,
@@ -684,6 +689,22 @@ window.__ModuleLoader__.load({
               style: { width: 72 },
             }),
             h('span', { 'data-cx-hint': '' }, '节'))),
+
+            h('div', { 'data-cx-row': '' },
+              h('span', { 'data-cx-label': '', style: { width: 72 } }, '播放倍速'),
+              h('select', {
+                'data-cx-in': '', 'data-cx-video-rate': '',
+                value: String(videoRate),
+                onChange: (e) => { setVideoRate(Number(e.target.value)); setDirty(true) },
+                style: { flex: 1 },
+              },
+                h('option', { value: '1' }, '1x（默认，最安全）'),
+                h('option', { value: '1.25' }, '1.25x'),
+                h('option', { value: '1.5' }, '1.5x'),
+                h('option', { value: '1.75' }, '1.75x'),
+                h('option', { value: '2' }, '2x')),
+              h('span', { 'data-cx-hint': '', 'data-cx-video-rate-warn': '' },
+                videoRate > 1 ? '⚠ 高于 1x 可能被判学习异常（建议 ≤2x）' : '保持 1x 最稳')),
 
         // 运行控制
         h('div', { 'data-cx-card': '', 'data-cx-tab-of': '开始' },
