@@ -35,6 +35,7 @@ let ok = true;
 ok = step('全量单元测试', [path.join('scripts', 'run-all-tests.cjs'), '--quiet']) && ok;
 ok = step('引擎自检 --self-test', [path.join('engine', 'chaoxing-autolearn.js'), '--self-test']) && ok;
 ok = step('版本一致性', [path.join('scripts', 'release-guard.cjs')]) && ok;
+ok = step('教训静态检查（探针转义/版本锁/变异锚点）', [path.join('scripts', 'lessons-check.cjs')]) && ok;
 
 if (!ok) {
   console.error('\n============================================');

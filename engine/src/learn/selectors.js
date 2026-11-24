@@ -18,7 +18,7 @@
  * 解析元素（避免矩形过期）。iframe 递归遍历由 CDP frame 树 + 逐帧求值完成。
  * ==========================================================================*/
 const SELECTORS = {
-  version: 12,
+  version: 14,
   /* 目录节点候选（第二层结构特征）
      ★★★ 2026-10-30 实测：**同一个课程存在两套目录页**，两套都要能读：
        A) mooc2-ans/mycourse/studentcourse  → 新版 **.chapter_item**（85 个）
@@ -569,7 +569,7 @@ const PAGE_PROBE_SRC = `(function () {
     try {
       if (el.classList && el.classList.contains('btnSave')) return true;
       var cls = String(el.className || '');
-      if (/(^|\s)btnSave(\s|$)/.test(cls)) return true;
+      if (/(^|\\s)btnSave(\\s|$)/.test(cls)) return true;
       var t = norm(el.innerText || el.value || '');
       if (t && matchAny(t, S.quizSaveText) && !matchAny(t, S.quizSubmitText)) return true;
     } catch (e) {}
@@ -597,7 +597,7 @@ const PAGE_PROBE_SRC = `(function () {
           qid: blk.id || ('q' + bi),
           question: qtext.slice(0, 300),
           /* 判断题题干里带 【True or False】，单选题带 【Single Choice】 */
-          kind: /true\s*or\s*false|判断/i.test(qtext) ? 'judge' : 'single',
+          kind: /true\\s*or\\s*false|判断/i.test(qtext) ? 'judge' : 'single',
           options: opts.map(function (o) { return { i: o.i, letter: o.letter, label: o.label }; })        });
       }
       if (blocks.length) {
@@ -845,7 +845,7 @@ const PAGE_PROBE_SRC = `(function () {
         var t = norm(lis[i].innerText || '');
         if (!t) continue;
         // 去掉 "A、" 之类的前缀，只留选项文本
-        var cleaned = t.replace(/^[A-H][、.．]\s*/, '');
+        var cleaned = t.replace(/^[A-H][、.．]\\s*/, '');
         options.push({ i: options.length, letter: String.fromCharCode(65 + options.length), label: cleaned || t });
       }
     } catch (e3) { /* ignore */ }
@@ -880,7 +880,7 @@ const PAGE_PROBE_SRC = `(function () {
     var panelText = '';
     try {
       panelText = norm(el.innerText || '').slice(0, 160);
-      var rm = panelText.match(/剩余\s*[:：]?\s*(\d+)\s*次/);
+      var rm = panelText.match(/剩余\\s*[:：]?\\s*(\\d+)\\s*次/);
       if (rm) remaining = Number(rm[1]);
     } catch (e9) { /* ignore */ }
     /* 兜底：即使 #spanNotBack 没出现，面板文本里出现回看要求也要停 */
@@ -891,10 +891,10 @@ const PAGE_PROBE_SRC = `(function () {
     /* 反馈原文里能提取「正确答案：X」时一并带出，供盲试少走弯路 */
     var correctAnswer = '';
     try {
-      var ca = panelText.match(/正确答案\s*[:：]\s*([A-T](?:[A-T\s,，、]*))/);
-      if (ca) correctAnswer = ca[1].replace(/[\s,，、]/g, '');
+      var ca = panelText.match(/正确答案\\s*[:：]\\s*([A-T](?:[A-T\\s,，、]*))/);
+      if (ca) correctAnswer = ca[1].replace(/[\\s,，、]/g, '');
       else {
-        var cb = panelText.match(/正确答案\s*[:：]\s*(对|错|正确|错误)/);
+        var cb = panelText.match(/正确答案\\s*[:：]\\s*(对|错|正确|错误)/);
         if (cb) correctAnswer = cb[1];
       }
     } catch (e10) { /* ignore */ }
@@ -946,9 +946,9 @@ const PAGE_PROBE_SRC = `(function () {
         || !!hasClassLike(it, S.tocChapterClass)
         || !!hasClassLike(it, S.chapterHeaderClass)
         || !!it.querySelector(S.tocHeaderTitleOldSel)
-        || /^第\s*[0-9一二三四五六七八九十百]+[章单元篇]\s*$/.test(t)
+        || /^第\\s*[0-9一二三四五六七八九十百]+[章单元篇]\\s*$/.test(t)
         /* 新版章头文本形如「1 新时代的工程」：纯数字 + 空格 + 标题，且无 id */
-        || (sel === S.tocItemNew && !hasId && /^\d+\s+\S+/.test(t) && !/^\d+\.\d+/.test(t));
+        || (sel === S.tocItemNew && !hasId && /^\\d+\\s+\\S+/.test(t) && !/^\\d+\\.\\d+/.test(t));
 
       /* ===== 完成度（A 方案：整节口径，仅作参考）=====
          新版：**已完成的小节完全没有 .catalog_jindu**；未完成的才有，
@@ -1000,12 +1000,12 @@ const PAGE_PROBE_SRC = `(function () {
         else {
           /* 新版也可从 onclick="toOld('204169157','143114596','156594937',0)" 里取 */
           var ocAttr = it.getAttribute ? String(it.getAttribute('onclick') || '') : '';
-          var mt = ocAttr.match(/toOld\('([0-9]+)','([0-9]+)','([0-9]+)'\)/);
+          var mt = ocAttr.match(/toOld\\('([0-9]+)','([0-9]+)','([0-9]+)'\\)/);
           if (mt) chapterId = mt[2];
           else {
             var oc = it.querySelector ? it.querySelector(S.teacherAjaxSel) : null;
             if (oc) {
-              var mo = String(oc.getAttribute('onclick') || '').match(/getTeacherAjax\('[^']*','[^']*','([0-9]+)'\)/);
+              var mo = String(oc.getAttribute('onclick') || '').match(/getTeacherAjax\\('[^']*','[^']*','([0-9]+)'\\)/);
               if (mo) chapterId = mo[1];
             }
           }

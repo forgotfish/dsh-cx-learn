@@ -237,41 +237,48 @@ function runTest(rel) {
   return { status: r.status, out: (r.stdout || '') + (r.stderr || '') };
 }
 
-console.log('变异测试：共 ' + list.length + ' 条（scope=' + scopeArg + '）');
-console.log('预期：每条都让测试**变红**；若仍绿 = 漏测\n');
+if (require.main === module) {
+  console.log('变异测试：共 ' + list.length + ' 条（scope=' + scopeArg + '）');
+  console.log('预期：每条都让测试**变红**；若仍绿 = 漏测\n');
 
-let caught = 0;
-const missed = [];
+  let caught = 0;
+  const missed = [];
 
-for (const m of list) {
-  const abs = path.join(ROOT, m.file);
-  const orig = fs.readFileSync(abs, 'utf8');
-  let applied = false;
-  try {
-    if (!orig.includes(m.old)) {
-      console.log('  ⚠ ' + m.id + ' 跳过：锚点未匹配（' + m.file + '）');
-      missed.push(m.id + ' (anchor-miss)');
-      continue;
+  for (const m of list) {
+    const abs = path.join(ROOT, m.file);
+    const orig = fs.readFileSync(abs, 'utf8');
+    let applied = false;
+    try {
+      if (!orig.includes(m.old)) {
+        console.log('  ⚠ ' + m.id + ' 跳过：锚点未匹配（' + m.file + '）');
+        missed.push(m.id + ' (anchor-miss)');
+        continue;
+      }
+      fs.writeFileSync(abs, orig.replace(m.old, m.new), 'utf8');
+      applied = true;
+      const t = runTest(m.test);
+      const red = t.status !== 0;
+      if (red) { caught += 1; console.log('  ✓ ' + m.id + ' 注入后测试变红（符合预期）— ' + m.why); }
+      else { missed.push(m.id); console.log('  ✗ ' + m.id + ' 注入后测试**仍绿**（漏测！）— ' + m.why); }
+    } finally {
+      if (applied) fs.writeFileSync(abs, orig, 'utf8');   /* 必定还原 */
     }
-    fs.writeFileSync(abs, orig.replace(m.old, m.new), 'utf8');
-    applied = true;
-    const t = runTest(m.test);
-    const red = t.status !== 0;
-    if (red) { caught += 1; console.log('  ✓ ' + m.id + ' 注入后测试变红（符合预期）— ' + m.why); }
-    else { missed.push(m.id); console.log('  ✗ ' + m.id + ' 注入后测试**仍绿**（漏测！）— ' + m.why); }
-  } finally {
-    if (applied) fs.writeFileSync(abs, orig, 'utf8');   /* 必定还原 */
   }
+
+  console.log('\n抓到 ' + caught + ' / ' + list.length);
+  if (missed.length) { console.log('漏测/未注入：' + missed.join(', ')); process.exit(1); }
+  console.log('全部变异均被测试捕获 ✓');
+
+
+
+
+
+
+
+
+
+
 }
 
-console.log('\n抓到 ' + caught + ' / ' + list.length);
-if (missed.length) { console.log('漏测/未注入：' + missed.join(', ')); process.exit(1); }
-console.log('全部变异均被测试捕获 ✓');
-
-
-
-
-
-
-
-
+/* ★ 供 scripts/lessons-check.cjs 做「锚点唯一性」自检；直接运行时不受影响 */
+module.exports = { MUTATIONS };
