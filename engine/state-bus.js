@@ -162,6 +162,25 @@ function readBrowser() { return readJson(CONTRACT.FILES.browser); }
 function reportLearn(info) {
   return writeJson(CONTRACT.FILES.learn, Object.assign({ layer: 'learn' }, info || {}));
 }
+/**
+ * ★ D-070：把「本节卡片采集表」写进 learn.json 的 sections[]（按 chapterId upsert）。
+ * 复测者建议「落盘沿用 state-bus（learn.json 加一段 sections[]）」。
+ * 说明：**跨运行只作提示**，切节判据仍以平台任务点为准（平台可能把进度退回）。
+ */
+function reportSection(entry) {
+  const e = entry || {};
+  const key = String(e.chapterId || '');
+  if (!key) return false;
+  const cur = readLearn() || {};
+  const list = Array.isArray(cur.sections) ? cur.sections.slice() : [];
+  const item = Object.assign({ chapterId: key }, e, { collectedAt: new Date().toISOString() });
+  const idx = list.findIndex((x) => x && String(x.chapterId) === key);
+  if (idx >= 0) list[idx] = item; else list.push(item);
+  /* 只留最近 50 节，避免文件无限增长 */
+  const trimmed = list.slice(-50);
+  return writeJson(CONTRACT.FILES.learn, Object.assign({}, cur, { layer: 'learn', sections: trimmed }));
+}
+
 /** 浏览器层 / 插件：读业务层进度 */
 function readLearn() { return readJson(CONTRACT.FILES.learn); }
 
@@ -173,6 +192,7 @@ module.exports = {
   reportBrowser,
   readBrowser,
   reportLearn,
+  reportSection,
   readLearn,
   FILES: CONTRACT.FILES,
 };

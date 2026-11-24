@@ -72,6 +72,21 @@ function scopeTasksToSection(tasks, currentChapterId) {
  *     inventory-from-other-section  只有上一节的任务点，数据不可用
  *     nothing                   无证据
  */
+/** 目标类任务点（默认 video+audio，保持历史行为）。可配置，为接入答题预留。 */
+const DEFAULT_TARGET_KINDS = Object.freeze(['video', 'audio']);
+function normalizeKinds(kinds) {
+  const src = Array.isArray(kinds) ? kinds : DEFAULT_TARGET_KINDS;
+  const out = [];
+  for (const k of src) {
+    const v = String(k || '').trim();
+    if (v && out.indexOf(v) < 0) out.push(v);
+  }
+  return out.length ? out : DEFAULT_TARGET_KINDS.slice();
+}
+function isTargetKind(task, kinds) {
+  return kinds.indexOf(String((task && task.kind) || '')) >= 0;
+}
+
 function isVideoTaskDone(input) {
   const o = input || {};
   const { scoped, stale } = scopeTasksToSection(o.tasks, o.currentChapterId);
@@ -79,8 +94,9 @@ function isVideoTaskDone(input) {
   /* 有带 knowledgeid 的任务点但都不是当前节的 ⇒ 明确不可用，不许用 */
   if (stale) return { done: false, by: 'inventory-from-other-section' };
 
-  /* ① 页面层面：所有 video/audio 任务点都 finished */
-  const media = scoped.filter((t) => t && (t.kind === 'video' || t.kind === 'audio'));
+  /* ① 页面层面：所有「目标类」任务点都 finished（默认 video+audio，可配置） */
+  const kinds = normalizeKinds(o.targetKinds);
+  const media = scoped.filter((t) => t && isTargetKind(t, kinds));
   if (media.length && media.every((t) => t.finished === true)) {
     return { done: true, by: 'page-video-task-finished', count: media.length };
   }
@@ -116,13 +132,14 @@ function isVideoTaskDone(input) {
  * @param {string} currentChapterId 当前节 chapterId
  * @returns {{ok:boolean, stale:boolean, pending:Array, total:number, finished:number}}
  */
-function pendingSectionVideos(tasks, currentChapterId) {
+function pendingSectionVideos(tasks, currentChapterId, targetKinds) {
   const { scoped, stale } = scopeTasksToSection(tasks, currentChapterId);
 
   /* 不可信数据（来自别的 knowledgeid）⇒ 不给结论 */
   if (stale) return { ok: false, stale: true, pending: [], total: 0, finished: 0 };
 
-  const media = scoped.filter((t) => t && (t.kind === 'video' || t.kind === 'audio'));
+  const kinds = normalizeKinds(targetKinds);
+  const media = scoped.filter((t) => t && isTargetKind(t, kinds));
   const pending = media
     .filter((t) => t.finished !== true)
     .map((t) => Object.assign({}, t, {
@@ -144,8 +161,8 @@ function pendingSectionVideos(tasks, currentChapterId) {
  * @param {string} chapterId
  * @returns {boolean}
  */
-function sectionVideosDone(tasks, chapterId) {
-  const r = pendingSectionVideos(tasks, chapterId);
+function sectionVideosDone(tasks, chapterId, targetKinds) {
+  const r = pendingSectionVideos(tasks, chapterId, targetKinds);
   if (!r.ok) return false;
   return r.total > 0 && r.finished === r.total;
 }
@@ -252,7 +269,23 @@ function pickStart(items) {
   return { mode: 'allDone', idx: curIdx >= 0 ? curIdx : null };
 }
 
+/**
+ * 「本节所有目标类任务点是否都完成」—— 复测报告建议的统一出口。
+ * targetKinds 默认 ['video','audio']；接入答题后可传 ['video','quiz']。
+ * stale 数据、空清单都不算完成（与 sectionVideosDone 同口径）。
+ */
+function areTargetTasksDone(tasks, chapterId, targetKinds) {
+  const kinds = normalizeKinds(targetKinds);
+  const r = pendingSectionVideos(tasks, chapterId, kinds);
+  if (!r.ok) return { ok: false, stale: true, total: 0, finished: 0, kinds: kinds };
+  return { ok: r.total > 0 && r.finished === r.total, stale: false, total: r.total, finished: r.finished, kinds: kinds };
+}
+
 module.exports = {
+  DEFAULT_TARGET_KINDS,
+  normalizeKinds,
+  isTargetKind,
+  areTargetTasksDone,
   knowledgeIdOf,
   scopeTasksToSection,
   isVideoTaskDone,

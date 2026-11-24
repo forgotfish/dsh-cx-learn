@@ -2,6 +2,48 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.3.2] — 2026-11-24
+
+### 新增（复测报告建议的两项遗留）
+
+- **D-070 ① `targetKinds` 可配置**（复测建议 (4)）
+  - `safety.targetKinds`，**默认 `['video','audio']` —— 刻意保持历史行为**（既有的
+    `sectionVideosDone` 就是只认 video/audio）。接答题后可改成 `['video','quiz']`，
+    连播/切节判据会自动跟随。
+  - `judge.js` 新增 `DEFAULT_TARGET_KINDS` / `normalizeKinds()` / `isTargetKind()` /
+    `areTargetTasksDone()`（复测者建议的统一出口）。
+  - 非法值（`[]` / `null` / `''` / 非数组）一律回落默认；含垃圾项**不崩**，
+    且绝不会因此误判「已完成」（`total===0` → `ok:false`）。
+- **D-070 ② 本节卡片采集表落盘**（复测建议 (2) 后半段）
+  - `state-bus.reportSection(entry)`：按 `chapterId` **upsert** 进 `learn.json` 的
+    `sections[]`，最多保留 50 节，带 `collectedAt`。
+  - `machine._persistSectionState()`：每记录一张卡就落一次，
+    内容 `{chapterId, title, kind, total, cards:[{cardid,num,title,collected,media,finished,failed}]}`。
+  - **跨运行只作提示**：切节判据仍以平台任务点为准（平台可能把进度退回）。
+    已加测试钉死「历史 sections 不参与判定」。
+
+### 修复（写测试时暴露）
+
+- `_recordCurrentCard` 直接 `this._cardScan.get()` —— 若该方法先于
+  `_ensureCardsScanned` 被调用（测试/未来重构），会 `TypeError` 并被兜底 `catch` **静默吞掉**，
+  表现为「什么都没发生」，极难排查。已加防御性初始化。
+
+### 新增测试
+
+- `engine/d070-targetkinds-state.test.cjs`（33 项）：
+  A1 默认行为不变 / A2 显式 `[video]` 忽略 audio / A3 `[video,quiz]` 预留 /
+  A4 非法值回落且不误判 / A5 stale 不给结论 /
+  B1 upsert 跨节共存 / B2 无 chapterId 不写不崩 / B3 50 节上限 /
+  B4 落盘不影响判定 / B5 machine→state-bus 端到端串联。
+- 变异测试扩到 **25 条**（M22–M25 专打本次），**25/25 全部被捕获**。
+
+### 说明
+
+- 全量 **44 个 `*.test.cjs` 全绿**，`--self-test` 通过。
+- 复测者提的三个问题，本次全部落地：
+  ① 采集超时 15s（v0.3.1 已有）② `targetKinds` 配置化（本版）③ `maxSections` 语义保持
+  「真正播完的节数」（v0.3.1 的 `greenEarly` 修复后自然生效）。
+
 ## [0.3.1] — 2026-11-24
 
 ### 修复（复测报告 v0.2.8：多卡节漏刷 / 并集闸门 fail-open）

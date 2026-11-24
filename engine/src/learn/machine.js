@@ -2228,6 +2228,7 @@ class LearnMachine {
     const cur = this._currentTocItem(st);
     const inv = this._lastInventory;
     const r = isVideoTaskDone({
+      targetKinds: this._targetKinds(),
       tasks: (inv && Array.isArray(inv.tasks)) ? inv.tasks : [],
       currentChapterId: cur && cur.chapterId ? String(cur.chapterId) : '',
       tocItem: cur,
@@ -2240,13 +2241,19 @@ class LearnMachine {
    * 本节未完成的 media 任务点（judge.pendingSectionVideos 的薄封装）。
    * 拿不到/不可信时一律返回 ok:false —— 调用方据此退回「不猜」的保守路径。
    */
+  /** 目标类任务点（D-070 可配置；默认 video+audio，保持历史行为）。 */
+  _targetKinds() {
+    const k = this.cfg && this.cfg.safety && this.cfg.safety.targetKinds;
+    return Array.isArray(k) && k.length ? k : ['video', 'audio'];
+  }
+
   _sectionPendingVideos(st) {
     const EMPTY = { ok: false, stale: false, pending: [], total: 0, finished: 0 };
     try {
       const cur = this._currentTocItem(st);
       const inv = this._lastInventory;
       const tasks = (inv && Array.isArray(inv.tasks)) ? inv.tasks : [];
-      const r = pendingSectionVideos(tasks, cur && cur.chapterId ? String(cur.chapterId) : '');
+      const r = pendingSectionVideos(tasks, cur && cur.chapterId ? String(cur.chapterId) : '', this._targetKinds());
       return (r && typeof r === 'object') ? r : EMPTY;
     } catch (_) { return EMPTY; }
   }
@@ -2450,6 +2457,10 @@ class LearnMachine {
    */
   _recordCurrentCard(st, col) {
     try {
+      /* ★ D-070：防御性初始化。原实现直接 this._cardScan.get()，
+         若谁先调本方法（测试/未来重构），会 TypeError 并被下面的 catch 静默吞掉 —— 
+         表现为"什么都没发生"，极难排查。 */
+      if (!(this._cardScan instanceof Map)) this._cardScan = new Map();
       const cf = this._cardsFrameInfo(st);
       const curNum = cf && cf.num != null ? cf.num : null;
       if (curNum == null) return;
@@ -2464,7 +2475,39 @@ class LearnMachine {
         failed: !!prev.failed,
       };
       this._cardScan.set(String(curCard.cardid), rec);
+      this._persistSectionState(col);
     } catch (_) { /* 记录失败不阻塞 */ }
+  }
+
+  /**
+   * ★ D-070：把本节卡片采集表落盘到 learn.json 的 sections[]（复测者建议）。
+   * **跨运行只作提示** —— 切节判据仍以平台任务点为准（平台可能把进度退回）。
+   * 失败不影响主流程（写盘异常只打 debug）。
+   */
+  _persistSectionState(col) {
+    try {
+      if (!col || !col.key) return;
+      if (!BUS || typeof BUS.reportSection !== 'function') return;
+      const cards = (col.cards || []).map((c) => {
+        const r = this._cardScan.get(String(c.cardid)) || null;
+        return {
+          cardid: String(c.cardid),
+          num: Number(c.num),
+          title: String(c.title || ''),
+          collected: !!r,
+          media: r ? Number(r.media) || 0 : 0,
+          finished: r ? Number(r.finished) || 0 : 0,
+          failed: !!(r && r.failed),
+        };
+      });
+      BUS.reportSection({
+        chapterId: col.key,
+        title: col.title || '',
+        kind: col.state,
+        total: Number(col.total) || 0,
+        cards: cards,
+      });
+    } catch (_) { /* 落盘失败不影响主流程 */ }
   }
 
   /**

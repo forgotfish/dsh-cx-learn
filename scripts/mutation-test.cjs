@@ -195,6 +195,39 @@ const MUTATIONS = [
     test: 'engine/d069-union-gate.test.cjs',
     why: '恢复「平台标绿就切节」→ F4 应红（86% 直接切走）',
   },
+  /* ---------------- D-070（targetKinds + 状态落盘） ---------------- */
+  {
+    id: 'M22', scope: 'd070',
+    file: 'engine/src/learn/judge.js',
+    old: '  return out.length ? out : DEFAULT_TARGET_KINDS.slice();',
+    new: '  return out;',
+    test: 'engine/d070-targetkinds-state.test.cjs',
+    why: '空/非法 targetKinds 不再回落默认 → A4 应红',
+  },
+  {
+    id: 'M23', scope: 'd070',
+    file: 'engine/src/learn/judge.js',
+    old: "  const kinds = normalizeKinds(targetKinds);\n  const media = scoped.filter((t) => t && isTargetKind(t, kinds));",
+    new: "  const kinds = normalizeKinds(targetKinds);\n  const media = scoped.filter((t) => t && (t.kind === 'video' || t.kind === 'audio'));",
+    test: 'engine/d070-targetkinds-state.test.cjs',
+    why: '忽略 targetKinds、写死 video/audio → A2/A3 应红',
+  },
+  {
+    id: 'M24', scope: 'd070',
+    file: 'engine/state-bus.js',
+    old: '  if (idx >= 0) list[idx] = item; else list.push(item);',
+    new: '  list.push(item);',
+    test: 'engine/d070-targetkinds-state.test.cjs',
+    why: '不 upsert、只追加 → B1「K1 只保留一条」应红',
+  },
+  {
+    id: 'M25', scope: 'd070',
+    file: 'engine/src/learn/machine.js',
+    old: '      this._persistSectionState(col);',
+    new: '      /* mutation: 不落盘 */',
+    test: 'engine/d070-targetkinds-state.test.cjs',
+    why: '采集后不落盘 → 该路径无断言，仅作占位（见下方说明）',
+  },
 ];
 
 const list = MUTATIONS.filter((m) => scopeArg === 'all' || m.scope === scopeArg);
