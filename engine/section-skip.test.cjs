@@ -45,7 +45,12 @@ function fakeAdapter(clicks) {
     async navigate() {},
     async getCurrentUrl() { return 'https://mooc1.chaoxing.com/mycourse/studentstudy?chapterId=143114597'; },
     async getFrameDocuments() { return []; },
-    async evalInFrame() { return null; },
+    async evalInFrame(frameId, expr) {
+      const e = String(expr || '');
+      /* D-069：新模型需要 cardsInfo 才能判定「本节有几张卡」。本夹具模拟「无卡片条」。 */
+      if (e.indexOf('cardsInfo') >= 0) return { ok: true, total: 0, cards: [] };
+      return null;
+    },
     async getText() { return ''; },
     async getAllCookies() { return null; },
     async screenshot() { return ''; },

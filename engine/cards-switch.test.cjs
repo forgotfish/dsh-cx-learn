@@ -172,13 +172,14 @@ const ONE_CARD = { ok: true, total: 1, cards: [{ i: 0, seq: 1, num: 0, total: 1,
     ok(!!step && step.outcome === 'CARD_SWITCHED', '★ 返回 CARD_SWITCHED（实际 ' + JSON.stringify(step) + '）');
     ok(st.clicks.length === 1 && st.clicks[0].fid === 'top', '★ 在外层文档点击 1 次（实际 ' + JSON.stringify(st.clicks.map((c) => c.fid)) + '）');
     ok(m._cardScan.has('CARD_A'), '  当前卡 CARD_A 已记录（media/finished）');
-    // 已切过 CARD_B 后（模拟下一拍：curNum=1 且 B 已记）→ 不再切
+    // 两卡都已采集（新模型：_cardCollect 为 multi 且 _cardScan 两张都有）→ 不再切、不再点
     const { m: m2, st: st2 } = mkMachine({ cardsInfo: TWO_CARDS });
-    m2._cardScanKey = 'K1';
+    m2._cardCollect = { key: 'K1', state: 'multi', startedAt: Date.now(), total: 2, cards: TWO_CARDS.cards, title: 't' };
     m2._cardScan = new Map([['CARD_A', { media: 3, finished: 3 }], ['CARD_B', { media: 7, finished: 2 }]]);
+    m2._cardAwait = null;
     const stx = mkSt({ cardsUrl: CARDS_URL_0.replace('num=0', 'num=1') });
     const step2 = await m2._ensureCardsScanned(stx);
-    ok(step2 === null && (st2.clicks.length === 0), '★ 两卡都已扫过 → 不再切（实际 ' + JSON.stringify(step2) + '）');
+    ok(step2 === null && (st2.clicks.length === 0), '★ 两卡都已采集 → 不再切（实际 ' + JSON.stringify(step2) + '）');
   }
 
   console.log('== B3. 播放中不切卡（避免打断）==');
@@ -201,22 +202,50 @@ const ONE_CARD = { ok: true, total: 1, cards: [{ i: 0, seq: 1, num: 0, total: 1,
     ok(st.findCalls === 1, '★ find 仍然只 1 次（不循环，实际 ' + st.findCalls + '）');
   }
 
-  console.log('== B5. 并集判定 _cardsUnionDone ==');
+  console.log('== B5. 并集判定 _cardsUnionDone（D-069 新模型）==');
   {
     const { m } = mkMachine({ cardsInfo: TWO_CARDS });
-    ok(m._cardsUnionDone({}) === null, '  空 Map → null（无法判定）');
-    m._cardScan = new Map([['A', { media: 3, finished: 3 }], ['B', { media: 7, finished: 7 }]]);
-    ok(m._cardsUnionDone({}) === true, '★ 全部 finished → true');
-    m._cardScan = new Map([['A', { media: 3, finished: 3 }], ['B', { media: 7, finished: 2 }]]);
-    ok(m._cardsUnionDone({}) === false, '★ 有卡片未完成 → false（不许切节）');
-    m._cardScan = new Map([['A', { media: 3, finished: 3 }], ['B', { media: 0, finished: 0, failed: true }]]);
-    ok(m._cardsUnionDone({}) === true, '★ 切不过去的卡（failed）忽略 → true');
-    /* ★ 变异测试补强（M12）：failed 卡若 media>finished 也必须被忽略，
-       否则「切不过去」会被误判成「还有未完成」→ 永远不切节、空转到超时。 */
-    m._cardScan = new Map([['A', { media: 3, finished: 3 }], ['B', { media: 7, finished: 0, failed: true }]]);
-    ok(m._cardsUnionDone({}) === true, '★ failed 卡即使 media>finished 也忽略 → true');
-    m._cardScan = new Map([['A', { media: 0, finished: 0 }]]);
-    ok(m._cardsUnionDone({}) === true, '★ 纯文档卡（media=0）不算未完成 → true');
+    const stK1 = { frames: [], toc: { found: true, items: [{ chapterId: 'K1', current: true }] }, video: { found: false } };
+
+    /* 没有采集记录 → fail-closed（不许切节，也不许当成「无法判定」放行） */
+    ok(m._cardsUnionDone(stK1) === false, '★ 无采集记录 → false（不许切节）');
+
+    /* 采集记录属于别的节 → false */
+    m._cardCollect = { key: 'OTHER', state: 'multi', startedAt: Date.now(), total: 2, cards: TWO_CARDS.cards, title: 't' };
+    ok(m._cardsUnionDone(stK1) === false, '★ 采集记录属于别的节 → false（chapterId 绑定）');
+
+    /* 老页面 / 单卡 → null（交回旧逻辑） */
+    m._cardCollect = { key: 'K1', state: 'none', startedAt: Date.now(), total: 0, cards: [], title: 't' };
+    ok(m._cardsUnionDone(stK1) === null, '★ state=none（老页面）→ null');
+    m._cardCollect.state = 'single';
+    ok(m._cardsUnionDone(stK1) === null, '★ state=single（单卡）→ null');
+
+    /* 采集未完成 → false */
+    m._cardCollect = { key: 'K1', state: 'pending', startedAt: Date.now(), total: 2, cards: TWO_CARDS.cards, title: 't' };
+    ok(m._cardsUnionDone(stK1) === false, '★ state=pending（还没采集）→ false');
+    m._cardCollect.state = 'timeout';
+    ok(m._cardsUnionDone(stK1) === false, '★ state=timeout → false');
+
+    /* multi：全部 finished → true */
+    m._cardCollect = { key: 'K1', state: 'multi', startedAt: Date.now(), total: 2, cards: TWO_CARDS.cards, title: 't' };
+    m._cardScan = new Map([['CARD_A', { media: 3, finished: 3 }], ['CARD_B', { media: 7, finished: 7 }]]);
+    ok(m._cardsUnionDone(stK1) === true, '★ 全部卡片 finished → true');
+
+    /* 有卡未完成 → false */
+    m._cardScan = new Map([['CARD_A', { media: 3, finished: 3 }], ['CARD_B', { media: 7, finished: 2 }]]);
+    ok(m._cardsUnionDone(stK1) === false, '★ 有卡片未完成 → false');
+
+    /* 有卡还没采集（不在表里）→ false（复测报告的核心漏洞） */
+    m._cardScan = new Map([['CARD_A', { media: 3, finished: 3 }]]);
+    ok(m._cardsUnionDone(stK1) === false, '★ ★ 有卡未采集（表里没有）→ false（不是 true）');
+
+    /* failed 卡忽略 */
+    m._cardScan = new Map([['CARD_A', { media: 3, finished: 3 }], ['CARD_B', { media: 7, finished: 0, failed: true }]]);
+    ok(m._cardsUnionDone(stK1) === true, '★ failed 卡忽略 → true');
+
+    /* 纯文档卡 media=0 不算未完成 */
+    m._cardScan = new Map([['CARD_A', { media: 0, finished: 0 }], ['CARD_B', { media: 2, finished: 2 }]]);
+    ok(m._cardsUnionDone(stK1) === true, '★ 纯文档卡（media=0）不算未完成 → true');
   }
 
   console.log('');

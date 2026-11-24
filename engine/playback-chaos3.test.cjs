@@ -112,7 +112,7 @@ function stFor(chapterId, hasCards) {
     m._cardScanTotal = 1;
     const step = await m._ensureCardsScanned(stFor('K2', true));
     ok(!!step && step.outcome === 'CARD_SWITCHED', '★ 新节重新开始扫（实际 ' + JSON.stringify(step) + '）');
-    ok(m._cardScanTotal === 2, '★ total 更新为 2（实际 ' + m._cardScanTotal + '）');
+    ok(m._cardCollect && m._cardCollect.total === 2, '★ 采集到 total=2（实际 ' + JSON.stringify(m._cardCollect && m._cardCollect.total) + '）');
     ok(!m._cardScan.has('CARD_A'), '★ 旧 cardid 不残留');
   }
 
@@ -135,35 +135,37 @@ function stFor(chapterId, hasCards) {
   }
 
   /* ---------- E5：stall 边界 8 拍不放弃、第 9 拍放弃 ---------- */
-  console.log('== E5. stall 有界放弃的边界（8 不放弃 / 9 放弃）==');
+  console.log('== E5. D-069：点过的卡「等待采集」而不是连点；超时停机 ==');
   {
-    /* 造「2 张卡，第 2 张永远扫不到」：cardsInfo 报 2 张，但点击后仍只记 1 张 */
+    /* 2 张卡，第 2 张点了但任务点始终读不到 → 不再重复点，超时后停机报错 */
     const TWO = { ok: true, total: 2, cards: [
       { i: 0, seq: 1, num: 0, total: 2, cardid: 'CA', title: 'a' },
       { i: 1, seq: 2, num: 1, total: 2, cardid: 'CB', title: 'b' }] };
     const { m, rec } = mkMachine({ cardsInfo: TWO, attachCount: 3 });
+    E.humanize.configure(cfgBase.humanize);
+    /* 把超时压到很小，便于测试 */
+    m.cfg.safety.cardDetectTimeoutMs = 120;
     const st = stFor('K1', true);
-    /* 先锚定本节，再预置「已扫到 CA」*/
+
+    /* 第 1 拍：采集到 multi，切到 CB → 进入 await */
     m._cardScanKey = 'K1';
-    m._cardScan = new Map();
-    m._cardScanTotal = 2;
-    m._cardScan.set('CA', { media: 3, finished: 3 });
-    let gaveUpAt = null;
-    m._cardScanStallTicks = 0;
-    for (let t = 1; t <= 12; t += 1) {
-      /* 每拍都「只扫到 CA、CB 一直扫不到」：直接调 stall 增量逻辑（通过 _ensureCardsScanned） */
-      const before = m._cardScanStallTicks || 0;
+    m._cardScan = new Map([['CA', { media: 3, finished: 3 }]]);
+    const step1 = await m._ensureCardsScanned(st);
+    ok(!!step1 && step1.outcome === 'CARD_SWITCHED', '★ 首次切到未采集的卡（实际 ' + JSON.stringify(step1) + '）');
+    ok(rec.findCalls === 1, '★ 只点了 1 次（实际 ' + rec.findCalls + '）');
+
+    /* 第 2~4 拍：在等采集 → 不许再点（这是复测里「952ms 又切一次同一张卡」的修复） */
+    for (let t = 0; t < 3; t += 1) {
       await m._ensureCardsScanned(st);
-      const after = m._cardScanStallTicks || 0;
-      const cbFailed = m._cardScan.get('CB') && m._cardScan.get('CB').failed === true;
-      if (cbFailed && gaveUpAt === null) { gaveUpAt = t; break; }
-      if (after === 0 && before > 0) { /* 被重置（切卡成功路径），继续 */ }
     }
-    ok(gaveUpAt !== null, '★ 最终有界放弃（CB 记 failed）实际第 ' + gaveUpAt + ' 拍');
-    ok(gaveUpAt !== null && gaveUpAt <= 10, '★ 放弃不晚于 10 拍（实际 ' + gaveUpAt + '）');
-    /* ★ 关键：真实环境连续快速点击有风控风险 —— 断言「同一张卡最多点 3 次」。
-       去掉限次后这里会变成 8+ 次（变异 M17 就靠这条被抓）。 */
-    ok(rec.clicks <= 3, '★ ★ 同一张卡最多点 3 次（实际 ' + rec.clicks + ' 次）');
+    ok(rec.findCalls === 1, '★ ★ 等待期间不再重复点击同一张卡（实际 ' + rec.findCalls + ' 次）');
+
+    /* 超过超时 → 停机 card_detect_timeout（可见的失败，不是静默跳过） */
+    await new Promise((r) => setTimeout(r, 200));
+    const step2 = await m._ensureCardsScanned(st);
+    ok(step2 && step2.outcome === 'STOPPED', '★ 超时即停机（实际 ' + JSON.stringify(step2) + '）');
+    ok(m.stopReason === 'card_detect_timeout', '★ 停机原因 card_detect_timeout（实际 ' + String(m.stopReason) + '）');
+    ok(rec.findCalls === 1, '★ 全程只点 1 次（实际 ' + rec.findCalls + '）');
   }
 
   /* ---------- E6：直播任务点不走 playByObjectId ---------- */

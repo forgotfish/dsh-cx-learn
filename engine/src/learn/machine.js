@@ -566,7 +566,32 @@ class LearnMachine {
       const doneNow = this._currentSectionDone(st)
         ? { ok: true, by: 'toc-section-done' }
         : this._videoTaskDone(st);
-      if (doneNow.ok) {
+      /* ★ D-069（复测报告第 (5) 条，真机实证）：超星大约在 86% 就把任务点标绿。
+         原实现 doneNow.ok 就直接 sectionsSkipped+1 并 advanceSection，
+         于是「连播 → 记账确认 → 并集闸门 → 计数」整段被跳过：
+           · 每个视频的后 10~14% 从未播放
+           · sectionsCompleted 恒为 0（走了 sectionsSkipped），maxSections 彻底失效
+           · 多卡片节的并集闸门也轮不到执行 → 后卡漏刷
+         修法：区分「本次起播后被动标绿」与「进来时本来就已经绿」：
+           · 前者 → 当「还没播完」，不切节，落下去继续播到判定线
+           · 后者 → 上次已看完，该跳就跳（保持旧行为，不额外耗时） */
+      const greenEarly = (() => {
+        if (!doneNow.ok) return false;
+        const v = st && st.video;
+        if (!v || !v.found) return false;
+        if (!this._isVideoStartedHere(v)) return false;               /* 进来时就是绿的 → 不算提前 */
+        if (v.ended) return false;                                    /* 真播完了 */
+        return (v.progress || 0) < this.cfg.video.progressDoneRatio;   /* 未到判定线 */
+      })();
+      if (greenEarly) {
+        logger.info('ADVANCE', '平台已标绿但视频尚未播到判定线，继续播放（不切节）', {
+          title: this._currentTitle,
+          progress: (st.video && st.video.progress) || 0,
+          doneAt: this.cfg.video.progressDoneRatio,
+          by: doneNow.by,
+        });
+      }
+      if (doneNow.ok && !greenEarly) {
         /* ★ D-064：本节可能是「多个知识卡片」。当前挂载那张卡片的 media 全绿
            **不等于**本节读完 —— 其余卡片还没扫/还没播。这里用「卡片并集」拦截：
              · 返回 false → 明确还有卡没播完：不许切节，继续走后面的卡片扫描/播放
@@ -2263,9 +2288,14 @@ class LearnMachine {
     const fid = this._topFrameId(st);
     if (!fid) return { ok: false, total: 0, cards: [] };
     let r = null;
-    try { r = await this.adapter.evalInFrame(fid, '__cx && __cx.cardsInfo ? __cx.cardsInfo() : {ok:false}'); }
-    catch (_) { r = null; }
-    if (!r || !r.ok || !Array.isArray(r.cards)) return { ok: false, total: 0, cards: [] };
+    try {
+      /* ★ D-069：探针缺失时返回 noProbe 标记 —— 用来区分
+         「老页面/旧探针（确认没有卡片条）」与「还没渲染（要等）」。 */
+      r = await this.adapter.evalInFrame(fid, '__cx && __cx.cardsInfo ? __cx.cardsInfo() : {ok:false,noProbe:true}');
+    } catch (_) { r = null; }
+    if (!r) return { ok: false, total: 0, cards: [], noProbe: false, readFailed: true };
+    if (r.noProbe) return { ok: false, total: 0, cards: [], noProbe: true };
+    if (!r.ok || !Array.isArray(r.cards)) return { ok: false, total: 0, cards: [], noProbe: false };
     return r;
   }
 
@@ -2295,92 +2325,146 @@ class LearnMachine {
     const secKey = String((cur && cur.chapterId) || '');
     if (!secKey) return null;
 
-    /* ★ D-068：**切节必须清账**（放在读取卡片信息之前）。
-       原实现把 secKey 判断放在 `if (!info.cards.length) return null` 之后，
-       于是「新节没有卡片条」时不会重置 → 上一节的 _cardScan 残留，
-       若上节有未完成卡，新节会被 _cardsUnionDone=false 永久卡住。 */
-    if (this._cardScanKey !== secKey) {
-      this._cardScanKey = secKey;
-      this._cardScan = new Map();       // cardid -> { media, finished }
+    /* ★ D-069：本节状态表。切节即重建（杜绝沿用上一节账本）。 */
+    if (!this._cardCollect || this._cardCollect.key !== secKey) {
+      this._cardCollect = {
+        key: secKey, state: 'pending', startedAt: Date.now(),
+        total: 0, cards: [], title: this._currentTitle,
+      };
+      this._cardScan = new Map();        // cardid -> { media, finished, failed }
+      this._cardAwait = null;            // 刚点过的卡，等它采集完
       this._cardSwitchCount = 0;
-      this._cardScanTotal = 0;          // D-067：本节卡片总数（0=未知）
-      this._cardScanStallTicks = 0;     // D-067：连续「有卡片扫不到」的拍数
-      this._cardClickTries = new Map(); // D-068：cardid -> 已点击次数（防止反复点同一张卡）
+      this._cardClickTries = new Map();
     }
+    const col = this._cardCollect;
     if (!(this._cardScan instanceof Map)) this._cardScan = new Map();
+    if (!(this._cardClickTries instanceof Map)) this._cardClickTries = new Map();
+    const timeoutMs = Number(this.cfg && this.cfg.safety && this.cfg.safety.cardDetectTimeoutMs) > 0
+      ? Number(this.cfg.safety.cardDetectTimeoutMs) : 15000;
 
-    const info = await this._readCardsInfo(st);
-    if (!info.ok || !info.cards.length) return null;      // 页面没有卡片条（老页面）→ 不介入
+    /* ---------- 阶段一：采集本节卡片清单（每节只做一次）---------- */
+    if (col.state === 'pending') {
+      const info = await this._readCardsInfo(st);
+      const cf = this._cardsFrameInfo(st);
+      if (info.ok && info.cards.length > 1) {
+        col.state = 'multi'; col.total = info.cards.length; col.cards = info.cards;
+        logger.info('ADVANCE', '本节有多个知识卡片，开始逐卡采集', {
+          title: col.title, cards: info.cards.length,
+          list: info.cards.map((c) => String(c.title || '')).slice(0, 6),
+        });
+      } else if (info.ok && info.cards.length === 1) {
+        col.state = 'single'; col.total = 1; col.cards = info.cards;
+      } else if (!cf) {
+        /* 连 knowledge/cards frame 都没有 → 老版页面，确认无卡片条（按单卡处理） */
+        col.state = 'none';
+      } else if (info.noProbe) {
+        /* 探针缺失/旧探针 → 老页面，确认无卡片条（按单卡处理） */
+        col.state = 'none';
+      } else if (info.ok && info.cards.length === 0) {
+        /* ★ 读到外层文档「成功但没有卡片 li」→ 这是**确认无**（老版/单卡页），
+           不是「还没渲染」。若一直当 pending，会把「已看完的小节」拖到超时停机。
+           区分依据：读失败（!info.ok）才说明可能还没就绪。 */
+        col.state = 'none';
+      } else {
+        const waited = Date.now() - col.startedAt;
+        if (waited > timeoutMs) {
+          col.state = 'timeout';
+          logger.error('ADVANCE', '卡片清单迟迟读不到（超时），停止本轮', {
+            title: col.title, waitedMs: waited, timeoutMs,
+            liCount: info && info.cards ? info.cards.length : 0,
+            hasCardsFrame: !!cf,
+          });
+          this.stop('card_detect_timeout');
+          return { progress: false, outcome: 'STOPPED' };
+        }
+        /* 未就绪：本拍不做任何结论（避免拿旧 inventory 下判定） */
+        return null;
+      }
+    }
+    if (col.state === 'timeout') return null;
 
-    const cf = this._cardsFrameInfo(st);
-    const curNum = cf && cf.num != null ? cf.num : null;
-    /* 记录「当前挂载那张卡」的 media 统计（任务点按 knowledgeid 无法区分卡片，只能按当前挂载算） */
-    const pvNow = this._sectionPendingVideos(st);
-    if (curNum != null) {
-      const curCard = info.cards.find((c) => Number(c.num) === Number(curNum));
-      if (curCard && pvNow && pvNow.ok) {
-        this._cardScan.set(String(curCard.cardid), { media: Number(pvNow.total) || 0, finished: Number(pvNow.finished) || 0 });
+    /* ---------- 阶段二：记录「当前挂载那张卡」的任务点统计 ---------- */
+    this._recordCurrentCard(st, col);
+
+    /* ---------- 阶段三：单卡 / 老页面 → 不介入 ---------- */
+    if (col.state === 'none' || col.state === 'single') return null;
+
+    /* ---------- 阶段四：多卡 —— 点过的卡先等它采集完成 ---------- */
+    if (this._cardAwait) {
+      const done = this._cardScan.has(String(this._cardAwait.cardid));
+      if (done) { this._cardAwait = null; }
+      else {
+        const waited = Date.now() - this._cardAwait.since;
+        if (waited > timeoutMs) {
+          logger.error('ADVANCE', '切卡后任务点迟迟未就绪（超时），停止本轮', {
+            title: col.title, cardid: String(this._cardAwait.cardid).slice(0, 16), waitedMs: waited, timeoutMs,
+          });
+          this.stop('card_detect_timeout');
+          return { progress: false, outcome: 'STOPPED' };
+        }
+        return null;                      /* 等采集，不重复点击 */
       }
     }
 
-    /* ★ D-067（破坏测试 C6 发现的真洞）：记录本节卡片总数，供 _cardsUnionDone 判断
-       「是否所有卡片都已扫描」。否则只扫了 1 张就放行切节 = 跳过其余卡片。 */
-    this._cardScanTotal = info.cards.length;
-    const missing = info.cards.filter((c) => !this._cardScan.has(String(c.cardid)));
-    if (!missing.length) this._cardScanStallTicks = 0;
-
-    if (info.cards.length <= 1) return null;              // 单卡：退化，不切
-
-    /* 找一张还没扫过的卡（按 cardid 记账，比 num 稳） */
-    const next = info.cards.find((c) => !this._cardScan.has(String(c.cardid)));
+    /* ---------- 阶段五：找一张「还没采集」的卡 ---------- */
+    const next = col.cards.find((c) => !this._cardScan.has(String(c.cardid)));
     if (!next) return null;
 
-    /* ★ D-067：若连续多拍都扫不到（元素被重绘/消失），有界放弃，
-       把剩下的卡记成 failed（视为「无媒体」），避免 done 闸门被永久卡住。 */
-    this._cardScanStallTicks = (this._cardScanStallTicks || 0) + 1;
-    if (this._cardScanStallTicks > 8) {
-      for (const c of missing) {
-        this._cardScan.set(String(c.cardid), { media: 0, finished: 0, failed: true });
-      }
-      logger.warn('ADVANCE', '多拍未能扫描到这些知识卡片，标记为 failed 并继续（避免卡死）', {
-        title: this._currentTitle, cards: missing.map((c) => c.title).slice(0, 4),
-      });
-      this._cardScanStallTicks = 0;
-      return null;
-    }
-    /* 播放中途不切卡（会打断正在播的视频）*/
+    /* 播放中途不切卡（避免打断）；等本卡播完自然继续 */
     if (st.video && st.video.found && !st.video.paused && !st.video.ended) return null;
 
     const topId = this._topFrameId(st);
     if (!topId) return null;
-    /* ★ D-068（E5 暴露）：原实现「扫不到就每拍再点一次」→ 同一张卡被连点 8 次，
-       真实环境连续快速点击有风控风险。这里按 cardid 限次，超了直接记 failed。 */
-    if (!(this._cardClickTries instanceof Map)) this._cardClickTries = new Map();
+
+    /* 同一张卡限次（防风控 + 防死循环） */
     const nextKey = String(next.cardid);
     const tries = (this._cardClickTries.get(nextKey) || 0) + 1;
     this._cardClickTries.set(nextKey, tries);
     if (tries > 3) {
-      for (const cm of missing) {
-        this._cardScan.set(String(cm.cardid), { media: 0, finished: 0, failed: true });
-      }
-      logger.warn('ADVANCE', '这张卡片点了多次仍扫不到任务点，标记 failed 并继续', { title: next.title, tries: tries - 1 });
+      this._cardScan.set(nextKey, { media: 0, finished: 0, failed: true });
+      logger.warn('ADVANCE', '这张卡片点了多次仍采集不到，标记 failed 并继续', { title: next.title, tries: tries - 1 });
       return null;
     }
+
     const r = await this.clickFound(topId, 'cardsTab', { index: next.i });
     if (!r || !r.ok) {
+      this._cardScan.set(nextKey, { media: 0, finished: 0, failed: true });
       logger.warn('ADVANCE', '切换知识卡片失败，跳过该卡', {
-        title: next.title, cardid: String(next.cardid).slice(0, 16), reason: (r && r.reason) || null,
+        title: next.title, cardid: nextKey.slice(0, 16), reason: (r && r.reason) || null,
       });
-      /* 记成「未知」避免同一张卡反复重试死循环；media 记 0 视为无媒体 */
-      this._cardScan.set(String(next.cardid), { media: 0, finished: 0, failed: true });
       return null;
     }
     this._cardSwitchCount = (this._cardSwitchCount || 0) + 1;
+    this._cardAwait = { cardid: nextKey, since: Date.now() };   /* ★ 关键：点过就等，不再重复点 */
     logger.info('ADVANCE', '已切换到知识卡片', {
-      title: next.title, num: next.num, total: info.cards.length, cardid: String(next.cardid).slice(0, 16),
+      title: next.title, num: next.num, total: col.cards.length, cardid: nextKey.slice(0, 16),
     });
-    await this._waitCardsTasksReady(cf && cf.frameId, 5000);
+    const cf2 = this._cardsFrameInfo(st);
+    await this._waitCardsTasksReady(cf2 && cf2.frameId, 5000);
     return { progress: true, outcome: 'CARD_SWITCHED' };
+  }
+
+  /**
+   * 记录「当前挂载那张卡」的 media 任务点统计（按 cards frame 的 num 反查 cardid）。
+   * 任务点按 knowledgeid 无法区分卡片，只能按当前挂载算 —— 所以必须逐卡切过去读。
+   */
+  _recordCurrentCard(st, col) {
+    try {
+      const cf = this._cardsFrameInfo(st);
+      const curNum = cf && cf.num != null ? cf.num : null;
+      if (curNum == null) return;
+      const curCard = (col.cards || []).find((c) => Number(c.num) === Number(curNum));
+      if (!curCard) return;
+      const pv = this._sectionPendingVideos(st);
+      if (!pv || !pv.ok) return;
+      const prev = this._cardScan.get(String(curCard.cardid)) || {};
+      const rec = {
+        media: Number(pv.total) || 0,
+        finished: Number(pv.finished) || 0,
+        failed: !!prev.failed,
+      };
+      this._cardScan.set(String(curCard.cardid), rec);
+    } catch (_) { /* 记录失败不阻塞 */ }
   }
 
   /**
@@ -2389,15 +2473,32 @@ class LearnMachine {
    * 返回 false = 明确还有卡片没播完 → 不许切节。
    */
   _cardsUnionDone(st) {
-    const info = this._cardScan;
-    if (!(info instanceof Map) || !info.size) return null;
-    /* ★ D-067：扫描未完成 → 明确「还不许切节」（返回 false，不是 null）。
-       返回 null 会被上层当成「无法判定 → 按旧逻辑切节」，那就跳过了未扫的卡片。 */
-    const total = Number(this._cardScanTotal) || 0;
-    if (total > 1 && info.size < total) return false;
-    for (const v of info.values()) {
-      if (v && v.failed) continue;                        // 切不过去的卡不算「有未完成」
-      if ((Number(v.media) || 0) > (Number(v.finished) || 0)) return false;
+    /* ★ D-069（复测报告第 (2) 条）：原实现不校验 chapterId，只遍历「扫到过的卡」——
+       「没扫到的卡根本不在表里」，所以这个「并集」实际是「已扫卡的并集」，
+       天然返回不了 false → 复测里 1.3 拿上一节的 7/7 判定 true 直接放行（静默漏刷）。
+       新判据：三态 + 绑 chapterId + 未采集即 fail-closed。 */
+    const cur = this._currentTocItem(st);
+    const secKey = String((cur && cur.chapterId) || '');
+    const col = this._cardCollect;
+
+    /* 没有本节采集记录 / 记录属于别的节 → 明确不许切节（不许当成「无法判定」） */
+    if (!secKey) return null;
+    if (!col || col.key !== secKey) return false;
+
+    /* 老页面 / 单卡：没有「别的卡」概念 → 交回旧逻辑（null） */
+    if (col.state === 'none' || col.state === 'single') return null;
+
+    /* 采集未完成 / 超时 → 不许切节 */
+    if (col.state === 'pending' || col.state === 'timeout') return false;
+
+    /* multi：每一张卡都必须「已采集 且 目标类任务点全部完成」 */
+    const rec = this._cardScan;
+    if (!(rec instanceof Map)) return false;
+    for (const c of (col.cards || [])) {
+      const r = rec.get(String(c.cardid));
+      if (!r) return false;                       /* 有卡未采集 → 不许切节（fail-closed） */
+      if (r.failed) continue;                     /* 切不过去/采集失败的卡忽略（避免永久卡死） */
+      if ((Number(r.media) || 0) > (Number(r.finished) || 0)) return false;
     }
     return true;
   }

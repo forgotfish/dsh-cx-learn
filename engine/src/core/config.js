@@ -133,6 +133,10 @@ const CONFIG = {
        连续这么多次仍未确认就停止本轮，避免无限重载（也避免风控画像）。
        设为 0 可关闭该保护。 */
     videoNotConfirmedMax: 3,
+    /* ★ D-069：知识卡片清单/任务点的采集上限（毫秒）。
+       超时**停机报错**（card_detect_timeout），不静默降级成「当单卡继续」——
+       后者正是复测里 1.3 漏刷的形态。复测者建议 15s。 */
+    cardDetectTimeoutMs: 15000,
     /* 出问题（播完但超星不记账）时：暂停视频并保存快照（json + png）。
        stopOnSnapshot=true 则第一次就停，用于取证；默认 false，仍允许重试。 */
     snapshotOnProblem: true,
