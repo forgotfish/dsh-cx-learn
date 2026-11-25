@@ -137,6 +137,13 @@ const CONFIG = {
        超时**停机报错**（card_detect_timeout），不静默降级成「当单卡继续」——
        后者正是复测里 1.3 漏刷的形态。复测者建议 15s。 */
     cardDetectTimeoutMs: 15000,
+    /* ★ D-073：切卡后的「视频消失」豁免窗口（毫秒）。
+       换卡瞬间旧卡 DOM/frame 会被换掉，视频元素必然消失，不该计入失败（否则 3 次就 FATAL）。
+       复测里 1.5 的 exit 2 就有这个成分。 */
+    cardSwitchSettleMs: 8000,
+    /* ★ D-073：卡片采集失败时是否停机（默认 true）。
+       设为 false 时仍不判本节完成（fail-closed），只是不停整轮。 */
+    stopOnCardCollectFailed: true,
     /* ★ D-070：把「目标类任务点」显式化（复测者建议）。
        默认 ['video','audio'] —— **保持历史行为**（既有的 sectionVideosDone 就是只认 video/audio）。
        接答题后可在这里改成 ['video','quiz']，判据与连播/切节会自动跟随。 */

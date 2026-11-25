@@ -2,6 +2,80 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.3.5] — 2026-11-25
+
+### 修复（复测报告 v0.3.2：「谁判定本节完成」要收口）
+
+复测者真机跑 33 分钟（1.1 → 1.5）后的结论：**多卡/多视频/并集 fail-closed 全部确认生效**，
+0.2.8 那三个 fail-open 一个都没复现。剩下的问题只有一个根 ——
+**本节「是否完成」有三个判据在抢答**，答案不齐就靠日志互相打脸（D-073）。
+
+- **计数收口：`sectionsCompleted` 恒 0 → 修好**
+  - 原实现把 `sectionsCompleted += 1` 只写在「视频播完」分支尾部，
+    而「提前完成」分支排在它前面 —— 视频一到判定线 `greenEarly` 就变 false，
+    控制流被提前分支接走记 `sectionsSkipped`。
+    复测里 33 分钟走 4 节，`sectionsCompleted` 恒 0 → `maxSections` 的
+    `completed >= maxSections` 永不成立，**「连播 N 节后暂停」整轮没生效**。
+  - 修：新增 `_countSectionOutcome()` 作为**唯一出口**，判据是
+    「**本节是否真的推动过播放**」（`_playedThisSection`，在 `_markVideoStarted` 里置位，
+    覆盖「playSectionVideo」与「P0 恢复播放」两条路径）。
+    ⚠️ 刻意**不借** `_startedVideoSrcs` —— 那是「本次运行」级账本、跨节不清，
+    实测会把上一节的「播过」带到本节，导致无视频节被误记 completed。
+
+- **A 类：已绿视频白播 → 修好**
+  - 复测：1.3 卡 0 的 3424s 视频进节时已 85.9% 且平台标绿，却被 `greenEarly` 推到 98.4%，
+    **白播 7 分 19 秒**；而 1.2 同样「进节即绿」36ms 就切走 —— 差别只在第一拍有没有登记 startedHere。
+  - 修：`_noteVideoEntry(v, st)` 进节时记录「**平台是否已标绿**」，`_doneAtEntry(v)` 据此判
+    「早已看完」→ `greenEarly` 直接返回 false，不再推着播。
+    （注意：判据是「进节时平台已绿」，**不是**「进节进度 ≥ 98.5%」——复测案例进节 85.9% 就已绿。）
+
+- **B 类：1.5 收尾振荡 → UNRECOGNIZED_PAGE exit 2 → 修好**
+  - 根因：`_videoSeenThisSection` 从卡 0 带过来，切到「教学课件」卡（无视频）后
+    被判成「视频曾经出现又消失」→ `failures` 累加 3 次 → FATAL。
+  - 修：该分支区分三种情形 ——
+    1. **刚切过卡**（`_recentlySwitchedCard()`，默认 8s 豁免窗口 `safety.cardSettleMs`
+       实为 `cardSwitchSettleMs`）→ 视频消失属预期，不计数；
+    2. **当前卡本来没有目标视频**（`_currentCardHasNoTargetVideo`）→ 交回卡片驱动，不当异常；
+    3. 其余才算真异常。
+
+- **切卡守卫改为「本卡目标是否判定完成」（B3）**
+  - 原守卫要求 `!paused && !ended`（即「播到结束才允许切卡」），这是白播的另一半原因。
+  - 修：`_currentCardTargetsSettled(st)` —— 本卡 pending 为空，或平台已标绿，就允许切
+    （播放器还在播也切）。**不再比 98.5/100**。没有播放器元素时不阻塞。
+
+- **failed 卡不得参与并集通过（B8，fail-closed）**
+  - 原实现 `if (r.failed) continue` 跳过失败卡 → 并集可以虚 `true` → **既漏刷又虚增计数**。
+  - 修：`if (r.failed) return false`；并在采集失败时 `_stopOnCardCollectFailed()`
+    → 默认停机 `card_collect_failed`（`safety.stopOnCardCollectFailed: false` 可关，
+    关掉时仍**绝不判本节完成、绝不 +1**）。
+
+- **`learn.json` 的 `sections[]` 不再被冲掉（复测报告七）**
+  - `reportLearn` 原实现整份覆盖 → 只能看到当前节，「保留最近 50 节」形同虚设。
+  - 修：合并写入，保留既有 `sections`。
+
+- **补 `adapters.typeInto` 实现**
+  - 契约早声明了但 CDP 层一直没实现 → 每次启动打印
+    「adapter 未实现契约方法 → typeInto」（复测报告七的噪声）。
+  - 修：先真实点击聚焦 + `Input.insertText`。
+
+- **日志语义（复测报告七）**：不再出现「当前节已看完（超星已确认）」紧跟
+  「仍有其他卡片未完成，暂不切节」这种自相矛盾——并集判定先行，日志按最终结论输出。
+
+### 新增测试
+
+- `engine/d073-section-outcome.test.cjs`（18 项）：G1 计数唯一出口（含「不借跨节账本」）/
+  G2 进节即绿不白播 / G3 切卡守卫 / G4 换卡豁免 / G5 无目标视频卡 / G6 采集失败停机+fail-closed /
+  G7 `sections[]` 不被冲掉。
+- 变异测试保持 **25 条**，**25/25 全部被捕获**（M12 随语义更新为「回退到旧 bug」）。
+- `lessons-check` 的 L3（锚点唯一性）**当场抓出 M12 锚点失效** —— 这正是它存在的意义。
+
+### 说明
+
+- 全量 **46 个 `*.test.cjs` 全绿**，`--self-test` 全部通过（且自测 1/3 的计数已正确：
+  `sectionsCompleted=2 / sectionsSkipped=1 / quizzesAnswered=1 / max_sections_reached`）。
+- 新配置项：`safety.cardSwitchSettleMs`（默认 8000）、`safety.stopOnCardCollectFailed`（默认 true）。
+- **仍需真机复测**：1.1/1.2 进节即跳过、1.3 播完卡 3 四条且 completed+1、1.5 不再 exit 2。
+
 ## [0.3.4] — 2026-11-24
 
 ### 修复：UI 没有跟上引擎（设置页缺口）

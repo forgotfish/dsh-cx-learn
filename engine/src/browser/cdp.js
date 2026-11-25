@@ -1231,6 +1231,22 @@ function createCdpAdapter(cfg) {
       return { mode: 'cdp-input' };
     },
 
+    /**
+     * 向输入框输入文本。
+     * 契约 adapter-contract.js 早声明了 typeInto 但一直没实现 ——
+     * 每次启动都打印「adapter 未实现契约方法 → typeInto」（复测报告七的噪声）。
+     * 做法：先真实点击聚焦，再 Input.insertText（不逐键 dispatchKeyEvent）。
+     */
+    async typeInto(frameId, kind, arg, text) {
+      const r = await adapter.evalInFrame(frameId,
+        '__cx.find(' + JSON.stringify(kind) + ',' + JSON.stringify(arg === undefined ? null : arg) + ')');
+      if (!r || !r.ok || !r.rect) return { ok: false, reason: (r && r.reason) || 'not-found' };
+      await this.click(frameId, r.rect);
+      const conn = requireConn();
+      await conn.send('Input.insertText', { text: String(text === undefined ? '' : text) });
+      return { ok: true, rect: r.rect, note: r.note };
+    },
+
     async jsClick(frameId, kind, arg) {
       return adapter.evalInFrame(frameId, '__cx.jsClick(' + JSON.stringify(kind) + ',' + JSON.stringify(arg === undefined ? null : arg) + ')');
     },

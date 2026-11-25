@@ -115,10 +115,10 @@ const MUTATIONS = [
   {
     id: 'M12', scope: 'd064',
     file: 'engine/src/learn/machine.js',
-    old: '      if (r.failed) continue;                     /* 切不过去/采集失败的卡忽略（避免永久卡死） */',
-    new: '      /* mutation: 不再忽略 failed 卡 */',
+    old: '      if (r.failed) return false;',
+    new: '      if (r.failed) continue;   /* mutation: 回退到旧 bug —— 让 failed 卡虚过并集 */',
     test: 'engine/cards-switch.test.cjs',
-    why: 'failed 卡不再忽略 → B5「failed 卡忽略 → true」应红',
+    why: 'failed 卡重新被忽略（并集虚 true）→ B5「failed 卡不得参与并集通过」应红',
   },
   /* ---------------- D-067（第二批破坏测试的产物） ---------------- */
   {

@@ -581,6 +581,11 @@ class LearnMachine {
         if (!v || !v.found) return false;
         if (!this._isVideoStartedHere(v)) return false;               /* 进来时就是绿的 → 不算提前 */
         if (v.ended) return false;                                    /* 真播完了 */
+        /* ★ D-073（复测报告 A 类）：**进节时平台就已经标绿** → 「上次已看完」，
+           不是「本次起播后被推动」，绝不能再推着播（1.3 卡 0 从 85.9% 白播到 98.4%）。
+           注意判据是「进节时平台已绿」，不是「进节进度 >= 98.5%」——
+           复测案例进节 85.9% 就已经绿了。 */
+        if (this._doneAtEntry(v)) return false;
         return (v.progress || 0) < this.cfg.video.progressDoneRatio;   /* 未到判定线 */
       })();
       if (greenEarly) {
@@ -610,7 +615,7 @@ class LearnMachine {
             unfinish: doneNow.unfinish,
             total: doneNow.total,
           });
-          this.counters.sectionsSkipped += 1;
+          this._countSectionOutcome();  /* D-073 唯一出口（原 sectionsSkipped += 1） */
           this.failures = 0;
           return this.advanceSection(st);
         }
@@ -641,6 +646,8 @@ class LearnMachine {
     /* —— 视频状态（P0 / P1）—— */
     if (st.video && st.video.found) {
       this._videoSeenThisSection = true;
+      /* ★ D-073：记录本节首次看到该视频时「平台是否已绿」，用于区分「早已看完」与「本次推动」 */
+      this._noteVideoEntry(st.video, st);
       /* 「本节已完成 ⇒ 不重播」的判定已经在上面的统一闸门里做过（见 tick 开头），
          那里同时覆盖了「整节完成」与「视频任务点完成」两种情形，
          并且不会被遗留弹题抢先。这里不再重复。 */
@@ -805,7 +812,7 @@ class LearnMachine {
           });
           return { progress: false, outcome: 'WAIT_VIDEO_CONFIRM' };
         }
-        this.counters.sectionsCompleted += 1;
+        this._countSectionOutcome();  /* D-073 唯一出口（原 sectionsCompleted += 1） */
         return this.advanceSection(st);
       }
       if (st.video.paused) {
@@ -941,13 +948,28 @@ class LearnMachine {
         await humanize.pollDelay();
         return { progress: true, outcome: 'TASKPOINT_WAIT' };
       }
-      this.counters.sectionsSkipped += 1;
+      this._countSectionOutcome();  /* D-073 唯一出口（原 sectionsSkipped += 1） */
       this._videoSeenThisSection = true; // 防重复跳过
       this.failures = 0;                 // 跳过是有效进展
       return this.advanceSection(st);
     }
 
-    /* —— 视频曾经出现又消失：视为异常 —— */
+    /* —— 视频曾经出现又消失：★ D-073 要区分三种情形，不能一律当异常 —— */
+    /* (a) 刚切过知识卡片：旧卡的 DOM/frame 被换掉，视频元素必然「消失」，这是预期的 */
+    if (this._recentlySwitchedCard()) {
+      logger.info('PLAYING_CHECK', '刚切过知识卡片，视频消失属预期（豁免失败计数）', {
+        msSinceSwitch: this._cardSwitchAt ? (Date.now() - this._cardSwitchAt) : null,
+      });
+      return { progress: true, outcome: 'CARD_SWITCH_SETTLE' };
+    }
+    /* (b) 当前卡本来就没有目标视频（如「教学课件」卡）：不是异常，交回卡片驱动 */
+    if (this._currentCardHasNoTargetVideo(st)) {
+      logger.info('ADVANCE', '当前知识卡片没有目标视频任务点，交回卡片驱动（不判本节）', {
+        title: this._currentTitle,
+      });
+      return { progress: true, outcome: 'CARD_NO_TARGET_VIDEO' };
+    }
+    /* (c) 真的异常 */
     this.failures += 1;
     logger.warn('PLAYING_CHECK', '视频元素消失', { failures: this.failures });
     return { progress: false, outcome: 'VIDEO_GONE' };
@@ -2417,8 +2439,12 @@ class LearnMachine {
     const next = col.cards.find((c) => !this._cardScan.has(String(c.cardid)));
     if (!next) return null;
 
-    /* 播放中途不切卡（避免打断）；等本卡播完自然继续 */
-    if (st.video && st.video.found && !st.video.paused && !st.video.ended) return null;
+    /* ★ D-073（复测报告 B3）：切卡守卫从「播放器没 ended」改成
+         「当前卡的目标视频是否都已判定完成（平台绿 或 已记录）」。
+         原实现要求 !paused && !ended —— 复测里 1.3 卡 0 进节就已 85.9% 且平台标绿，
+         却因为「还没到 98.5%、播放器还在播」被一路推到 98.4%，白播 7 分 19 秒。
+         现在：平台已绿/本卡无未完成目标 → 允许切（播放器还在播也切）。 */
+    if (!this._currentCardTargetsSettled(st)) return null;
 
     const topId = this._topFrameId(st);
     if (!topId) return null;
@@ -2429,19 +2455,20 @@ class LearnMachine {
     this._cardClickTries.set(nextKey, tries);
     if (tries > 3) {
       this._cardScan.set(nextKey, { media: 0, finished: 0, failed: true });
-      logger.warn('ADVANCE', '这张卡片点了多次仍采集不到，标记 failed 并继续', { title: next.title, tries: tries - 1 });
-      return null;
+      logger.warn('ADVANCE', '这张卡片点了多次仍采集不到，标记 failed', { title: next.title, tries: tries - 1, cardid: nextKey.slice(0, 16) });
+      return this._stopOnCardCollectFailed(col, next, 'retry-exhausted');
     }
 
     const r = await this.clickFound(topId, 'cardsTab', { index: next.i });
     if (!r || !r.ok) {
       this._cardScan.set(nextKey, { media: 0, finished: 0, failed: true });
-      logger.warn('ADVANCE', '切换知识卡片失败，跳过该卡', {
+      logger.warn('ADVANCE', '切换知识卡片失败，标记 failed', {
         title: next.title, cardid: nextKey.slice(0, 16), reason: (r && r.reason) || null,
       });
-      return null;
+      return this._stopOnCardCollectFailed(col, next, (r && r.reason) || 'click-failed');
     }
     this._cardSwitchCount = (this._cardSwitchCount || 0) + 1;
+      this._cardSwitchAt = Date.now();   /* ★ D-073：供 PLAYING_CHECK 换卡豁免窗口 */
     this._cardAwait = { cardid: nextKey, since: Date.now() };   /* ★ 关键：点过就等，不再重复点 */
     logger.info('ADVANCE', '已切换到知识卡片', {
       title: next.title, num: next.num, total: col.cards.length, cardid: nextKey.slice(0, 16),
@@ -2540,7 +2567,10 @@ class LearnMachine {
     for (const c of (col.cards || [])) {
       const r = rec.get(String(c.cardid));
       if (!r) return false;                       /* 有卡未采集 → 不许切节（fail-closed） */
-      if (r.failed) continue;                     /* 切不过去/采集失败的卡忽略（避免永久卡死） */
+      /* ★ D-073（复测报告 B8）：采集失败的卡**不得**参与「并集通过」。
+           原实现 continue 跳过 → 并集可以虚 true → 既漏刷又虚增计数。
+           现在：有失败卡 → 本节不许判完成（上层据此停机报 card_collect_failed）。 */
+      if (r.failed) return false;
       if ((Number(r.media) || 0) > (Number(r.finished) || 0)) return false;
     }
     return true;
@@ -3104,6 +3134,7 @@ class LearnMachine {
         }
         this._startedVideoIds.add(oid);
         this._unstartableVideoIds.delete(oid);
+        this._playedThisSection = true;   /* D-073：本节确实推动过播放 */
         return { ok: true, objectid: oid, note: verified.note };
       }
       /* 没有 objectid 的老情形：保持旧语义（无法按身份验证） */
@@ -3111,11 +3142,125 @@ class LearnMachine {
       this._markVideoStarted(video);
       this._stallTicks = 0;
       this._resumeAttempts = 0;
+      this._playedThisSection = true;   /* D-073：本节确实推动过播放 */
       return { ok: true };
     } catch (e) {
       this._bumpUnstartable(oid);
       return { ok: false, reason: 'play-error: ' + String((e && e.message) || e).slice(0, 80), objectid: oid };
     }
+  }
+
+  /**
+   * ★ D-073（复测报告 B8）：采集失败的卡**不许当通过**。
+   * 默认停机（宁可停，不可漏刷后静默 +1）；可用 safety.stopOnCardCollectFailed=false 关掉，
+   * 关掉时也不 +1（由 _cardsUnionDone 的 fail-closed 保证不判完成）。
+   */
+  _stopOnCardCollectFailed(col, card, reason) {
+    const on = !(this.cfg && this.cfg.safety && this.cfg.safety.stopOnCardCollectFailed === false);
+    logger.warn('ADVANCE', '知识卡片采集失败，本节无法判定完成', {
+      title: col && col.title, card: card && card.title, reason,
+      cardid: card ? String(card.cardid).slice(0, 16) : '',
+      stop: on,
+    });
+    if (on) this.stop('card_collect_failed');
+    return null;
+  }
+
+  /**
+   * ★ D-073：记录「本视频在本节首次出现时的进度」。
+   * 用来区分「进节时早已绿」与「本次起播后被推着走」——前者不许白播。
+   */
+  _noteVideoEntry(v, st) {
+    try {
+      if (!v) return;
+      if (!(this._videoEntryDone instanceof Map)) this._videoEntryDone = new Map();
+      const k = this._videoKey(v);
+      if (!k || this._videoEntryDone.has(k)) return;
+      /* ★ 关键：记录「进节时平台是否已经认为本节视频任务点完成」。
+         复测案例：1.3 卡 0 进节进度 85.9%（< 98.5%）但平台已标绿 —— 这就是「早已看完」，
+         不该再被 greenEarly 推着播到 98.4%（白播 7 分 19 秒）。 */
+      const green = (() => { try { const r = this._videoTaskDone(st); return !!(r && r.ok); } catch (_) { return false; } })();
+      this._videoEntryDone.set(k, green);
+    } catch (_) { /* ignore */ }
+  }
+
+  /** 进节时该视频是否已被平台判为完成（= 上次已看完，本次不该再播） */
+  _doneAtEntry(v) {
+    try {
+      const k = this._videoKey(v);
+      const m = this._videoEntryDone;
+      return !!(m instanceof Map && k && m.get(k) === true);
+    } catch (_) { return false; }
+  }
+
+  _videoKey(v) {
+    const oid = String((v && v.objectid) || '');
+    if (oid) return oid;
+    return String((v && v.src) || '').slice(0, 200);
+  }
+
+  /** 进节时该视频进度是否已达判定线（= 平台早已标绿的古老视频） */
+  _greenAtEntry(v) {
+    try {
+      const k = this._videoKey(v);
+      const m = this._videoEntryProgress;
+      if (!(m instanceof Map) || !k || !m.has(k)) return false;
+      return Number(m.get(k)) >= this.cfg.video.progressDoneRatio;
+    } catch (_) { return false; }
+  }
+
+  /** 刚切过卡片的豁免窗口（默认 8s，可配 safety.cardSwitchSettleMs） */
+  _recentlySwitchedCard() {
+    const w = Number(this.cfg && this.cfg.safety && this.cfg.safety.cardSwitchSettleMs);
+    const win = w > 0 ? w : 8000;
+    const at = Number(this._cardSwitchAt || 0);
+    return at > 0 && (Date.now() - at) < win;
+  }
+
+  /**
+   * ★ D-073（B3）：当前挂载那张卡的**目标视频是否都已判定完成**。
+   * 依据：本卡 pending 为空；或平台已把本节任务点标绿（≈86% 早绿）。
+   * 不比 98.5/100，也不看播放器是否还在播。
+   */
+  _currentCardTargetsSettled(st) {
+    try {
+      /* 当前没有播放器元素 → 没有「正在播的视频」可打断，直接放行。
+         （切卡本身会把旧卡的 DOM 换掉，不必等一个不存在的播放器） */
+      if (!st || !st.video || !st.video.found) return true;
+      const pv = this._sectionPendingVideos(st);
+      if (!pv || !pv.ok) return true;                 /* 数据不可信 → 不阻塞 */
+      if (!Array.isArray(pv.pending) || pv.pending.length === 0) return true;
+      const green = this._videoTaskDone(st);
+      return !!(green && green.ok);                   /* 平台标绿即放行（早绿也算完成） */
+    } catch (_) { return true; }
+  }
+
+  /** ★ D-073（B4）：当前卡是否根本没有目标视频（如「教学课件」卡） */
+  _currentCardHasNoTargetVideo(st) {
+    try {
+      const pv = this._sectionPendingVideos(st);
+      if (pv && pv.ok) return (Number(pv.total) || 0) === 0;
+      return false;
+    } catch (_) { return false; }
+  }
+
+  /**
+   * ★ D-073（复测报告 A4）：本节计数的**唯一出口**。
+   *
+   * 原实现把 sectionsCompleted += 1 只写在「视频播完」分支尾部，而「提前完成」分支
+   * 排在它前面 —— 视频一到判定线 greenEarly 立刻变 false，控制流被提前分支接走记
+   * sectionsSkipped，于是 sectionsCompleted 恒为 0，maxSections 的
+   * completed >= maxSections 永不成立（复测 33 分钟走了 4 节，一次都没触发）。
+   *
+   * 判据：**本次是否真的推动过目标点**（_startedVideoSrcs 非空 = 本节起播过视频）。
+   */
+  _countSectionOutcome() {
+    /* ★ 不能借 _startedVideoSrcs —— 那是「本次运行」级账本、跨节不清，
+       会把上一节的「播过」带到本节（实测导致无视频节被误记 completed）。 */
+    const played = this._playedThisSection === true;
+    if (played) this.counters.sectionsCompleted += 1;
+    else this.counters.sectionsSkipped += 1;
+    return played;
   }
 
   _bumpUnstartable(oid) {
@@ -3237,6 +3382,9 @@ class LearnMachine {
    * 参考 xuexitong-ai-assistant 的 startedVideos 语义。
    */
   _markVideoStarted(video) {
+    /* ★ D-073：只要本节真的推动过播放（不论走 playSectionVideo 还是 P0 恢复播放），
+       本节计数就该记 completed。放在这里是因为两条播放路径都会经过 _markVideoStarted。 */
+    this._playedThisSection = true;
     try {
       const src = String((video && video.src) || '').slice(0, 400);
       if (src) this._startedVideoSrcs.add(src);
@@ -3394,6 +3542,9 @@ class LearnMachine {
     this._attemptedVideoIds = new Set();
     this._startedVideoIds = new Set();
     this._unstartableVideoIds = new Map();
+    this._videoEntryDone = new Map();       /* D-073：换节清「进节时平台是否已绿」快照 */
+    this._cardSwitchAt = 0;                 /* D-073：换节清换卡豁免窗口 */
+    this._playedThisSection = false;        /* D-073：本节是否真的起播过（计数唯一依据） */
     /* ★ 2026-10-31 真机（FNOS 3.4）：点了 3.4，但 knowledge/cards 播放器
        还是 3.3 那一份（772.2s），引擎只看到「有视频 + 有 duration」就当成就绪，
        于是把 3.3 当 3.4 看，最后 3.4 永远不记账，还来回重进。

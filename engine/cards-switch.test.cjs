@@ -239,9 +239,10 @@ const ONE_CARD = { ok: true, total: 1, cards: [{ i: 0, seq: 1, num: 0, total: 1,
     m._cardScan = new Map([['CARD_A', { media: 3, finished: 3 }]]);
     ok(m._cardsUnionDone(stK1) === false, '★ ★ 有卡未采集（表里没有）→ false（不是 true）');
 
-    /* failed 卡忽略 */
+    /* ★ D-073（复测报告 B8）：failed 卡**不再**被忽略 —— 它不得参与「并集通过」。
+       原实现 `if (r.failed) continue` 会让并集虚 true（既漏刷又虚增计数）。 */
     m._cardScan = new Map([['CARD_A', { media: 3, finished: 3 }], ['CARD_B', { media: 7, finished: 0, failed: true }]]);
-    ok(m._cardsUnionDone(stK1) === true, '★ failed 卡忽略 → true');
+    ok(m._cardsUnionDone(stK1) === false, '★ ★ failed 卡不得参与并集通过 → false（D-073 改）');
 
     /* 纯文档卡 media=0 不算未完成 */
     m._cardScan = new Map([['CARD_A', { media: 0, finished: 0 }], ['CARD_B', { media: 2, finished: 2 }]]);

@@ -158,9 +158,20 @@ function reportBrowser(info) {
 /** 业务层：读浏览器层留下的现状 */
 function readBrowser() { return readJson(CONTRACT.FILES.browser); }
 
-/** 业务层：报告当前学习进度 */
+/**
+ * 业务层：报告当前学习进度。
+ *
+ * ★ D-073（复测报告七）：**必须合并，不能整份覆盖**。
+ * 原实现 writeJson({layer, ...info}) 把 reportSection 写进去的 sections[] 冲掉，
+ * 于是「保留最近 50 节」实际只剩当前节。
+ */
 function reportLearn(info) {
-  return writeJson(CONTRACT.FILES.learn, Object.assign({ layer: 'learn' }, info || {}));
+  const prev = readLearn() || {};
+  const next = Object.assign({}, prev, { layer: 'learn' }, info || {});
+  if (!info || !Array.isArray(info.sections)) {
+    if (Array.isArray(prev.sections)) next.sections = prev.sections;
+  }
+  return writeJson(CONTRACT.FILES.learn, next);
 }
 /**
  * ★ D-070：把「本节卡片采集表」写进 learn.json 的 sections[]（按 chapterId upsert）。
