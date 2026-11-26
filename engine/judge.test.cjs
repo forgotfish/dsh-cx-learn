@@ -146,7 +146,20 @@ console.log('== 4. 选下一节 ==');
 
   const r3 = J.pickNextSection({ items: items2, curIdx: 3, mode: 'continue_chapters', maxSections: 5, completed: 0 });
   eq(r3.action, 'stop', '全部完成 → 停');
-  eq(r3.stopReason, 'all_done_or_no_target', '停止原因正确');
+  /* ★ D-074（复测 C1）：两种收尾必须分得开。
+     curIdx=3 就是 items2 的最后一项 → 「后面已经没有节」= toc_end_reached。 */
+  eq(r3.stopReason, 'toc_end_reached', '停止原因：已在目录最后一节 → toc_end_reached');
+
+  /* ★ D-074：用专用夹具测「后面还有节但都已完成」= toc_all_done
+     （items2 末项未完成，会 advance，测不到这条） */
+  const itemsAllDoneAfter = [
+    { i: 0, title: '1.1', done: true },
+    { i: 1, title: '1.2', done: true },
+    { i: 2, title: '1.3', done: true },
+  ];
+  const r3b = J.pickNextSection({ items: itemsAllDoneAfter, curIdx: 0, mode: 'continue_chapters', maxSections: 5, completed: 0 });
+  eq(r3b.action, 'stop', '后面只剩已完成节 → 停');
+  eq(r3b.stopReason, 'toc_all_done', '停止原因：后面还有节但全完成 → toc_all_done');
 
   const r4 = J.pickNextSection({ items, curIdx: 1, mode: 'continue_chapters', maxSections: 1, completed: 1 });
   eq(r4.action, 'stop', '达到节数上限 → 停');

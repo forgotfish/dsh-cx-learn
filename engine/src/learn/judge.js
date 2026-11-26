@@ -228,7 +228,14 @@ function pickNextSection(input) {
     break;
   }
 
-  if (!target) return { action: 'stop', skipped, stopReason: 'all_done_or_no_target' };
+  /* ★ D-074（复测 C1）：两种收尾必须分得开 ——
+     · 后面已经没有节了          → toc_end_reached
+     · 后面还有节，但都已经完成   → toc_all_done
+     两者都是 NORMAL_STOP（不算异常）。 */
+  if (!target) {
+    const restExists = (curIdx >= 0) && (curIdx + 1 < items.length);
+    return { action: 'stop', skipped, stopReason: restExists ? 'toc_all_done' : 'toc_end_reached' };
+  }
 
   if (Number(o.completed) >= Number(o.maxSections)) {
     return { action: 'stop', skipped, stopReason: 'max_sections_reached' };

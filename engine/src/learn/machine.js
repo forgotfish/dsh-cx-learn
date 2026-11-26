@@ -23,7 +23,7 @@ const { isVideoTaskDone, pendingSectionVideos, pickNextSection, pickStart } = re
  *   PLAYING_CHECK → QUIZ_INTERRUPT → SECTION_ADVANCE → WAIT_LOAD → IDLE(轮询)
  *   任意状态 → FATAL_STOP（人工验证 / 登录失效 / 连续失败 / 防呆）
  * ==========================================================================*/
-const NORMAL_STOP = ['all_done_or_no_target', 'max_sections_reached', 'chapter_boundary', 'max_runtime_exceeded', 'user_abort'];
+const NORMAL_STOP = ['all_done_or_no_target', 'toc_end_reached', 'toc_all_done', 'max_sections_reached', 'chapter_boundary', 'max_runtime_exceeded', 'user_abort'];
 
 class LearnMachine {
   constructor(adapter, cfg) {
@@ -903,6 +903,30 @@ class LearnMachine {
         });
         return { progress: false, outcome: 'VIDEO_STALLED' };
       }
+      /* ★ D-076：本节「在播但毫无进展」的兜底上限。
+         实测再现（复现包 R9 的另一种形态）：video.found=true、paused=false，
+         但 currentTime 恒为 0、duration 也为 0（播放器没真正起播 / 元数据没加载）。
+         此时 _progressStalled 的 `prev > 1` 守卫永远不成立 → _stallTicks 每轮被清零
+         → 永远不判停滞 → 无限输出「视频播放中」（自测观测到 41 拍仍在转）。
+         这里改用**本节级**判据：真的在前进就复位计时，不前进就累计；
+         超过 safety.sectionStuckTimeoutMs 停机 —— 宁可停，也不空转。 */
+      const curT = Number(st.video.currentTime) || 0;
+      if (curT > (this._lastPlayingTime || 0) + 0.2) {
+        this._lastPlayingTime = curT;
+        this._resetSectionWait();
+      } else if (this._noteSectionWait()) {
+        logger.error('PLAYING_CHECK', '视频长时间毫无进展，停机（section_stuck）', {
+          title: this._currentTitle,
+          currentTime: curT,
+          duration: Number(st.video.duration) || 0,
+          readyState: Number(st.video.readyState) || 0,
+          stalledTicks: this._stallTicks || 0,
+          waitedMs: this._sectionStuckSince ? (Date.now() - this._sectionStuckSince) : null,
+          hint: '播放器未真正起播 / 元数据未加载：duration=0 且 currentTime 不前进',
+        });
+        this.stop('section_stuck');
+        return { progress: false, outcome: 'SECTION_STUCK' };
+      }
       await humanize.pollDelay(); // 轮询节流：播放期间按 CONFIG 节奏休眠，避免热循环
       return { progress: true, outcome: 'PLAYING' };
     }
@@ -957,16 +981,39 @@ class LearnMachine {
     /* —— 视频曾经出现又消失：★ D-073 要区分三种情形，不能一律当异常 —— */
     /* (a) 刚切过知识卡片：旧卡的 DOM/frame 被换掉，视频元素必然「消失」，这是预期的 */
     if (this._recentlySwitchedCard()) {
-      logger.info('PLAYING_CHECK', '刚切过知识卡片，视频消失属预期（豁免失败计数）', {
-        msSinceSwitch: this._cardSwitchAt ? (Date.now() - this._cardSwitchAt) : null,
+      this._logThrottled('card_switch_settle', 10000, () => {
+        logger.info('PLAYING_CHECK', '刚切过知识卡片，视频消失属预期（豁免失败计数）', {
+          msSinceSwitch: this._cardSwitchAt ? (Date.now() - this._cardSwitchAt) : null,
+        });
       });
+      await humanize.pollDelay();   /* ★ D-074：原来漏了，40ms 一圈 */
       return { progress: true, outcome: 'CARD_SWITCH_SETTLE' };
     }
-    /* (b) 当前卡本来就没有目标视频（如「教学课件」卡）：不是异常，交回卡片驱动 */
+    /* (b) 当前卡本来就没有目标视频（如「教学课件」卡）：不是异常 */
     if (this._currentCardHasNoTargetVideo(st)) {
-      logger.info('ADVANCE', '当前知识卡片没有目标视频任务点，交回卡片驱动（不判本节）', {
-        title: this._currentTitle,
+      /* ★ D-074（复测 U4）：**先问并集** —— 末卡无任务点时 doneNow 永远 false，
+         并集原来是「判完之后再拦一道」的闸门，永远轮不到 → 本节结不了论 → 空转。
+         这里把它升为判据：所有已采集卡的目标点都全绿就结算并切节。 */
+      const settled = await this._trySettleByUnion(st, 'no-target-card');
+      if (settled) return settled;
+
+      this._logThrottled('card_no_target_video', 10000, () => {
+        logger.info('ADVANCE', '当前知识卡片没有目标视频任务点，交回卡片驱动（不判本节）', {
+          title: this._currentTitle,
+          cards: this._cardScan ? this._cardScan.size : 0,
+        });
       });
+      /* 等待上限：宁可停，也不无限空转（复测 1.5 曾 1240 条 / 6 分 50 秒） */
+      if (this._noteSectionWait()) {
+        logger.error('ADVANCE', '本节长时间结不了论，停机（section_stuck）', {
+          title: this._currentTitle,
+          waitedMs: Date.now() - this._sectionStuckSince,
+          cards: this._cardScan ? this._cardScan.size : 0,
+        });
+        this.stop('section_stuck');
+        return { progress: false, outcome: 'SECTION_STUCK' };
+      }
+      await humanize.pollDelay();   /* ★ D-074：原来漏了 */
       return { progress: true, outcome: 'CARD_NO_TARGET_VIDEO' };
     }
     /* (c) 真的异常 */
@@ -2437,7 +2484,13 @@ class LearnMachine {
 
     /* ---------- 阶段五：找一张「还没采集」的卡 ---------- */
     const next = col.cards.find((c) => !this._cardScan.has(String(c.cardid)));
-    if (!next) return null;
+    if (!next) {
+      /* ★ D-074：所有卡都采集完了 —— 这里同样不能只 return null 当甩手掌柜，
+         要先问并集：全绿就结算切节（否则末卡判不出结论时又回到空转）。 */
+      const settled = await this._trySettleByUnion(st, 'all-cards-collected');
+      if (settled) return settled;
+      return null;
+    }
 
     /* ★ D-073（复测报告 B3）：切卡守卫从「播放器没 ended」改成
          「当前卡的目标视频是否都已判定完成（平台绿 或 已记录）」。
@@ -3245,6 +3298,67 @@ class LearnMachine {
   }
 
   /**
+   * ★ D-074（复测 U4）：把「并集」从**闸门**升级为**判据**的出口。
+   *
+   * 死循环根因是循环依赖：
+   *   _cardsUnionDone 是唯一知道「本节全绿」的判据，但它只在 doneNow.ok === true 时被调用；
+   *   doneNow ← isVideoTaskDone，要求「当前卡有目标类任务点且全绿」；
+   *   末卡（如「教学课件」）0 个任务点 → done:false → 并集永远轮不到 → 本节结不了论。
+   *
+   * 注意：isVideoTaskDone 对空清单返回 false 是**正确**的，不许改
+   * （否则「卡片 frame 还没渲染出任务点」的一瞬会被判完成 = 漏刷）。
+   * 所以这里另开一个「不看 doneNow、直接问并集」的出口。
+   *
+   * @returns advanceSection 的结果（已切节/停机）或 null（还没全绿 / 无法判定）
+   * TODO(D-074-B)：方案 B 第一刀落地后，此判据并入单一决策点，本方法整段删除。
+   */
+  async _trySettleByUnion(st, where) {
+    let unionDone = null;
+    try { unionDone = this._cardsUnionDone(st); } catch (_) { unionDone = null; }
+    if (unionDone !== true) return null;
+    logger.info('ADVANCE', '本节所有已采集卡片的目标点均已全绿，结算并切下一节', {
+      title: this._currentTitle, where, cards: this._cardScan ? this._cardScan.size : 0,
+    });
+    this._countSectionOutcome();
+    this.failures = 0;
+    this._resetSectionWait();
+    return this.advanceSection(st);
+  }
+
+  /** ★ D-074：本节「结不了论」的计时起点复位（切节时调用） */
+  _resetSectionWait() {
+    this._sectionStuckSince = 0;
+  }
+
+  /**
+   * ★ D-074：记一次「本节还在等」；超过 sectionStuckTimeoutMs 就返回 true（该停机了）。
+   * 计数器只看**本节**，换节由 _resetSectionWait 清零。
+   */
+  _noteSectionWait() {
+    if (!this._sectionStuckSince) this._sectionStuckSince = Date.now();
+    const limit = Number(this.cfg && this.cfg.safety && this.cfg.safety.sectionStuckTimeoutMs);
+    const cap = limit > 0 ? limit : 180000;
+    return (Date.now() - this._sectionStuckSince) > cap;
+  }
+
+  /**
+   * ★ D-074：同一 key 的日志限流（默认 10 秒最多 1 条）。
+   * 复测 1.5 一次刷 1240 条同样的行，真出事时有用信息会被淹掉。
+   */
+  _logThrottled(key, ttlMs, fn) {
+    try {
+      if (!(this._throttleAt instanceof Map)) this._throttleAt = new Map();
+      const now = Date.now();
+      const ttl = ttlMs > 0 ? ttlMs : 10000;
+      const at = Number(this._throttleAt.get(key) || 0);
+      if (now - at < ttl) return false;
+      this._throttleAt.set(key, now);
+      fn();
+      return true;
+    } catch (_) { return false; }
+  }
+
+  /**
    * ★ D-073（复测报告 A4）：本节计数的**唯一出口**。
    *
    * 原实现把 sectionsCompleted += 1 只写在「视频播完」分支尾部，而「提前完成」分支
@@ -3260,6 +3374,14 @@ class LearnMachine {
     const played = this._playedThisSection === true;
     if (played) this.counters.sectionsCompleted += 1;
     else this.counters.sectionsSkipped += 1;
+    /* ★ D-074（复测 A3）：逐节可核对 —— 否则「1/2 到底哪节记成 completed」查不出来。 */
+    logger.info('ADVANCE', played ? '本节结算：本次真播过 → completed+1' : '本节结算：本次没播过 → skipped+1', {
+      section: this._currentTitle,
+      played,
+      completed: this.counters.sectionsCompleted,
+      skipped: this.counters.sectionsSkipped,
+      maxSections: this.cfg && this.cfg.maxSections,
+    });
     return played;
   }
 
@@ -3502,8 +3624,17 @@ class LearnMachine {
         this.stop('max_sections_reached');   // P4：最大节数上限
         return { progress: false, outcome: 'MAX_SECTIONS' };
       }
-      this.stop(decision.stopReason || 'all_done_or_no_target');
-      return { progress: false, outcome: 'ALL_DONE' };
+        /* ★ D-074（复测 C2）：停机前必须打一行，且两种收尾分得开。
+           原来「后面还有节但全完成」与「后面已经没有节」合并成一个字符串，事后分不出来。 */
+        logger.info('ADVANCE', '已到收尾点，停机', {
+          reason: decision.stopReason || 'all_done_or_no_target',
+          current: this._currentTitle,
+          completed: this.counters.sectionsCompleted,
+          skipped: this.counters.sectionsSkipped,
+          maxSections: this.cfg && this.cfg.maxSections,
+        });
+        this.stop(decision.stopReason || 'all_done_or_no_target');
+        return { progress: false, outcome: 'ALL_DONE' };
     }
 
     const target = decision.target;
@@ -3545,6 +3676,9 @@ class LearnMachine {
     this._videoEntryDone = new Map();       /* D-073：换节清「进节时平台是否已绿」快照 */
     this._cardSwitchAt = 0;                 /* D-073：换节清换卡豁免窗口 */
     this._playedThisSection = false;        /* D-073：本节是否真的起播过（计数唯一依据） */
+    this._sectionStuckSince = 0;            /* D-074：换节清「结不了论」计时 */
+    this._lastPlayingTime = 0;              /* D-076：换节清「上次播放位置」 */
+    this._throttleAt = new Map();           /* D-074：换节清日志限流表 */
     /* ★ 2026-10-31 真机（FNOS 3.4）：点了 3.4，但 knowledge/cards 播放器
        还是 3.3 那一份（772.2s），引擎只看到「有视频 + 有 duration」就当成就绪，
        于是把 3.3 当 3.4 看，最后 3.4 永远不记账，还来回重进。

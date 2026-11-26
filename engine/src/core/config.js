@@ -141,6 +141,11 @@ const CONFIG = {
        换卡瞬间旧卡 DOM/frame 会被换掉，视频元素必然消失，不该计入失败（否则 3 次就 FATAL）。
        复测里 1.5 的 exit 2 就有这个成分。 */
     cardSwitchSettleMs: 8000,
+    /* ★ D-074：本节「结不了论」的等待上限（毫秒）。
+       复测 1.5：末卡（教学课件）0 个任务点 → doneNow 永远 false → 并集永远轮不到
+       → 每拍都落进「没有目标视频」分支，1240 条 / 6 分 50 秒，只能等 12 小时兜底。
+       超过此值即 stop('section_stuck')，宁可停也不空转。 */
+    sectionStuckTimeoutMs: 180000,
     /* ★ D-073：卡片采集失败时是否停机（默认 true）。
        设为 false 时仍不判本节完成（fail-closed），只是不停整轮。 */
     stopOnCardCollectFailed: true,

@@ -195,6 +195,15 @@ const MUTATIONS = [
     test: 'engine/d069-union-gate.test.cjs',
     why: '恢复「平台标绿就切节」→ F4 应红（86% 直接切走）',
   },
+  /* ---------------- D-076（播放中无进展必须停机） ---------------- */
+  {
+    id: 'M26', scope: 'd076',
+    file: 'engine/src/learn/machine.js',
+    old: '      } else if (this._noteSectionWait()) {',
+    new: '      } else if (false && this._noteSectionWait()) {   /* mutation: 兜底永不触发 */',
+    test: 'engine/d076-playing-no-progress.test.cjs',
+    why: '播放中无进展兜底失效 → P1「有限拍内停机」应红（实测 201 拍不停）',
+  },
   /* ---------------- D-070（targetKinds + 状态落盘） ---------------- */
   {
     id: 'M22', scope: 'd070',

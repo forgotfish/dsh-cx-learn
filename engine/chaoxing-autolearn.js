@@ -67,6 +67,7 @@ const {
 } = require('./src/courses.js');
 const { serveMcp, parseArgs } = require('./src/mcp.js');
 const { selfTest, createMockAdapter } = require('./src/selftest.js');
+const { exportRepro, replay } = require('./src/repro-cli.js');
 
 /* 退出守卫要在模块加载时就装上：之后任何退出路径（正常/异常/SIGTERM）都会收掉浏览器，
    否则 headless Chrome 会一直占着调试端口和 profile 目录。 */
@@ -95,7 +96,23 @@ module.exports = {
 /* ── CLI 入口 ───────────────────────────────────────────────────────────────*/
 if (require.main === module) {
   const args = parseArgs(process.argv.slice(2));
-  if (args['self-test']) {
+  if (args['export-repro']) {
+    /* ★ D-075：从本机已落盘的诊断快照生成**脱敏复现包**（不新开浏览器、不访问课程页）。
+       复测者跑完一轮后执行，把文件/口令贴到 issue；维护者用 --replay 复现，双方零泄露。 */
+    try {
+      const r = exportRepro(args);
+      console.log(JSON.stringify(r));
+      process.exit(r.ok ? 0 : 1);
+    } catch (e) {
+      console.error('FATAL: ' + String((e && e.stack) || e).slice(0, 600));
+      process.exit(1);
+    }
+  } else if (args['replay'] !== undefined) {
+    /* ★ D-075：用复现包驱动状态机，不需要任何账号。--replay=<文件|REPRO1.口令> */
+    replay(args)
+      .then((r) => { console.log(JSON.stringify(r, null, 2)); process.exit(r.ok ? 0 : 1); })
+      .catch((e) => { console.error('FATAL: ' + String((e && e.stack) || e).slice(0, 600)); process.exit(1); });
+  } else if (args['self-test']) {
     selfTest().then((ok) => process.exit(ok ? 0 : 1)).catch((e) => { console.error('自测异常:', e && e.stack || e); process.exit(1); });
   } else if (args['check-login']) {
     /* 登录态预检：只访问个人空间判断是否已登录，不开二维码。宿主 start 前调用。 */

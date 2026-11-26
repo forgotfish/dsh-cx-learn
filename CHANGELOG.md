@@ -2,6 +2,164 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.3.8] — 2026-11-26
+
+> **0.3.7 与 0.3.8 合并发布**：0.3.7 从未公开发布，内容并入本版（本地提交次数 ≠ 版本数）。
+
+---
+
+
+### 修复：播放中「毫无进展」时无限空转（D-076）
+
+0.3.7 顺带发现的另一个空转形态，**这次修掉了**：
+`video.found = true`、`paused = false`（看起来在播），但 `currentTime` 恒为 0、
+`duration` 也是 0（播放器没真正起播 / 元数据没加载）。
+状态机会无限输出 `视频播放中`（自测观测到 41 拍仍在转，真机时序更慢但同样不收敛）。
+
+**根因**：`_progressStalled` 里有 `prev > 1` 守卫 ——
+`prev` 恒为 0 时永不进入停滞判定，`_stallTicks` 每轮被清零，永远返回 false。
+
+**修法**：在 PLAYING 分支加**本节级**兜底（判据是「本节是否真的在前进」，覆盖所有空转形态）：
+
+- `currentTime` 前进 → 复位本节等待计时（长视频不会被误杀）
+- 不前进 → 累计；超过 `safety.sectionStuckTimeoutMs`（默认 180s）→ `stop('section_stuck')`
+- 停机日志带 `currentTime` / `duration` / `readyState` / `stalledTicks` / `waitedMs` + 明确 hint
+
+### 新增测试
+
+`engine/d076-playing-no-progress.test.cjs`（10 项）：
+
+| 组 | 覆盖 |
+|---|---|
+| **P1** | 持续不前进 → 有限拍内 `stop('section_stuck')`，**不是**靠拍数上限兜底（实测 9 拍） |
+| **P2** | 一直在前进（7200s 长视频）→ **不许误杀**（跑了 61 拍仍不停） |
+| **P3** | 停滞 5 拍后恢复前进 → 计时复位，不被误停 |
+| **P4** | 停机日志带 duration / currentTime / readyState / waitedMs |
+
+**变异验证闭环**（不是只看绿）：
+- 注入变异（兜底永不触发）→ **P1 变红**：201 拍仍在转、`stopReason=null`
+- 还原 → **P1 变绿**：9 拍停机、`section_stuck`
+- 变异条目 **M26** 已加入 `scripts/mutation-test.cjs`，自动捕获通过
+
+### 验证
+
+- 全量 **49 个 `*.test.cjs` 全绿**；`--self-test` 14 组全过；`lessons-check` 10/10
+- 变异测试 **26 条**，26/26 全捕获
+
+### 新增：脱敏复现包 `--export-repro` / `--replay`（D-075）
+
+复测者要能「把出问题的章节结构交给维护者」，但**课程 URL 绝对不能发**：
+`enc` / `cpi` / `openc` 是会话绑定的短期票据 —— 过期就废、绑着他的 cookie、
+能进就等于把账号借出去，而 issue 是公开的。
+
+改为交换**结构指纹**：
+
+```bash
+# 复测者：跑完一轮复现问题后（读本机已落盘的诊断快照 + learn.json，不新开浏览器）
+node engine/chaoxing-autolearn.js --export-repro --token
+#   → 写出 .state/repro-<ts>.json；--token 额外打印一行 REPRO1.xxx（约 700 字符，可直接贴 issue）
+
+# 维护者：不需要任何账号
+node engine/chaoxing-autolearn.js --replay=REPRO1.xxx
+#   → mock 适配器驱动真状态机 → {ok, converged, ticks, outcome, counters}
+```
+
+**双向保护，靠两条设计原则：**
+
+1. **白名单投影**（不是「脱敏/黑名单替换」）—— 只从输入里挑允许的字段构造新对象，
+   黑名单永远会漏字段名，漏一个就等于泄露。允许清单写死在 `repro.js` 的 `ALLOW_*` 里。
+2. **per-bundle 随机盐 hash** —— 包内同一 chapter 的任务点 hash 一致（能看出归属），
+   每次导出的盐都不同，**跨包不可关联**（盐不出包）。
+
+| 类别 | 处理 |
+|---|---|
+| `enc`/`cpi`/`openc`/cookie/token/JSESSIONID | **整字段删除** |
+| `courseId`/`clazzid`/`chapterId`/`cardid`/`objectid` | `h_` + 12 位 hash |
+| 课程名 / 含人名标题 | hash（`hashed:h_…`） |
+| 通用标题（教学视频/教学课件/教案/纯序号…） | 保留 |
+| 本机路径 / 主机名 / 用户名 / 学号 / 头像 | **压根不采集** |
+| 截图 | **默认不导出**（最可能含真名/学号） |
+| 时长 / 进度 / 任务点类型 / 完成状态 / 卡片数量顺序 | 保留（复现必需） |
+
+### 新增测试
+
+`engine/repro.test.cjs`（64 项）—— 对**塞满真实身份信息的恶意输入**断言输出零泄露：
+
+- **R1** 15 个敏感**值** + 16 个敏感**键** + 本机路径，全部不出现在包内
+- **R2** 标识符只以 `h_` 形式出现；**全文无裸 32 位 hex**（真 objectid 不可能残留）
+- **R3** 同盐稳定 / 随机盐跨包不可关联 / 不同卡不塌缩
+- **R4/R5** 通用词保留、含人名 hash、`--keep-titles` 才放开
+- **R6** 单行口令往返一致、坏口令明确报错、口令二进制里也没有原值
+- **R7** 夹具 `video.found=false`（复刻 1.5 末卡无任务点形态）
+- **R8** null / 垃圾输入不崩
+- **R9** ★ 复现包驱动真状态机，2 拍收敛、计数 +1（**不得空转**）
+
+### 新增文档
+
+`docs/REPRO-BUNDLE.md` —— 为什么不能发 URL、三步用法、包里有什么/没什么、可选参数。
+
+### 验证
+
+- 全量 **48 个 `*.test.cjs` 全绿**；`--self-test` 14 组全过；`lessons-check` 10/10
+- **真实执行**两个命令（假 state 目录 → 导出 → 文件 replay / 口令 replay 均 `ok:true`、2 拍收敛）
+- 真实执行确认：导出的包内**不含** `enc`/`cpi`/chapterId/cardid/objectid/课程名/人名
+
+## [0.3.6] — 2026-11-26
+
+### 修复（复测 v0.3.5：1.5 死循环 1240 条 / 6 分 50 秒）
+
+复测确认 0.3.5 四项修对：**白播没了**（1.3 只播 1.9 秒就切卡）、**换卡豁免生效**（21 次豁免、0 次计失败）、
+**多卡采集全绿**、**计数器活了**（0.3.2 是 0/4，0.3.5 是 1/2）。
+
+新问题是**循环依赖**：
+
+- 并集 `_cardsUnionDone` 是唯一知道「本节全绿」的判据，但它**只在 doneNow.ok 时被调用**；
+- `doneNow` ← `isVideoTaskDone`，要求「当前卡有目标任务点且全绿」；
+- 末卡（「教学课件」）**0 个任务点** → `done:false` → 并集永远轮不到 → 本节结不了论；
+- 该分支还返回 `progress:true`，把「连续 3 次失败」与「连续 9 轮无进展」两个防呆**同时清零**，
+  于是 40ms 一圈、峰值 25 圈/秒，只有 `maxRuntimeMs=12h` 兜底。
+
+**修法（方案 A + 安全网；B 排期）：**
+
+| 编号 | 修法 |
+|---|---|
+| **A1** | 新增 `_trySettleByUnion()`：**不看 doneNow、直接问并集**。全绿 → 计数 + 切节。接入两处：①「当前卡没有目标视频」分支 ②卡片驱动 `if(!next)`（所有卡采集完）。**这一步就把并集从「闸门」升成了「判据」** |
+| **A2** | 该分支补 `await humanize.pollDelay()`（原来漏了，40ms 一圈）+ 新增**本节等待上限** `safety.sectionStuckTimeoutMs`（默认 **180s**）→ 超时 `stop('section_stuck')`。宁可停，不可空转 |
+| **A3** | `_countSectionOutcome()` 打日志：`本节结算：本次真播过 → completed+1` / `本次没播过 → skipped+1`，带本节标题与本轮累计 —— 否则「1/2 到底哪节记成 completed」查不出来 |
+| **C1** | 收尾原因拆分：`toc_end_reached`（后面没节了）/ `toc_all_done`（后面还有节但都完成），两者都进 `NORMAL_STOP` |
+| **C2** | 停机前必打一行 `已到收尾点，停机 {reason,current,completed,skipped,maxSections}` |
+| **日志限流** | 同一 outcome **10 秒最多 1 条**（`_logThrottled`），避免 1240 条把有效信息淹掉 |
+
+> **没有改 `isVideoTaskDone` 对空清单返回 `false`** —— 复测者明确说这是对的（否则「卡片 frame
+> 还没渲染出任务点」的一瞬会被判完成 = 漏刷），`judge.test.cjs` 已固化该行为。
+
+### 新增测试
+
+`engine/d074-no-target-card.test.cjs`（9 项，**按复测者要求先写 red 再修**）：
+
+- **U4a** 末卡无任务点 + 并集全绿 → 20 拍内产出结论、计数恰好 +1、记为 `skipped`
+- **U4b** 末卡无任务点 + 并集未全绿 → 不许 advance，且有限拍内 `stop('section_stuck')`
+- **U4c** 30 拍里「没有目标视频」日志 ≤ 1 条（原来 30 条）
+- **U4d** `toc_end_reached` / `toc_all_done` 可分，且都在 `NORMAL_STOP`
+
+### 新配置项
+
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `safety.sectionStuckTimeoutMs` | 180000 | 本节「结不了论」的等待上限，超时停 `section_stuck` |
+
+### 验证
+
+- 全量 **47 个 `*.test.cjs` 全绿**；`--self-test` 14 组全过
+- 自测日志已可见新行：`本节结算：本次真播过 → completed+1`、`已到收尾点，停机 {"reason":"toc_end_reached"}`
+- `lessons-check` 10/10
+
+### 未做（诚实标注）
+
+复测报告的 **方案 B（单一决策点，两刀落地）** 本次未做。本次是 A（收口 + 安全网），
+`_trySettleByUnion` 已标注 `TODO(D-074-B)`，等 B 第一刀落地时整段删除。
+如果这轮真机还有振荡，就按 B 做彻底分离。
+
 ## [0.3.5] — 2026-11-25
 
 ### 修复（复测报告 v0.3.2：「谁判定本节完成」要收口）
