@@ -146,6 +146,15 @@ const CONFIG = {
        → 每拍都落进「没有目标视频」分支，1240 条 / 6 分 50 秒，只能等 12 小时兜底。
        超过此值即 stop('section_stuck')，宁可停也不空转。 */
     sectionStuckTimeoutMs: 180000,
+    /* ★ D-077：判定「本节这一轮真的播过」的阈值（决定 completed 还是 skipped）。
+       复测教训：只看「点过播放」会把「点一下推动加载、真播 0.2 秒」也算成播过，
+       于是白占 maxSections 配额（一轮 3 节预算只兑现 1 节）。
+       现在要求「实际推进 ≥ N 秒」或「最大进度 ≥ M%」才算 completed。 */
+    completedMinPlayedSec: 30,
+    completedMinProgressPct: 5,
+    /* ★ D-078：本节连续 N 拍「结不了论」就主动保存诊断快照。
+       空转是「没被检测到」的问题，不主动拍的话 --export-repro 导出的包是空的。 */
+    proactiveSnapshotTicks: 3,
     /* ★ D-073：卡片采集失败时是否停机（默认 true）。
        设为 false 时仍不判本节完成（fail-closed），只是不停整轮。 */
     stopOnCardCollectFailed: true,

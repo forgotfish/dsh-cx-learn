@@ -155,6 +155,8 @@ function sanitizeRepro(input, opts) {
   /* --- 4c. 环境：只留版本与家族，不含路径/主机名/用户名 --- */
   const env = src.env || {};
   const environment = {
+    /* ★ D-078：插件版本 —— 用来把复现包归到某个 release（引擎内部 VERSION 恒 1.0.0 不可用） */
+    pluginVersion: String(env.pluginVersion || '').slice(0, 20),
     engineVersion: String(env.engineVersion || '').slice(0, 20),
     dshVersion: String(env.dshVersion || '').slice(0, 40),
     nodeMajor: Number(env.nodeMajor) || 0,

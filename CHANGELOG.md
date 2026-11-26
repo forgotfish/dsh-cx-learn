@@ -2,6 +2,60 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.3.9] — 2026-11-27
+
+### 修复：计数把「点过播放」当成「播过」—— 白占 maxSections 配额（D-077）
+
+复测 v0.3.8 真机抓到的错，有实际后果：**一轮 3 节预算只兑现 1 节真视频**。
+
+根因：`_playedThisSection` 被放在 `_markVideoStarted` 里，而后者也会被
+「看到进度 > 0.5% 就标记」这条路径调用。于是：
+- 1.1/1.2 元数据就绪、没点 → `played:false` → `skipped+1`（对）
+- 1.3/1.5 `readyState=0`，WAIT_LOAD 点了 `videoToggle` **推动加载** → 实际只播 **1.9 秒 / 0.2 秒**
+  → progress 过 0.5% → `played:true` → `completed+1`（**错**）
+
+**修法（按复测者建议）**：判据换成**实际前进量** ——
+`maxAdvanceSec >= safety.completedMinPlayedSec`（默认 30 秒）
+**或** `maxProgressPct >= safety.completedMinProgressPct`（默认 5%）才记 completed；否则 skipped（不占配额）。
+
+同时把判据明细打进结算日志，这类错以后一眼可查：
+
+```
+本节结算：本次没播过 → skipped+1 {"maxAdvanceSec":1.9,"maxProgressPct":0.1,"needSec":30,"needPct":5,...}
+```
+
+### 新增：主动快照（D-078）—— 让复现包不再是空的
+
+复测者指出最关键的一条：`captureProblemSnapshot` 只在「检测到问题」时触发，
+而**空转恰恰是「没被检测到」的问题** —— 越需要排障的节越没有快照，`--export-repro` 导出 `snapshotsUsed: 0`。
+
+- 新增 `_maybeProactiveSnapshot()`：本节连续 **3 拍**（`safety.proactiveSnapshotTicks`）结不了论
+  → 主动拍一张 `section_stuck_proactive`（每节最多一次，不刷盘）
+- 接入两条空转路径：「当前卡无目标视频」与「PLAYING 但毫无进展」
+
+### 其他（复测第 6 条 + repro 可用性）
+
+- **maxSections 停机行**现在自带对比：`已到本轮节数上限，停机 {"reason":"max_sections_reached","completed":3,"maxSections":3,"skipped":...,"current":...}`
+- **`environment.pluginVersion`**：原来读的是引擎内部 `VERSION`（恒 `1.0.0`），
+  导致 0.3.5 与 0.3.8 的包完全一样、无法归到某个 release。现在读**插件** `package.json` 的 version。
+- **`--export-repro` 增加 `tip` / `lastSection` / `snapshotsHint`**：
+  明确提醒「**症状还在屏幕上时**导出」（跑完再导只能拿到收尾那一节的平凡态）。
+- 文档 `docs/REPRO-BUNDLE.md` 补三节：导出时机、沙箱下用 `--out`、`pluginVersion` 字段。
+
+### 新增测试
+
+- `engine/d077-count-by-progress.test.cjs`（10 项）：
+  C1 只播 1.9s/0.2s → skipped（**复测真机两种形态**）/ C2 实播 120s → completed /
+  C3 进度 99.6% → completed / C4 端到端「几乎不动」→ skipped / C5 端到端「正常推进」→ completed /
+  C6 主动快照只拍一次 / C7 pluginVersion
+- `d073` 的 G1 已按新语义重写，并加入 1.3/1.5 真机形态反例
+
+### 验证
+
+- 全量 **50 个 `*.test.cjs` 全绿**；`--self-test` 14 组全过
+- 变异 **28 条**（新增 M27），全捕获
+- `lessons-check` 的 L3 锚点自检**又一次**在改动后抓出 M26 失效（已修）
+
 ## [0.3.8] — 2026-11-26
 
 > **0.3.7 与 0.3.8 合并发布**：0.3.7 从未公开发布，内容并入本版（本地提交次数 ≠ 版本数）。

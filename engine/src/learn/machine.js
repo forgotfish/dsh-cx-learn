@@ -648,6 +648,8 @@ class LearnMachine {
       this._videoSeenThisSection = true;
       /* ★ D-073：记录本节首次看到该视频时「平台是否已绿」，用于区分「早已看完」与「本次推动」 */
       this._noteVideoEntry(st.video, st);
+      /* ★ D-077：累计本节实际播放推进量（completed / skipped 的判据） */
+      this._noteSectionProgress(st.video);
       /* 「本节已完成 ⇒ 不重播」的判定已经在上面的统一闸门里做过（见 tick 开头），
          那里同时覆盖了「整节完成」与「视频任务点完成」两种情形，
          并且不会被遗留弹题抢先。这里不再重复。 */
@@ -914,7 +916,8 @@ class LearnMachine {
       if (curT > (this._lastPlayingTime || 0) + 0.2) {
         this._lastPlayingTime = curT;
         this._resetSectionWait();
-      } else if (this._noteSectionWait()) {
+        this._proactiveSnapTicks = 0;
+      } else if ((this._maybeProactiveSnapshot(st), this._noteSectionWait())) {
         logger.error('PLAYING_CHECK', '视频长时间毫无进展，停机（section_stuck）', {
           title: this._currentTitle,
           currentTime: curT,
@@ -1003,6 +1006,8 @@ class LearnMachine {
           cards: this._cardScan ? this._cardScan.size : 0,
         });
       });
+      /* ★ D-078：先把「结不了论」的现场拍下来（否则复现包是空的） */
+      this._maybeProactiveSnapshot(st);
       /* 等待上限：宁可停，也不无限空转（复测 1.5 曾 1240 条 / 6 分 50 秒） */
       if (this._noteSectionWait()) {
         logger.error('ADVANCE', '本节长时间结不了论，停机（section_stuck）', {
@@ -3187,7 +3192,6 @@ class LearnMachine {
         }
         this._startedVideoIds.add(oid);
         this._unstartableVideoIds.delete(oid);
-        this._playedThisSection = true;   /* D-073：本节确实推动过播放 */
         return { ok: true, objectid: oid, note: verified.note };
       }
       /* 没有 objectid 的老情形：保持旧语义（无法按身份验证） */
@@ -3195,7 +3199,6 @@ class LearnMachine {
       this._markVideoStarted(video);
       this._stallTicks = 0;
       this._resumeAttempts = 0;
-      this._playedThisSection = true;   /* D-073：本节确实推动过播放 */
       return { ok: true };
     } catch (e) {
       this._bumpUnstartable(oid);
@@ -3234,6 +3237,28 @@ class LearnMachine {
          不该再被 greenEarly 推着播到 98.4%（白播 7 分 19 秒）。 */
       const green = (() => { try { const r = this._videoTaskDone(st); return !!(r && r.ok); } catch (_) { return false; } })();
       this._videoEntryDone.set(k, green);
+      /* ★ D-077：同时记下进节时的 currentTime —— 后面用它算「本次实际推进了多少秒」。 */
+      if (!(this._videoEntryTime instanceof Map)) this._videoEntryTime = new Map();
+      if (!this._videoEntryTime.has(k)) this._videoEntryTime.set(k, Number(v.currentTime) || 0);
+    } catch (_) { /* ignore */ }
+  }
+
+  /**
+   * ★ D-077：累计本节「实际播放量」——completed / skipped 的判据。
+   * 判据是**实际推进**，不是「点过播放按钮」：
+   *   advanceSec  = 本视频 currentTime - 进节时 currentTime
+   *   progressPct = 本节见过的最大进度
+   * 「点一下推动加载、真播 0.2 秒」不会被算成播过（复测 1.3/1.5 就是这样白占配额）。
+   */
+  _noteSectionProgress(v) {
+    try {
+      if (!v || !v.found) return;
+      const k = this._videoKey(v);
+      const entryTime = (this._videoEntryTime instanceof Map && k) ? Number(this._videoEntryTime.get(k)) || 0 : 0;
+      const adv = Math.max(0, (Number(v.currentTime) || 0) - entryTime);
+      if (adv > (this._maxAdvanceThisSection || 0)) this._maxAdvanceThisSection = adv;
+      const pct = Number(v.progress) || 0;
+      if (pct > (this._maxProgressThisSection || 0)) this._maxProgressThisSection = pct;
     } catch (_) { /* ignore */ }
   }
 
@@ -3342,6 +3367,36 @@ class LearnMachine {
   }
 
   /**
+   * ★ D-078（复测最关键的一条）：**主动快照**。
+   *
+   * 复测者指出：captureProblemSnapshot 只在「检测到问题」时触发，而**空转恰恰是
+   * 「没被检测到」的问题** —— 越需要排障的节，越不会留下诊断快照，于是 --export-repro
+   * 导出的包是空的（snapshotsUsed: 0）。
+   *
+   * 这里在「本节结不了论」的路径上主动拍一次：连续 N 拍仍在等（且本节还没拍过）
+   * → captureProblemSnapshot('section_stuck_proactive')。每节最多一次，不刷盘。
+   */
+  _maybeProactiveSnapshot(st) {
+    try {
+      if (this._proactiveSnapDone) return;
+      this._proactiveSnapTicks = (this._proactiveSnapTicks || 0) + 1;
+      const need = Number(this.cfg && this.cfg.safety && this.cfg.safety.proactiveSnapshotTicks);
+      if (this._proactiveSnapTicks < (need > 0 ? need : 3)) return;
+      this._proactiveSnapDone = true;
+      logger.warn('DIAG', '本节连续多拍结不了论，主动保存诊断快照（供 --export-repro 使用）', {
+        title: this._currentTitle,
+        ticks: this._proactiveSnapTicks,
+        maxAdvanceSec: Math.round((Number(this._maxAdvanceThisSection) || 0) * 10) / 10,
+        cards: this._cardScan ? this._cardScan.size : 0,
+      });
+      if (this.captureProblemSnapshot) {
+        Promise.resolve(this.captureProblemSnapshot(st || this._lastState || {}, 'section_stuck_proactive'))
+          .catch(() => { /* 快照失败不影响主流程 */ });
+      }
+    } catch (_) { /* ignore */ }
+  }
+
+  /**
    * ★ D-074：同一 key 的日志限流（默认 10 秒最多 1 条）。
    * 复测 1.5 一次刷 1240 条同样的行，真出事时有用信息会被淹掉。
    */
@@ -3369,15 +3424,27 @@ class LearnMachine {
    * 判据：**本次是否真的推动过目标点**（_startedVideoSrcs 非空 = 本节起播过视频）。
    */
   _countSectionOutcome() {
-    /* ★ 不能借 _startedVideoSrcs —— 那是「本次运行」级账本、跨节不清，
-       会把上一节的「播过」带到本节（实测导致无视频节被误记 completed）。 */
-    const played = this._playedThisSection === true;
+    /* ★ D-077（复测真机）：判据从「点过播放」改成「本节实际播了多久 / 推进了多少」。
+       复测证据：1.3 只播 1.9 秒 / 3424.4 秒、1.5 只播 0.2 秒 / 5211.6 秒，却都记了
+       completed+1 —— 因为 WAIT_LOAD 里点了 videoToggle 推动加载，progress 过 0.5%
+       就触发 _markVideoStarted，而「播过」标志原本放在那个函数里。
+       后果：maxSections=3 的配额被这两节占掉，一轮只兑现 1 节真视频。 */
+    const minSec = Number(this.cfg && this.cfg.safety && this.cfg.safety.completedMinPlayedSec);
+    const minPct = Number(this.cfg && this.cfg.safety && this.cfg.safety.completedMinProgressPct);
+    const sec = Number(this._maxAdvanceThisSection) || 0;
+    const pct = Number(this._maxProgressThisSection) || 0;
+    const played = sec >= (minSec > 0 ? minSec : 30) || pct >= (minPct > 0 ? minPct : 5);
     if (played) this.counters.sectionsCompleted += 1;
     else this.counters.sectionsSkipped += 1;
     /* ★ D-074（复测 A3）：逐节可核对 —— 否则「1/2 到底哪节记成 completed」查不出来。 */
     logger.info('ADVANCE', played ? '本节结算：本次真播过 → completed+1' : '本节结算：本次没播过 → skipped+1', {
       section: this._currentTitle,
       played,
+      /* ★ D-077：把判据打出来，否则「凭什么算 completed」还是查不出来 */
+      maxAdvanceSec: Math.round(sec * 10) / 10,
+      maxProgressPct: Math.round(pct * 10) / 10,
+      needSec: minSec > 0 ? minSec : 30,
+      needPct: minPct > 0 ? minPct : 5,
       completed: this.counters.sectionsCompleted,
       skipped: this.counters.sectionsSkipped,
       maxSections: this.cfg && this.cfg.maxSections,
@@ -3504,9 +3571,10 @@ class LearnMachine {
    * 参考 xuexitong-ai-assistant 的 startedVideos 语义。
    */
   _markVideoStarted(video) {
-    /* ★ D-073：只要本节真的推动过播放（不论走 playSectionVideo 还是 P0 恢复播放），
-       本节计数就该记 completed。放在这里是因为两条播放路径都会经过 _markVideoStarted。 */
-    this._playedThisSection = true;
+    /* ★ D-077：**这里不再置「播过」标志**。
+       复测教训：本函数也会被「看到进度 > 0.5% 就标记」的路径调用，
+       于是「点一下推动加载、真播 0.2 秒」也会被算成播过（1.3/1.5 就是这样白占配额）。
+       现在改为累计实际推进量（_noteSectionProgress），由 _countSectionOutcome 判定。 */
     try {
       const src = String((video && video.src) || '').slice(0, 400);
       if (src) this._startedVideoSrcs.add(src);
@@ -3621,6 +3689,15 @@ class LearnMachine {
         return { progress: false, outcome: 'CHAPTER_BOUNDARY' };
       }
       if (decision.stopReason === 'max_sections_reached') {
+        /* ★ D-078（复测第 6 条）：停止行本身也要有 completed / maxSections 对比，
+           否则「一眼看配额」还得往上翻一行结算日志。 */
+        logger.info('ADVANCE', '已到本轮节数上限，停机', {
+          reason: 'max_sections_reached',
+          completed: this.counters.sectionsCompleted,
+          maxSections: this.cfg && this.cfg.maxSections,
+          skipped: this.counters.sectionsSkipped,
+          current: this._currentTitle,
+        });
         this.stop('max_sections_reached');   // P4：最大节数上限
         return { progress: false, outcome: 'MAX_SECTIONS' };
       }
@@ -3675,9 +3752,13 @@ class LearnMachine {
     this._unstartableVideoIds = new Map();
     this._videoEntryDone = new Map();       /* D-073：换节清「进节时平台是否已绿」快照 */
     this._cardSwitchAt = 0;                 /* D-073：换节清换卡豁免窗口 */
-    this._playedThisSection = false;        /* D-073：本节是否真的起播过（计数唯一依据） */
     this._sectionStuckSince = 0;            /* D-074：换节清「结不了论」计时 */
     this._lastPlayingTime = 0;              /* D-076：换节清「上次播放位置」 */
+    this._maxAdvanceThisSection = 0;        /* D-077：本节最大实际推进秒数 */
+    this._proactiveSnapTicks = 0;           /* D-078：主动快照的拍数计数 */
+    this._proactiveSnapDone = false;        /* D-078：本节已主动拍过快照 */
+    this._maxProgressThisSection = 0;       /* D-077：本节最大进度百分比 */
+    this._videoEntryTime = new Map();       /* D-077：本节各视频的进节 currentTime */
     this._throttleAt = new Map();           /* D-074：换节清日志限流表 */
     /* ★ 2026-10-31 真机（FNOS 3.4）：点了 3.4，但 knowledge/cards 播放器
        还是 3.3 那一份（772.2s），引擎只看到「有视频 + 有 duration」就当成就绪，

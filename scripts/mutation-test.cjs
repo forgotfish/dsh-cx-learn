@@ -199,10 +199,19 @@ const MUTATIONS = [
   {
     id: 'M26', scope: 'd076',
     file: 'engine/src/learn/machine.js',
-    old: '      } else if (this._noteSectionWait()) {',
-    new: '      } else if (false && this._noteSectionWait()) {   /* mutation: 兜底永不触发 */',
+    old: '      } else if ((this._maybeProactiveSnapshot(st), this._noteSectionWait())) {',
+    new: '      } else if ((this._maybeProactiveSnapshot(st), false && this._noteSectionWait())) {   /* mutation: 兜底永不触发 */',
     test: 'engine/d076-playing-no-progress.test.cjs',
     why: '播放中无进展兜底失效 → P1「有限拍内停机」应红（实测 201 拍不停）',
+  },
+  /* ---------------- D-077（计数按实际推进量） ---------------- */
+  {
+    id: 'M27', scope: 'd077',
+    file: 'engine/src/learn/machine.js',
+    old: '    const played = sec >= (minSec > 0 ? minSec : 30) || pct >= (minPct > 0 ? minPct : 5);',
+    new: '    const played = true;   /* mutation: 永远算播过（回到「点过就算」的老毛病） */',
+    test: 'engine/d077-count-by-progress.test.cjs',
+    why: '计数恒为 completed → C1「只播 1.9 秒应 skipped」应红（复测真机那个错）',
   },
   /* ---------------- D-070（targetKinds + 状态落盘） ---------------- */
   {

@@ -41,10 +41,18 @@ function readLearn() {
 }
 
 function engineEnv() {
+  /* ★ D-078（复测）：原来读的是引擎内部 VERSION（恒 1.0.0），导致 0.3.5 与 0.3.8 导出的包
+     完全一样、没法把包归到某个 release。现在读**插件** package.json 的 version。 */
   let engineVersion = '';
+  let pluginVersion = '';
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf8'));
+    pluginVersion = String(pkg.version || '');
+  } catch (_) { /* ignore */ }
   try { engineVersion = require('../chaoxing-autolearn.js').VERSION || ''; } catch (_) { /* ignore */ }
   return {
     engineVersion,
+    pluginVersion,
     dshVersion: String(process.env.DSH_VERSION || '').slice(0, 40),
     nodeMajor: Number(String(process.versions.node || '').split('.')[0]) || 0,
     osFamily: process.platform === 'win32' ? 'windows' : (process.platform === 'darwin' ? 'darwin' : 'linux'),
@@ -80,6 +88,14 @@ function exportRepro(args) {
     cardCount: pkg.section ? pkg.section.cards.length : 0,
     currentCardHasNoTasks: pkg.signals.currentCardHasNoTasks,
     note: '文件已脱敏：不含 enc/cpi/openc/cookie/账号/路径，标识符只以 h_ hash 出现',
+    /* ★ D-078（复测第 2 条）：导出时机很重要 —— 跑完一轮再导，拿到的是「跑完时那一节」的
+       平凡态（例如单卡已完成），出问题的节结构已经不在 learn.sections 里了。
+       所以：**症状还在屏幕上时就导**。这里给出显式提醒。 */
+    tip: '请在「症状还在屏幕上」时导出（例如卡在某一节不动时立刻执行）；跑完一轮再导只能拿到收尾那一节的平凡态。',
+    lastSection: pkg.section ? { titleKind: pkg.section.titleKind, cards: pkg.section.cards.length, state: pkg.section.state } : null,
+    snapshotsHint: snapshots.length === 0
+      ? '本次没有诊断快照（0 张）。若确实卡住了，说明还没触发主动快照：0.3.9 起「连续 3 拍结不了论」会自动拍一张。'
+      : null,
   };
   if (a.token === true) report.token = repro.packToken(pkg);
   return report;

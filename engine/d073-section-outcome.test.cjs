@@ -81,31 +81,47 @@ const VIDEO = { found: true, paused: false, ended: false, progress: 90, currentT
 
 (async () => {
   /* ---------------- G1 计数唯一出口 ---------------- */
-  console.log('== G1. 计数唯一出口：起播过=completed / 纯跳过=skipped ==');
-  {
-    const { m } = mkMachine();
-    m._playedThisSection = false;
-    m._countSectionOutcome();
-    ok(m.counters.sectionsSkipped === 1 && m.counters.sectionsCompleted === 0,
-      '★ 未起播 → skipped+1（实际 completed=' + m.counters.sectionsCompleted + ' skipped=' + m.counters.sectionsSkipped + '）');
+  console.log('== G1. 计数唯一出口：实际播过=completed / 纯跳过=skipped ==');
+{
+  /* ★ D-077：判据已从「点过播放」改成「实际推进量」。
+     completed 需要 maxAdvanceSec >= completedMinPlayedSec 或 maxProgressPct >= completedMinProgressPct。 */
+  const { m } = mkMachine();
+  m._maxAdvanceThisSection = 0;
+  m._maxProgressThisSection = 0;
+  m._countSectionOutcome();
+  ok(m.counters.sectionsSkipped === 1 && m.counters.sectionsCompleted === 0,
+    '★ 没推进过 → skipped+1（实际 completed=' + m.counters.sectionsCompleted + ' skipped=' + m.counters.sectionsSkipped + '）');
 
-    const { m: m2 } = mkMachine();
-    m2._playedThisSection = true;
-    m2._countSectionOutcome();
-    ok(m2.counters.sectionsCompleted === 1 && m2.counters.sectionsSkipped === 0,
-      '★ 起播过 → completed+1（实际 completed=' + m2.counters.sectionsCompleted + '）');
+  const { m: m2 } = mkMachine();
+  m2._maxAdvanceThisSection = 300;   /* 实播 300 秒 */
+  m2._maxProgressThisSection = 12;
+  m2._countSectionOutcome();
+  ok(m2.counters.sectionsCompleted === 1 && m2.counters.sectionsSkipped === 0,
+    '★ 实播 300 秒 → completed+1（实际 completed=' + m2.counters.sectionsCompleted + '）');
 
-    /* 不能借 _startedVideoSrcs（跨节不清的坑） */
-    const { m: m3 } = mkMachine();
-    m3._startedVideoSrcs.add('https://x/OID_A/sd.mp4');
-    m3._playedThisSection = false;
-    m3._countSectionOutcome();
-    ok(m3.counters.sectionsSkipped === 1,
-      '★ ★ 只认本节专用标志，不认跨节的 _startedVideoSrcs（实际 skipped=' + m3.counters.sectionsSkipped + '）');
-  }
+  const { m: m3 } = mkMachine();
+  m3._maxAdvanceThisSection = 1.9;    /* 复测 1.3 的真机形态：只播 1.9 秒 */
+  m3._maxProgressThisSection = 0.06;
+  m3._countSectionOutcome();
+  ok(m3.counters.sectionsSkipped === 1,
+    '★ ★ 只播 1.9 秒（1.3 真机形态）→ skipped（实际 skipped=' + m3.counters.sectionsSkipped + '）');
 
-  /* ---------------- G2 进节即绿不白播 ---------------- */
-  console.log('== G2. 进节时进度已达判定线 → 不算 greenEarly（不白播）==');
+  const { m: m4 } = mkMachine();
+  m4._maxAdvanceThisSection = 0.2;    /* 复测 1.5 的真机形态：只播 0.2 秒 */
+  m4._maxProgressThisSection = 0.004;
+  m4._countSectionOutcome();
+  ok(m4.counters.sectionsSkipped === 1,
+    '★ ★ 只播 0.2 秒（1.5 真机形态）→ skipped（实际 skipped=' + m4.counters.sectionsSkipped + '）');
+
+  const { m: m5 } = mkMachine();
+  m5._maxAdvanceThisSection = 3;
+  m5._maxProgressThisSection = 99.6;  /* 进度到 99.6%：即使秒数不多也算播完 */
+  m5._countSectionOutcome();
+  ok(m5.counters.sectionsCompleted === 1,
+    '★ 进度到 99.6% → completed（进度维度可单独成立）');
+}
+
+console.log('== G2. 进节时进度已达判定线 → 不算 greenEarly（不白播）==');
   {
     /* 复测案例：进节 85.9% 但**平台已标绿** → 判为「早已看完」，不该再播 */
     const { m } = mkMachine();
