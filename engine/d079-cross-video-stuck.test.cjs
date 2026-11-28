@@ -86,7 +86,8 @@ function mkMachine(opts) {
   console.log('== V1. 换视频（currentTime 回退）→ 不得误判 section_stuck ==');
   {
     /* 复刻真机时序：先播视频1 到 348.7，然后换视频2 从 3.1 起持续推进 */
-    const m = mkMachine({ cfg: { safety: { sectionStuckTimeoutMs: 400 } } });
+    /* ★ 阈值必须小于「测试真的跑过的时间」，否则「不漏停」是空过（V1 曾因此抓不到变异）。 */
+    const m = mkMachine({ cfg: { safety: { sectionStuckTimeoutMs: 50 } } });
     let phase = 0;      /* 0=视频1，1=视频2 */
     let t2 = 3.1;
     m.gatherState = async () => {
@@ -102,7 +103,27 @@ function mkMachine(opts) {
     let ticks = 0;
     for (; ticks < 200 && !m.stopReason; ticks += 1) await m.tick();
     ok(!m.stopReason, '★ ★ 换视频后正常推进 → 不停机（实际 ' + String(m.stopReason) + '，ticks=' + (ticks + 1) + '）');
-    ok(ticks >= 60, '★ 跨过 400ms 阈值仍未误杀（实际 ' + (ticks + 1) + ' 拍）');
+    ok(ticks >= 60, '★ 跨过 50ms 阈值仍未误杀（实际 ' + (ticks + 1) + ' 拍）');
+
+    /* ★ 确定性断言（不靠时序）：真机那个 bug 的本质是「节级计时器跨视频没复位」。
+       这里直接验证：视频1 期间把计时器走到非零，换视频2 后**必须归零**。
+       —— 只断言「没停机」是不够的：视频一直推进时根本进不了等待分支，
+          漏复位也看不出来（M28 曾因此漏测）。 */
+    const m2 = mkMachine({ cfg: { safety: { sectionStuckTimeoutMs: 100000 } } });
+    let p2 = 0;
+    m2.gatherState = async () => {
+      if (p2 === 0) { p2 = 1; return mkSt({ found: true, paused: false, ended: false, progress: 66.8, currentTime: 348.7, duration: 521.7, frameId: 'vf', objectid: 'oidA', src: 'https://x/oidA.mp4', readyState: 4 }); }
+      return mkSt({ found: true, paused: false, ended: false, progress: 1, currentTime: 3.1, duration: 212.4, frameId: 'vf', objectid: 'oidB', src: 'https://x/oidB.mp4', readyState: 4 });
+    };
+    /* 先跑一拍识别视频1 */
+    await m2.tick();
+    /* 人为把计时器「污染」成视频1 已等待很久（模拟真机：视频1 播到末段计过时） */
+    m2._sectionStuckSince = Date.now() - 90000;
+    ok(m2._sectionStuckSince > 0, '  前置：计时器非零（模拟视频1 期间已累计 90s）');
+    /* 换到视频2 */
+    await m2.tick();
+    ok(m2._sectionStuckSince === 0 || m2._sectionStuckSince > Date.now() - 1000,
+      '★ ★ ★ 换视频 → 节级计时器被复位（实际 ' + (m2._sectionStuckSince === 0 ? '0' : (Date.now() - m2._sectionStuckSince) + 'ms 前') + '）');
   }
 
   console.log('== V2. 同一视频真卡住 → 仍然要停（修 V1 不能把这条废掉）==');

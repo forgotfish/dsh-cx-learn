@@ -213,14 +213,20 @@ const MUTATIONS = [
     test: 'engine/d077-count-by-progress.test.cjs',
     why: '计数恒为 completed → C1「只播 1.9 秒应 skipped」应红（复测真机那个错）',
   },
-  /* ---------------- D-079（cross-video stuck） ---------------- */
+  /* ★ M28 已退役（D-080）：V1 现在有**两层**冗余保护 ——
+       gatherState 的换视频复位块（含 _resetSectionWait）与 PLAYING 分支的复位。
+       任何单点变异都会被另一层兜住 → 单条变异无法表达该缺陷。
+       等价保护改由 **lessons-check L5** 静态强制（_sectionStuckSince 必须在复位块内），
+       以及 d079 V1 的「计时器归零」确定性断言 + d080 W1 覆盖。 */
+
+  /* ---------------- D-080（视频级状态隔离） ---------------- */
   {
-    id: 'M28', scope: 'd079',
+    id: 'M29', scope: 'd080',
     file: 'engine/src/learn/machine.js',
-    old: '      const switched = this._lastPlayingKey !== curKey;          /* 换视频了 */',
-    new: '      const switched = false;   /* mutation: 退回「高水位线」判据（跨视频误杀） */',
-    test: 'engine/d079-cross-video-stuck.test.cjs',
-    why: '换视频不再复位 → V1「换视频后不得停机」应红（复测真机的那个必然触发 bug）',
+    old: '        this._resumeAttempts = 0;\n        this._lastPlayingTime = current;',
+    new: '        this._lastPlayingTime = current;   /* mutation: 漏掉 _resumeAttempts 复位 */',
+    test: 'engine/d080-video-scope.test.cjs',
+    why: '视频级计数器漏复位 → W1「换视频后 _resumeAttempts 归零」应红（lessons-check L5 同一条规则）',
   },
   /* ---------------- D-070（targetKinds + 状态落盘） ---------------- */
   {

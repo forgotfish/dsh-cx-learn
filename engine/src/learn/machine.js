@@ -70,6 +70,7 @@ class LearnMachine {
     this._lastProgressTime = undefined;
     this._resumeAttempts = 0;
     this._lastVideoFrameId = null;
+    this._lastVideoKey = '';          /* D-080：视频身份（objectid/src），换视频判定用 */
     this._lastVideoCurrentTime = undefined;
     this._lastVideoDuration = undefined;
     this._lastVideoSrc = '';
@@ -502,20 +503,43 @@ class LearnMachine {
     this._detectRetry = 0;
 
     if (st.video && st.video.found) {
-      const frameChanged = this._lastVideoFrameId !== st.video.frameId;
+      /* ★ D-080：**换视频的唯一判定点**。所有「视频级」计数器必须在这里复位。
+         历史教训：D-076 的 section_stuck 用节级高水位线，一节两个任务点时换视频导致
+         currentTime 回退、计时器永不复位 → 误杀正常播放（D-079）。
+         同类单槽位还有 _resumeAttempts / _stallTicks / _lastProgressTime。 */
       const current = Number(st.video.currentTime) || 0;
       const duration = Number(st.video.duration) || 0;
       const src = String(st.video.src || '');
-      const mediaChanged = !frameChanged && (
+      const vkey = this._videoKey(st.video) || ('frame:' + st.video.frameId);
+      const frameChanged = this._lastVideoFrameId !== st.video.frameId;
+      const identityChanged = this._lastVideoKey !== vkey;
+      const mediaChanged = !frameChanged && !identityChanged && (
         (this._lastVideoDuration > 0 && duration > 0 && Math.abs(duration - this._lastVideoDuration) > 1)
         || (this._lastVideoSrc && src && src !== this._lastVideoSrc)
       );
-      if (frameChanged || mediaChanged) {
+      if (frameChanged || identityChanged || mediaChanged) {
         this._lastVideoFrameId = st.video.frameId;
+        this._lastVideoKey = vkey;
         this._lastVideoCurrentTime = current;
         this._lastVideoDuration = duration;
         this._lastVideoSrc = src;
         this._videoProgressTicks = 0;
+        /* ★ 视频级计数器统一复位（不是节级！）—— 少任何一行就是下一轮的回归。
+           INVARIANTS.md I1/I2：这里必须覆盖全部视频级字段，lessons-check L5 会校验。 */
+        this._stallTicks = 0;
+        this._lastProgressTime = undefined;
+        this._resumeAttempts = 0;
+        this._lastPlayingTime = current;   /* 换视频=推进，高水位线随之更新 */
+        this._lastPlayingKey = vkey;       /* 与 PLAYING 分支同一身份键 */
+        /* ★ 关键：节级计时器也必须在这里复位。
+           否则 gatherState 先把 _lastPlayingKey 更新成新键 → PLAYING 分支的 switched 永远 false
+           → 换视频时节级计时器从不复位 → 仍是 D-079 那个 bug。 */
+        this._resetSectionWait();
+        logger.info('PLAYING_CHECK', '检测到视频切换，视频级计数器已复位', {
+          section: this._currentTitle,
+          videoKey: String(vkey).slice(0, 40),
+          by: frameChanged ? 'frame' : (identityChanged ? 'identity' : 'media'),
+        });
       } else if (this._lastVideoCurrentTime !== undefined && current - this._lastVideoCurrentTime >= 0.5) {
         this._videoProgressTicks += 1;
         this._lastVideoCurrentTime = current;
@@ -3808,6 +3832,7 @@ class LearnMachine {
     this._lastProgressTime = undefined;
     this._resumeAttempts = 0;
     this._lastVideoFrameId = null;
+    this._lastVideoKey = '';          /* D-080：视频身份（objectid/src），换视频判定用 */
     this._lastVideoCurrentTime = undefined;
     this._lastVideoDuration = undefined;
     this._lastVideoSrc = '';

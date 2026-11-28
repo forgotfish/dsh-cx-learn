@@ -126,6 +126,51 @@ console.log('== L3. 变异条目自检（锚点必须唯一存在）==');
   }
 }
 
+/* ---------------- L5：视频级计数器必须集中复位（防 D-079 类回归） ---------------- */
+console.log('== L5. 视频级计数器必须在唯一换视频点复位 ==');
+{
+  const f = path.join(ROOT, 'engine', 'src', 'learn', 'machine.js');
+  const txt = fs.readFileSync(f, 'utf8').replace(/\r\n/g, '\n');
+
+  /* INVARIANTS.md I1：这些是「视频级」字段，必须全部出现在换视频复位块里 */
+  const VIDEO_SCOPED = [
+    '_stallTicks', '_lastProgressTime', '_resumeAttempts', '_videoProgressTicks',
+    '_lastVideoFrameId', '_lastVideoKey', '_lastVideoCurrentTime',
+    '_lastVideoDuration', '_lastVideoSrc', '_lastPlayingTime', '_lastPlayingKey',
+    '_sectionStuckSince',
+  ];
+
+  /* 块起点必须是 if 条件行 —— 因为部分视频级字段（frame/key/currentTime…）在注释之前复位 */
+  const at = txt.indexOf('if (frameChanged || identityChanged || mediaChanged) {');
+  ok(at >= 0, '  能定位到「换视频复位块」起点（不变量 I1 的锚点）');
+  let block = '';
+  if (at >= 0) {
+    const end = txt.indexOf('} else if (this._lastVideoCurrentTime !== undefined', at);
+    block = txt.slice(at, end < 0 ? at + 3000 : end);
+  }
+
+  const missing = VIDEO_SCOPED.filter(function (name) {
+    /* 直接赋值算复位；_sectionStuckSince 是通过 _resetSectionWait() 复位的（单一出口），
+       所以它接受 _resetSectionWait( 也算 */
+    if (name === '_sectionStuckSince') {
+      return !/this\._resetSectionWait\(/.test(block) && !new RegExp('this\\.' + name + '\\s*=').test(block);
+    }
+    return !new RegExp('this\\.' + name + '\\s*=').test(block);
+  });
+  ok(missing.length === 0,
+    '★ ★ ' + VIDEO_SCOPED.length + ' 个视频级字段全部在该块内复位（缺：' + (missing.join(', ') || '无') + '）');
+
+  const inv = path.join(ROOT, 'docs', 'INVARIANTS.md');
+  ok(fs.existsSync(inv), '★ docs/INVARIANTS.md 存在（约定可查，不靠记性）');
+  if (fs.existsSync(inv)) {
+    const it = fs.readFileSync(inv, 'utf8');
+    ok(it.indexOf('I1') >= 0 && it.indexOf('视频级') >= 0, '★ 不变量文档含 I1/视频级约定');
+    const missDoc = VIDEO_SCOPED.filter(function (x) { return it.indexOf(x) < 0; });
+    ok(missDoc.length === 0,
+      '★ 文档与代码清单一致（文档缺：' + (missDoc.join(', ') || '无') + '）');
+  }
+}
+
 /* ---------------- L4：D 编号不重复 ---------------- */
 console.log('== L4. DECISIONS 的 D 编号不重复 ==');
 {
