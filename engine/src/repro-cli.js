@@ -72,6 +72,8 @@ function exportRepro(args) {
 
   const pkg = repro.sanitizeRepro({ snapshots, learn, env: engineEnv() }, {
     keepTitles: a['keep-titles'] === true,
+    maxSectionsInBundle: Number(a.sections) > 0 ? Number(a.sections) : undefined,
+    sectionIndex: a.section,
   });
 
   const ts = new Date().toISOString().replace(/[:.]/g, '-');
@@ -85,6 +87,7 @@ function exportRepro(args) {
     bytes: fs.statSync(out).size,
     snapshotsUsed: snapshots.length,
     hasSection: !!pkg.section,
+    sectionsInBundle: Array.isArray(pkg.sections) ? pkg.sections.length : 0,
     cardCount: pkg.section ? pkg.section.cards.length : 0,
     currentCardHasNoTasks: pkg.signals.currentCardHasNoTasks,
     note: '文件已脱敏：不含 enc/cpi/openc/cookie/账号/路径，标识符只以 h_ hash 出现',

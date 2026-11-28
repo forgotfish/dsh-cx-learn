@@ -101,8 +101,14 @@ class LearnMachine {
       let videoLive = null;
       try {
         if (v.frameId) {
+          /* ★ D-079（复测指出）：**不要无条件 pause**。
+             原来这里直接 v.pause() 采样，于是「主动快照」在健康路径上也会把正常播放
+             停掉（实测停了 8 秒才被 P0 恢复）。现在只在确实需要定格的场景（停滞/未确认）
+             才暂停，其余只读不打断。 */
+          const needPause = (reason !== 'section_stuck_proactive');
+          const pauseJs = needPause ? 'v.pause();' : '';
           videoLive = await this.adapter.evalInFrame(v.frameId,
-            '(function(){try{var v=document.querySelector("video");if(!v)return null;v.pause();return {currentTime:v.currentTime,duration:v.duration,ended:v.ended,paused:v.paused,muted:v.muted,readyState:v.readyState,seekable:v.seekable.length?[v.seekable.start(0),v.seekable.end(v.seekable.length-1)]:null,buffered:v.buffered.length?[v.buffered.start(0),v.buffered.end(v.buffered.length-1)]:null,src:(v.currentSrc||"").slice(0,200)}}catch(e){return {err:String(e&&e.message||e)}}})()');
+            '(function(){try{var v=document.querySelector("video");if(!v)return null;' + pauseJs + 'return {currentTime:v.currentTime,duration:v.duration,ended:v.ended,paused:v.paused,muted:v.muted,readyState:v.readyState,seekable:v.seekable.length?[v.seekable.start(0),v.seekable.end(v.seekable.length-1)]:null,buffered:v.buffered.length?[v.buffered.start(0),v.buffered.end(v.buffered.length-1)]:null,src:(v.currentSrc||"").slice(0,200)}}catch(e){return {err:String(e&&e.message||e)}}})()');
         }
       } catch (e) { videoLive = { err: String((e && e.message) || e) }; }
       let targetProbe = null;
@@ -912,20 +918,36 @@ class LearnMachine {
          → 永远不判停滞 → 无限输出「视频播放中」（自测观测到 41 拍仍在转）。
          这里改用**本节级**判据：真的在前进就复位计时，不前进就累计；
          超过 safety.sectionStuckTimeoutMs 停机 —— 宁可停，也不空转。 */
+      /* ★ D-079（复测 v0.3.9 真机）：复位条件必须**按视频**算，不能用「超过历史最大值」。
+         现场：1.7.2 一卡两任务点，第 1 个播到 348.7s 平台判完成后页面换到第 2 个，
+         currentTime 从 348.7 掉回 3.1 —— 高水位线 348.9 永远越不过去，计时器再没复位，
+         183 秒后把**正在正常推进**的视频判成 stuck（换视频不是停滞，是推进）。 */
       const curT = Number(st.video.currentTime) || 0;
-      if (curT > (this._lastPlayingTime || 0) + 0.2) {
+      const curKey = this._videoKey(st.video) || '__noKey__';
+      const switched = this._lastPlayingKey !== curKey;          /* 换视频了 */
+      const sameVideoMoved = !switched && curT > (this._lastPlayingTime || 0) + 0.2;
+      if (switched || sameVideoMoved) {
+        this._lastPlayingKey = curKey;
         this._lastPlayingTime = curT;
         this._resetSectionWait();
         this._proactiveSnapTicks = 0;
       } else if ((this._maybeProactiveSnapshot(st), this._noteSectionWait())) {
-        logger.error('PLAYING_CHECK', '视频长时间毫无进展，停机（section_stuck）', {
+        const dur = Number(st.video.duration) || 0;
+        const rs = Number(st.video.readyState) || 0;
+        logger.error('PLAYING_CHECK', '同一个视频长时间毫无进展，停机（section_stuck）', {
           title: this._currentTitle,
+          objectid: String((st.video && st.video.objectid) || '').slice(0, 12),
           currentTime: curT,
-          duration: Number(st.video.duration) || 0,
-          readyState: Number(st.video.readyState) || 0,
+          lastTime: this._lastPlayingTime || 0,
+          duration: dur,
+          readyState: rs,
           stalledTicks: this._stallTicks || 0,
           waitedMs: this._sectionStuckSince ? (Date.now() - this._sectionStuckSince) : null,
-          hint: '播放器未真正起播 / 元数据未加载：duration=0 且 currentTime 不前进',
+          /* ★ hint 按实际字段生成，不再用固定文案误导排查（复测指出：同一行里
+             duration:212.4 + readyState:4 明明说明视频是好的，文案却说「元数据未加载」） */
+          hint: (dur <= 0 || rs === 0)
+            ? '播放器未真正起播 / 元数据未加载（duration=0 或 readyState=0）'
+            : '元数据正常但 currentTime 长时间不动：可能卡缓冲 / 源失效 / 播放器假死',
         });
         this.stop('section_stuck');
         return { progress: false, outcome: 'SECTION_STUCK' };
@@ -3240,6 +3262,10 @@ class LearnMachine {
       /* ★ D-077：同时记下进节时的 currentTime —— 后面用它算「本次实际推进了多少秒」。 */
       if (!(this._videoEntryTime instanceof Map)) this._videoEntryTime = new Map();
       if (!this._videoEntryTime.has(k)) this._videoEntryTime.set(k, Number(v.currentTime) || 0);
+      /* ★ D-079（复测指出）：pct 判据也要用**增量**，否则「进节就在 5% 以上」的续播节
+         会被判 played，与 adv 的增量判据不对称。 */
+      if (!(this._videoEntryPct instanceof Map)) this._videoEntryPct = new Map();
+      if (!this._videoEntryPct.has(k)) this._videoEntryPct.set(k, Number(v.progress) || 0);
     } catch (_) { /* ignore */ }
   }
 
@@ -3257,7 +3283,9 @@ class LearnMachine {
       const entryTime = (this._videoEntryTime instanceof Map && k) ? Number(this._videoEntryTime.get(k)) || 0 : 0;
       const adv = Math.max(0, (Number(v.currentTime) || 0) - entryTime);
       if (adv > (this._maxAdvanceThisSection || 0)) this._maxAdvanceThisSection = adv;
-      const pct = Number(v.progress) || 0;
+      /* ★ D-079：进度也取**增量**（进节以来涨了多少个百分点），与 adv 对称。 */
+      const entryPct = (this._videoEntryPct instanceof Map && k) ? Number(this._videoEntryPct.get(k)) || 0 : 0;
+      const pct = Math.max(0, (Number(v.progress) || 0) - entryPct);
       if (pct > (this._maxProgressThisSection || 0)) this._maxProgressThisSection = pct;
     } catch (_) { /* ignore */ }
   }
@@ -3754,11 +3782,13 @@ class LearnMachine {
     this._cardSwitchAt = 0;                 /* D-073：换节清换卡豁免窗口 */
     this._sectionStuckSince = 0;            /* D-074：换节清「结不了论」计时 */
     this._lastPlayingTime = 0;              /* D-076：换节清「上次播放位置」 */
+    this._lastPlayingKey = '';              /* D-079：换节清「上次播放的视频身份」 */
     this._maxAdvanceThisSection = 0;        /* D-077：本节最大实际推进秒数 */
     this._proactiveSnapTicks = 0;           /* D-078：主动快照的拍数计数 */
     this._proactiveSnapDone = false;        /* D-078：本节已主动拍过快照 */
     this._maxProgressThisSection = 0;       /* D-077：本节最大进度百分比 */
     this._videoEntryTime = new Map();       /* D-077：本节各视频的进节 currentTime */
+    this._videoEntryPct = new Map();        /* D-079：本节各视频的进节 progress（pct 增量用） */
     this._throttleAt = new Map();           /* D-074：换节清日志限流表 */
     /* ★ 2026-10-31 真机（FNOS 3.4）：点了 3.4，但 knowledge/cards 播放器
        还是 3.3 那一份（772.2s），引擎只看到「有视频 + 有 duration」就当成就绪，

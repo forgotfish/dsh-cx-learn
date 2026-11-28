@@ -2,6 +2,71 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.3.10] — 2026-11-28
+
+### 修复：`section_stuck` 跨视频误杀正常播放（D-079，P0）
+
+复测 v0.3.9 真机发现，**必然触发**：任何一节有两个任务点都会被误杀。
+
+现场（UTC）：
+
+```
+17:07:36  视频1 currentTime 348.7 / 521.7
+17:07:45  平台判完第 1 个 → 页面自动换到视频2
+17:07:49  视频2 currentTime 3.1 / 212.4     ← 从 348.7 掉回 3.1
+17:08:58  视频2 currentTime 63.7            ← 一直在正常推进
+17:10:52  停机 section_stuck  waitedMs 182977
+```
+
+根因：复位条件是 `curT > _lastPlayingTime + 0.2`，即「**超过历史最大值**」的高水位线。
+换视频后 `currentTime` 必然回退，高水位线再也越不过 → 计时器永不复位 → 180 秒后误杀。
+同一条日志里 `stalledTicks:0`（另一套判据没触发）就是旁证。
+
+修法：**按视频身份复位** ——
+
+- 新增 `_lastPlayingKey`（objectid/src）；**换了视频就视为「在推进」**，立即复位计时
+- 同一视频内仍要求 `curT > lastTime + 0.2` 才算推进（真卡住照样停）
+- 停机日志的 `hint` **按实际字段生成**：`duration>0 && readyState>0` 时说
+  「元数据正常但 currentTime 长时间不动：可能卡缓冲 / 源失效 / 播放器假死」，
+  不再一律甩「duration=0 且元数据未加载」（复测指出那行自己是矛盾的）
+
+### 修复：pct 判据改为增量（D-079 P1）
+
+`maxProgressPct` 原来取 `v.progress` **绝对值**，与 `maxAdvanceSec` 的增量判据不对称 ——
+「进节就在 5% 以上」的续播节会被判 played。现在记 `_videoEntryPct`，用 `pct - entryPct`。
+
+### 修复：主动快照不再打断健康播放（D-079 P3）
+
+`captureProblemSnapshot` 原来无条件 `v.pause()` 采样，于是主动快照在健康路径上
+也会把正常播放停掉（实测停 8 秒等 P0 恢复）。现在仅 `reason !== 'section_stuck_proactive'`
+时才暂停，主动快照**只读不打断**。
+
+### 改进：复现包导出最近 N 节（D-079 P2）
+
+原来只取 `sections[length-1]`，跑完一轮后出问题那节已被挤出末位、全丢（实测 7 节历史只导 1 节）。
+
+- 默认导出最近 **8** 节（`--sections=N` 可调）
+- `--section=<序号>` 指定「选中那一节」（`section` 字段，兼容 `--replay`）；
+  正数从头数（1 = 第一节），负数从末尾倒数（-1 = 最后一节）
+- 多节导出同样走白名单脱敏，document 卡（`media:0/finished:0`）也在包里
+
+### 新增测试
+
+`engine/d079-cross-video-stuck.test.cjs`（12 项）：
+
+| 组 | 覆盖 |
+|---|---|
+| **V1** | 换视频（currentTime 从 348.7 回退到 3.1）后持续推进 → **不得停机**（跑 201 拍仍不停） |
+| **V2** | 同一视频 `currentTime` 真不动 → **仍要停** `section_stuck`（修 V1 不能废掉这条） |
+| **V3** | 进节 10% → 12% 只算 +2% → skipped（pct 增量） |
+| **V4** | 导出 4 节 / `--section=1` / `--section=-2` / `--sections=2` / 多节里无原文 |
+| **V5** | 源码断言：只有非主动快照才 pause |
+
+### 验证
+
+- 全量 **51 个 `*.test.cjs` 全绿**；`--self-test` 14 组全过；`lessons-check` 10/10
+- 变异条目同步更新（M26 锚点随代码变更已修）
+
 ## [0.3.9] — 2026-11-27
 
 ### 修复：计数把「点过播放」当成「播过」—— 白占 maxSections 配额（D-077）

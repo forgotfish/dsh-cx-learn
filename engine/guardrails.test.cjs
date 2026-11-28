@@ -536,7 +536,13 @@ function state(over) {
     m.maybeHandleChapterQuiz = async () => 'none';
     const r = await m.tick();
     ok(advances === 1, '★ 全部完成 → 允许切节一次（advanceSection 调用 1 次，实际 ' + advances + '）');
-    ok(m.counters.sectionsCompleted === 1, '★ sectionsCompleted 只 +1（实际 ' + m.counters.sectionsCompleted + '）');
+    /* ★ D-077 改后：本夹具「进节时视频已在 100/100」，本轮实际推进量 = 0
+       （_videoEntryTime 记的就是 100，currentTime 也是 100），按新判据应记 skipped 而非 completed。
+       这里要验的是「本节结论只记一次」（别重复计数），不是「必须记 completed」。 */
+    ok((m.counters.sectionsCompleted + m.counters.sectionsSkipped) === 1,
+      '★ 本节结论只记一次（completed+skipped = 1，实际 completed=' + m.counters.sectionsCompleted + ' skipped=' + m.counters.sectionsSkipped + '）');
+    ok(m.counters.sectionsSkipped === 1,
+      '★ D-077：进节时已播完（本轮推进 0）→ 记 skipped（实际 skipped=' + m.counters.sectionsSkipped + '）');
     ok(r.outcome === 'ADVANCED', '本拍 outcome=ADVANCED（实际 ' + r.outcome + '）');
   }
 

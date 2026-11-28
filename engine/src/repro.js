@@ -86,19 +86,21 @@ function sanitizeRepro(input, opts) {
   const snapshots = Array.isArray(src.snapshots) ? src.snapshots : [];
   const learn = src.learn || {};
 
-  /* --- 4a. 章节：只从 learn.sections 取「最近一节」，chapterId hash --- */
+  /* --- 4a. 章节：导出**最近 N 节**（不再只取最后一节）---
+     ★ D-079（复测指出）：原来只取 sections[length-1]，跑完一轮后出问题那节的结构已经
+     被后续节挤出最后一位，全丢了（实测 7 节历史只导了 1 节）。
+     现在导出最近 N 节（默认 8，可配 maxSectionsInBundle），并可用 sectionIndex 指定。 */
   const sections = Array.isArray(learn.sections) ? learn.sections : [];
-  const lastSec = sections.length ? sections[sections.length - 1] : null;
 
-  let section = null;
-  if (lastSec && lastSec.chapterId) {
-    const cards = Array.isArray(lastSec.cards) ? lastSec.cards : [];
-    section = {
-      /* 白名单字段，一个不多 */
-      chapterHash: salter.h(lastSec.chapterId),
-      titleKind: titleKind(lastSec.title, salter, keepTitles),
-      state: String(lastSec.kind || '').slice(0, 16),
-      totalCards: Number(lastSec.total) || cards.length,
+  /** 单节 → 白名单对象（一个字段都不多） */
+  const pickSection = (sec) => {
+    if (!sec || !sec.chapterId) return null;
+    const cards = Array.isArray(sec.cards) ? sec.cards : [];
+    return {
+      chapterHash: salter.h(sec.chapterId),
+      titleKind: titleKind(sec.title, salter, keepTitles),
+      state: String(sec.kind || '').slice(0, 16),
+      totalCards: Number(sec.total) || cards.length,
       cards: cards.map((c) => ({
         cardHash: salter.h(c && c.cardid),
         num: Number(c && c.num) || 0,
@@ -109,7 +111,21 @@ function sanitizeRepro(input, opts) {
         failed: !!(c && c.failed),
       })),
     };
+  };
+
+  const maxInBundle = Number(o.maxSectionsInBundle) > 0 ? Number(o.maxSectionsInBundle) : 8;
+  const tailRaw = sections.slice(-maxInBundle);
+  const sectionsList = tailRaw.map(pickSection).filter(Boolean);
+
+  /* section = 选中那一节（默认最后一节）。
+     --section=N：N>=1 从开头数（1=第一节），N<0 从末尾倒数（-1=最后一节）。 */
+  let picked = sections.length ? sections[sections.length - 1] : null;
+  const wantIdx = Number(o.sectionIndex);
+  if (Number.isFinite(wantIdx) && wantIdx !== 0) {
+    const idx = wantIdx > 0 ? (wantIdx - 1) : (sections.length + wantIdx);
+    if (idx >= 0 && idx < sections.length) picked = sections[idx];
   }
+  const section = pickSection(picked);
 
   /* --- 4b. 任务点/视频：从最近一张诊断快照取（含 objectid → hash） --- */
   const snap = snapshots.length ? snapshots[snapshots.length - 1] : null;
@@ -168,6 +184,9 @@ function sanitizeRepro(input, opts) {
     format: FORMAT,
     version: VERSION,
     createdAt: new Date().toISOString(),
+    /* ★ D-079：最近 N 节全量（含 document 卡那种 media:0/finished:0 的形态），
+       不再只剩最后一节。section 保留为「选中那一节」，兼容 --replay。 */
+    sections: sectionsList,
     section,
     tasks,
     videos,

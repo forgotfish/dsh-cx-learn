@@ -213,6 +213,15 @@ const MUTATIONS = [
     test: 'engine/d077-count-by-progress.test.cjs',
     why: '计数恒为 completed → C1「只播 1.9 秒应 skipped」应红（复测真机那个错）',
   },
+  /* ---------------- D-079（cross-video stuck） ---------------- */
+  {
+    id: 'M28', scope: 'd079',
+    file: 'engine/src/learn/machine.js',
+    old: '      const switched = this._lastPlayingKey !== curKey;          /* 换视频了 */',
+    new: '      const switched = false;   /* mutation: 退回「高水位线」判据（跨视频误杀） */',
+    test: 'engine/d079-cross-video-stuck.test.cjs',
+    why: '换视频不再复位 → V1「换视频后不得停机」应红（复测真机的那个必然触发 bug）',
+  },
   /* ---------------- D-070（targetKinds + 状态落盘） ---------------- */
   {
     id: 'M22', scope: 'd070',
